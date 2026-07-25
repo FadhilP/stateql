@@ -12,10 +12,10 @@ import {
 import {
   confidence,
   databaseIdentity,
+  databaseUrlHasSecret,
   detectDriver,
   isEnvironmentName,
   normalizeSqliteSource,
-  postgresUrlHasSecret,
   validateProfileName,
   version,
 } from "./connection.js";
@@ -162,13 +162,13 @@ export class StateQL {
       }
       const driver = detectDriver(secret);
       if (
-        driver === "postgres" &&
+        driver !== "sqlite" &&
         !secretEnv &&
-        postgresUrlHasSecret(secret)
+        databaseUrlHasSecret(secret)
       ) {
         throw new StateQLError(
           "PERMISSION_DENIED",
-          "Credential-bearing PostgreSQL URLs must use --env.",
+          `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env.`,
           {
             suggestedAction:
               "Set the URL in an environment variable and reconnect with --env NAME.",
@@ -185,7 +185,7 @@ export class StateQL {
       const databaseName =
         driver === "sqlite"
           ? basename(source)
-          : new URL(secret).pathname.replace(/^\//, "") || "postgres";
+          : new URL(secret).pathname.replace(/^\//, "") || driver;
       const readOnly =
         options.readOnly ??
         (profile ? Boolean(profile.read_only) : true);
@@ -279,10 +279,10 @@ export class StateQL {
       let storedTarget = target;
       if (target) {
         const driver = detectDriver(target);
-        if (driver === "postgres" && postgresUrlHasSecret(target)) {
+        if (driver !== "sqlite" && databaseUrlHasSecret(target)) {
           throw new StateQLError(
             "PERMISSION_DENIED",
-            "Credential-bearing PostgreSQL URLs must use --env.",
+            `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env.`,
           );
         }
         if (driver === "sqlite") storedTarget = normalizeSqliteSource(target);
@@ -1182,7 +1182,7 @@ export class StateQL {
   async capabilities(): Promise<Response<unknown>> {
     return this.run("capabilities", async () => ({
       data: {
-        drivers: ["postgres", "sqlite"],
+        drivers: ["mysql", "postgres", "sqlite"],
         features: {
           result_handles: true,
           write_deduplication: true,
@@ -1739,6 +1739,12 @@ function markTransactionOutcomeUnknown(
 function boundedReadSql(sql: string, limit: number): string {
   const statement = sql.trim().replace(/;\s*$/, "");
   return `SELECT * FROM (${statement}) AS _stateql_bounded LIMIT ${limit}`;
+}
+
+function databaseDisplayName(
+  driver: Exclude<ConnectionRecord["driver"], "sqlite">,
+): string {
+  return driver === "postgres" ? "PostgreSQL" : "MySQL";
 }
 
 function normalizeIsolation(

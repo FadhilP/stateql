@@ -46,7 +46,12 @@ export function analyzeSql(sql: string, driver: Driver): SqlAnalysis {
   if (!trimmed) throw new StateQLError("INVALID_SQL", "SQL is empty.");
 
   try {
-    const database = driver === "postgres" ? "Postgresql" : "Sqlite";
+    const database =
+      driver === "postgres"
+        ? "Postgresql"
+        : driver === "mysql"
+          ? "MySQL"
+          : "Sqlite";
     const parsed = parser.astify(trimmed, { database });
     if (Array.isArray(parsed)) {
       if (parsed.length !== 1) {

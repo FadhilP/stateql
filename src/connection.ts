@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { StateQLError } from "./errors.js";
 import type { ConnectionRecord } from "./store.js";
-import type { StateConfidence } from "./types.js";
+import type { Driver, StateConfidence } from "./types.js";
 
 export function databaseIdentity(connection: ConnectionRecord): unknown {
   return {
@@ -12,12 +12,13 @@ export function databaseIdentity(connection: ConnectionRecord): unknown {
   };
 }
 
-export function detectDriver(target: string): "sqlite" | "postgres" {
+export function detectDriver(target: string): Driver {
   if (/^postgres(?:ql)?:\/\//i.test(target)) return "postgres";
+  if (/^mysql:\/\//i.test(target)) return "mysql";
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(target)) {
     throw new StateQLError(
       "UNSUPPORTED_DRIVER",
-      "Only PostgreSQL and SQLite are supported.",
+      "Only MySQL, PostgreSQL, and SQLite are supported.",
     );
   }
   return "sqlite";
@@ -29,7 +30,7 @@ export function normalizeSqliteSource(target: string): string {
   return resolve(source);
 }
 
-export function postgresUrlHasSecret(target: string): boolean {
+export function databaseUrlHasSecret(target: string): boolean {
   try {
     const url = new URL(target);
     return (
@@ -39,7 +40,7 @@ export function postgresUrlHasSecret(target: string): boolean {
       )
     );
   } catch {
-    throw new StateQLError("INVALID_COMMAND", "Invalid PostgreSQL URL.");
+    throw new StateQLError("INVALID_COMMAND", "Invalid database URL.");
   }
 }
 

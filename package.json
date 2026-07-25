@@ -25,11 +25,12 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/cli.test.js dist/test/query.test.js dist/test/store.test.js dist/test/transaction.test.js dist/test/write.test.js",
+    "test": "npm run build && node --test dist/test/cli.test.js dist/test/mysql.test.js dist/test/postgres.test.js dist/test/query.test.js dist/test/sqlite.test.js dist/test/store.test.js dist/test/transaction.test.js dist/test/write.test.js",
     "prepack": "npm test"
   },
   "keywords": [
     "database",
+    "mysql",
     "sqlite",
     "postgresql",
     "cli",
@@ -41,6 +42,7 @@
     "node": ">=22.5"
   },
   "dependencies": {
+    "mysql2": "^3.23.1",
     "node-sql-parser": "^5.4.0",
     "pg": "^8.16.3"
   },

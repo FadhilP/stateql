@@ -1,4 +1,4 @@
-export type Driver = "sqlite" | "postgres";
+export type Driver = "sqlite" | "postgres" | "mysql";
 export type StateConfidence =
   | "authoritative"
   | "transaction_snapshot"

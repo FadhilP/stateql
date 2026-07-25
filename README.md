@@ -64,17 +64,23 @@ Example first page:
 Running the same normalized query with the same parameters reuses `q_1` while
 its cache is valid. Use `--cache bypass` when a fresh read is required.
 
-PostgreSQL credentials should come from an environment variable:
+PostgreSQL and MySQL credentials should come from environment variables:
 
 ```bash
 export APP_DATABASE_URL='postgres://user:password@host/app'
 stql connect --env APP_DATABASE_URL --name app --read-only
+
+export MYSQL_DATABASE_URL='mysql://user:password@host/app'
+stql connect --env MYSQL_DATABASE_URL --name mysql-app --read-only
 ```
+
+MySQL uses positional `?` parameters. MariaDB compatibility is not currently
+claimed.
 
 ## Commands
 
 ```text
-stql connect <sqlite-path|postgres-url> [--name NAME] [--env ENV] [--read-write]
+stql connect <sqlite-path|postgres-url|mysql-url> [--name NAME] [--env ENV] [--read-write]
 stql connect --profile NAME
 stql status
 stql profile add|list|show|remove
@@ -100,8 +106,9 @@ stql pipe [--continue-on-error]
 Database commands accept `--timeout-ms N`; default is 30,000 ms. `Ctrl+C`
 cancels active work. SQLite runs in a killable child process so long synchronous
 statements cannot block StateQL's event loop. PostgreSQL uses server-side
-`statement_timeout` plus client deadlines. A timed-out write may return
-`OUTCOME_UNKNOWN` when commit status cannot be proven.
+`statement_timeout` plus client deadlines. MySQL deadlines destroy the active
+connection. A timed-out write may return `OUTCOME_UNKNOWN` when commit status
+cannot be proven.
 
 ## Output modes
 
@@ -193,16 +200,18 @@ Read cache entries expire after five minutes; materialized handles expire after
 narrower `WHERE` clause or `LIMIT`. This row cap bounds materialization, while
 the independent deadline bounds execution time. Command history keeps the latest 10,000
 entries per session. SQLite cache reuse also checks
-the database file signature; PostgreSQL reuse is labeled `ttl_based`, never
-authoritative. Transactions are staged in local state so they survive CLI
+the database file signature; PostgreSQL and MySQL reuse is labeled `ttl_based`,
+never authoritative. Transactions are staged in local state so they survive CLI
 invocations, then executed atomically on commit. Connections cannot be changed
 or disconnected while a transaction is active. SQLite supports `serializable`;
-PostgreSQL also supports `repeatable read`, `read committed`, and
-`read uncommitted`. PostgreSQL reads run inside database-enforced read-only
-transactions.
+PostgreSQL and MySQL also support `repeatable read`, `read committed`, and
+`read uncommitted`. Server reads run inside database-enforced read-only
+transactions. MySQL staged transactions reject DDL because MySQL implicitly
+commits those statements.
 
-StateQL stores no PostgreSQL password. Credential-bearing URLs must be supplied
-through `--env`. SQLite result rows are materialized locally for durable access.
+StateQL stores no PostgreSQL or MySQL password. Credential-bearing URLs must be
+supplied through `--env`. SQLite result rows are materialized locally for
+durable access.
 `filter` evaluates one scalar SQLite predicate against those stored rows, keeps
 source order, state metadata, and expiry, and never accesses the original
 database. Use parameters for values. Subqueries, query-shaping clauses, and

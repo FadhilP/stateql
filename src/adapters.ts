@@ -1,4 +1,14 @@
 import { fork, type ChildProcess } from "node:child_process";
+import {
+  createConnection as createMySqlConnection,
+  type Connection as MySqlCoreConnection,
+  type ExecuteValues,
+  type FieldPacket as MySqlFieldPacket,
+  type QueryResult as MySqlQueryResult,
+  type ResultSetHeader as MySqlResultSetHeader,
+  type RowDataPacket as MySqlRowDataPacket,
+} from "mysql2";
+import type { Connection as MySqlConnection } from "mysql2/promise";
 import { Client, types as pgTypes, type QueryResult } from "pg";
 import type { Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
@@ -77,7 +87,10 @@ export async function createAdapter(
   if (connection.driver === "sqlite") {
     return new SQLiteAdapter(source, Boolean(connection.read_only), context);
   }
-  return new PostgresAdapter(source, Boolean(connection.read_only), context);
+  if (connection.driver === "postgres") {
+    return new PostgresAdapter(source, Boolean(connection.read_only), context);
+  }
+  return new MySqlAdapter(source, Boolean(connection.read_only), context);
 }
 
 interface SQLiteResponse {
@@ -513,6 +526,379 @@ class PostgresAdapter implements Adapter {
       this.ending = this.client.end().catch(() => undefined);
     }
   }
+}
+
+class MySqlAdapter implements Adapter {
+  readonly confidence = "ttl_based" as const;
+  private rawClient: MySqlCoreConnection | undefined;
+  private client: MySqlConnection | undefined;
+  private connected = false;
+  private closed = false;
+
+  constructor(
+    private readonly source: string,
+    private readonly readOnly: boolean,
+    private readonly context: AdapterContext,
+  ) {}
+
+  async read(sql: string, params: SqlParameters): Promise<ReadResult> {
+    await this.query("START TRANSACTION READ ONLY", [], false, false);
+    try {
+      const [result, fields] = await this.query(
+        sql,
+        mysqlParams(params),
+        false,
+        true,
+      );
+      await this.query("COMMIT", [], false, false);
+      return {
+        rows: toJsonSafe(mysqlRows(result)),
+        columns: fields.map((field) => ({
+          name: field.name,
+          type: mysqlFieldType(field),
+        })),
+      };
+    } catch (error) {
+      await this.rollbackQuietly();
+      throw error;
+    }
+  }
+
+  async write(sql: string, params: SqlParameters): Promise<WriteResult> {
+    if (this.readOnly) throw new Error("Connection is read-only.");
+    await this.query("START TRANSACTION", [], false, false);
+    let committing = false;
+    try {
+      const [result] = await this.query(
+        sql,
+        mysqlParams(params),
+        true,
+        true,
+      );
+      committing = true;
+      await this.query("COMMIT", [], true, false);
+      return { affectedRows: mysqlAffectedRows(result) };
+    } catch (error) {
+      const rolledBack = await this.rollbackQuietly();
+      if (
+        error instanceof AdapterExecutionError &&
+        !committing &&
+        rolledBack
+      ) {
+        throw new AdapterExecutionError(error.message, error.reason, false);
+      }
+      throw error;
+    }
+  }
+
+  async writeBatch(
+    operations: OperationRecord[],
+    isolation: string,
+  ): Promise<WriteResult[]> {
+    if (this.readOnly) throw new Error("Connection is read-only.");
+    const unsupported = operations.find(
+      (operation) =>
+        !MYSQL_TRANSACTIONAL_STATEMENTS.has(operation.statement_type),
+    );
+    if (unsupported) {
+      throw new BatchWriteError(
+        `MySQL transactions cannot atomically include ${unsupported.statement_type.toUpperCase()} statements.`,
+        false,
+      );
+    }
+    const level = isolation.toUpperCase();
+    if (!MYSQL_ISOLATION_LEVELS.has(level)) {
+      throw new Error(`Unsupported MySQL isolation level "${isolation}".`);
+    }
+    try {
+      await this.query(
+        `SET TRANSACTION ISOLATION LEVEL ${level}`,
+        [],
+        false,
+        false,
+      );
+      await this.query("START TRANSACTION", [], false, false);
+    } catch (error) {
+      throw new BatchWriteError(errorText(error), false);
+    }
+    const results: WriteResult[] = [];
+    try {
+      for (const operation of operations) {
+        const [result] = await this.query(
+          operation.sql,
+          mysqlParams(parseJson<SqlParameters>(operation.parameters, [])),
+          true,
+          true,
+        );
+        results.push({ affectedRows: mysqlAffectedRows(result) });
+      }
+    } catch (error) {
+      if (await this.rollbackQuietly()) {
+        throw new BatchWriteError(errorText(error), false);
+      }
+      throw new BatchWriteError(errorText(error), true);
+    }
+    try {
+      await this.query("COMMIT", [], true, false);
+      return results;
+    } catch (error) {
+      await this.rollbackQuietly();
+      throw new BatchWriteError(errorText(error), true);
+    }
+  }
+
+  async signature(): Promise<string> {
+    throwIfStopped(this.context, false);
+    return "ttl";
+  }
+
+  async inspect(kind: string, table?: string): Promise<unknown> {
+    await this.query("START TRANSACTION READ ONLY", [], false, false);
+    try {
+      const result = await this.inspectTransaction(kind, table);
+      await this.query("COMMIT", [], false, false);
+      return result;
+    } catch (error) {
+      await this.rollbackQuietly();
+      throw error;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.connected = false;
+    if (!this.client) return;
+    await this.client.end().catch(() => undefined);
+  }
+
+  private async inspectTransaction(kind: string, table?: string): Promise<unknown> {
+    if (kind === "schema") {
+      const [result] = await this.query(
+        `SELECT TABLE_SCHEMA AS schema, TABLE_NAME AS name, TABLE_TYPE AS type
+         FROM information_schema.tables
+         WHERE TABLE_SCHEMA = DATABASE()
+         ORDER BY TABLE_NAME`,
+        [],
+        false,
+        false,
+      );
+      return { tables: mysqlRows(result) };
+    }
+    if (!table) throw new Error(`Table is required for inspect ${kind}.`);
+    const separator = table.indexOf(".");
+    const schema = separator === -1
+      ? await this.databaseName()
+      : table.slice(0, separator);
+    const name = separator === -1 ? table : table.slice(separator + 1);
+    if (!schema || !name) throw new Error(`Invalid table name "${table}".`);
+    const [columnResult] = await this.query(
+      `SELECT COLUMN_NAME AS name, DATA_TYPE AS type,
+              IS_NULLABLE = 'YES' AS nullable
+       FROM information_schema.columns
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       ORDER BY ORDINAL_POSITION`,
+      [schema, name],
+      false,
+      true,
+    );
+    const columns = mysqlRows(columnResult).map((column) => ({
+      ...column,
+      nullable: Boolean(column.nullable),
+    }));
+    if (columns.length === 0) {
+      throw new Error(`Table "${table}" was not found.`);
+    }
+    if (kind === "columns") return { table: name, schema, columns };
+
+    const [indexResult] = await this.query(
+      `SELECT INDEX_NAME AS name, NON_UNIQUE AS non_unique,
+              INDEX_TYPE AS index_type,
+              GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ') AS columns
+       FROM information_schema.statistics
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       GROUP BY INDEX_NAME, NON_UNIQUE, INDEX_TYPE
+       ORDER BY INDEX_NAME`,
+      [schema, name],
+      false,
+      true,
+    );
+    const indexes = mysqlRows(indexResult).map((index) => ({
+      name: String(index.name),
+      definition: `${Number(index.non_unique) === 0 ? "UNIQUE " : ""}${String(index.index_type)} (${String(index.columns)})`,
+    }));
+    const [constraintResult] = await this.query(
+      `SELECT CONSTRAINT_NAME AS name, CONSTRAINT_TYPE AS type
+       FROM information_schema.table_constraints
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       ORDER BY CONSTRAINT_NAME`,
+      [schema, name],
+      false,
+      true,
+    );
+    const constraints = mysqlRows(constraintResult);
+    if (kind === "indexes") return { table: name, schema, indexes };
+    if (kind === "constraints") {
+      return { table: name, schema, constraints };
+    }
+    if (kind !== "table") throw new Error(`Unknown inspection kind "${kind}".`);
+    return {
+      table: name,
+      schema,
+      columns,
+      indexes: indexes.length,
+      constraints: constraints.length,
+    };
+  }
+
+  private async databaseName(): Promise<string> {
+    const [result] = await this.query(
+      "SELECT DATABASE() AS database_name",
+      [],
+      false,
+      false,
+    );
+    const row = mysqlRows(result)[0];
+    if (!row?.database_name) throw new Error("MySQL connection has no database selected.");
+    return String(row.database_name);
+  }
+
+  private async connect(): Promise<void> {
+    if (this.connected) return;
+    throwIfStopped(this.context, false);
+    if (this.closed) throw new Error("MySQL adapter is closed.");
+    const rawClient = createMySqlConnection({
+      uri: this.source,
+      connectTimeout: remainingMilliseconds(this.context),
+      multipleStatements: false,
+      namedPlaceholders: false,
+      supportBigNumbers: true,
+      bigNumberStrings: true,
+      dateStrings: true,
+    });
+    this.rawClient = rawClient;
+    this.client = rawClient.promise();
+    try {
+      await withContext(
+        this.client.connect(),
+        this.context,
+        () => this.stop(),
+        false,
+      );
+      this.connected = true;
+      if (this.readOnly) {
+        await this.runQuery(
+          "SET SESSION TRANSACTION READ ONLY",
+          [],
+          false,
+          false,
+        );
+      }
+    } catch (error) {
+      this.stop();
+      throw error;
+    }
+  }
+
+  private async query(
+    sql: string,
+    params: ExecuteValues[],
+    outcomeUnknown: boolean,
+    prepared: boolean,
+  ): Promise<[MySqlQueryResult, MySqlFieldPacket[]]> {
+    await this.connect();
+    return this.runQuery(sql, params, outcomeUnknown, prepared);
+  }
+
+  private async runQuery(
+    sql: string,
+    params: ExecuteValues[],
+    outcomeUnknown: boolean,
+    prepared: boolean,
+  ): Promise<[MySqlQueryResult, MySqlFieldPacket[]]> {
+    throwIfStopped(this.context, outcomeUnknown);
+    if (!this.client || this.closed) throw new Error("MySQL adapter is closed.");
+    const result = prepared
+      ? this.client.execute<MySqlQueryResult>(sql, params)
+      : this.client.query<MySqlQueryResult>(sql, params);
+    return withContext(
+      result,
+      this.context,
+      () => this.stop(),
+      outcomeUnknown,
+    );
+  }
+
+  private async rollbackQuietly(): Promise<boolean> {
+    if (this.closed || !this.connected) return false;
+    try {
+      await this.query("ROLLBACK", [], false, false);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private stop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.connected = false;
+    this.rawClient?.destroy();
+  }
+}
+
+const MYSQL_ISOLATION_LEVELS = new Set([
+  "SERIALIZABLE",
+  "REPEATABLE READ",
+  "READ COMMITTED",
+  "READ UNCOMMITTED",
+]);
+
+const MYSQL_TRANSACTIONAL_STATEMENTS = new Set([
+  "delete",
+  "insert",
+  "replace",
+  "update",
+]);
+
+function mysqlParams(params: SqlParameters): ExecuteValues[] {
+  if (!Array.isArray(params)) {
+    throw new Error("MySQL parameters must be a JSON array.");
+  }
+  return params.map((value) => {
+    if (
+      value === undefined ||
+      Array.isArray(value) ||
+      (typeof value === "object" &&
+        value !== null &&
+        !(value instanceof Date) &&
+        !Buffer.isBuffer(value) &&
+        !(value instanceof Uint8Array))
+    ) {
+      throw new Error("MySQL parameter values must be scalar.");
+    }
+    return value as ExecuteValues;
+  });
+}
+
+function mysqlRows(result: MySqlQueryResult): Row[] {
+  if (!Array.isArray(result)) {
+    throw new Error("MySQL statement did not return rows.");
+  }
+  return result as MySqlRowDataPacket[] as Row[];
+}
+
+function mysqlAffectedRows(result: MySqlQueryResult): number {
+  if (Array.isArray(result) || !("affectedRows" in result)) {
+    throw new Error("MySQL statement did not return a write result.");
+  }
+  return Number((result as MySqlResultSetHeader).affectedRows);
+}
+
+function mysqlFieldType(field: MySqlFieldPacket): string {
+  return String(
+    field.typeName ?? field.columnType ?? field.type ?? "unknown",
+  ).toLowerCase();
 }
 
 const POSTGRES_ISOLATION_LEVELS = new Set([
