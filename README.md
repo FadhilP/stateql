@@ -17,7 +17,6 @@ query. Parameters keep values separate from SQL; `ORDER BY` makes paging
 stable, while `LIMIT` bounds work at the database.
 
 ```bash
-npm install --global stateql
 export STQL_SESSION=audit
 stql profile add local ./app.sqlite
 stql connect local
