@@ -1,14 +1,8 @@
-import { existsSync, statSync } from "node:fs";
-import { DatabaseSync, type StatementSync } from "node:sqlite";
-import { Client, types as pgTypes } from "pg";
-import type {
-  Column,
-  Row,
-  SqlParameters,
-  StateConfidence,
-} from "./types.js";
+import { fork, type ChildProcess } from "node:child_process";
+import { Client, types as pgTypes, type QueryResult } from "pg";
+import type { Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
-import { hash, parseJson, toJsonSafe } from "./util.js";
+import { parseJson, toJsonSafe } from "./util.js";
 
 export interface ReadResult {
   rows: Row[];
@@ -17,6 +11,22 @@ export interface ReadResult {
 
 export interface WriteResult {
   affectedRows: number;
+}
+
+export interface AdapterContext {
+  deadline: number;
+  signal?: AbortSignal;
+}
+
+export class AdapterExecutionError extends Error {
+  constructor(
+    message: string,
+    readonly reason: "timeout" | "aborted",
+    readonly outcomeUnknown: boolean,
+  ) {
+    super(message);
+    this.name = "AdapterExecutionError";
+  }
 }
 
 export class BatchWriteError extends Error {
@@ -42,8 +52,19 @@ export interface Adapter {
   close(): Promise<void>;
 }
 
+export function createAdapterContext(
+  timeoutMs: number,
+  signal?: AbortSignal,
+): AdapterContext {
+  return {
+    deadline: Date.now() + timeoutMs,
+    ...(signal ? { signal } : {}),
+  };
+}
+
 export async function createAdapter(
   connection: ConnectionRecord,
+  context: AdapterContext,
 ): Promise<Adapter> {
   const source = connection.secret_env
     ? process.env[connection.secret_env]
@@ -54,157 +75,184 @@ export async function createAdapter(
     );
   }
   if (connection.driver === "sqlite") {
-    return new SQLiteAdapter(source, Boolean(connection.read_only));
+    return new SQLiteAdapter(source, Boolean(connection.read_only), context);
   }
-  return new PostgresAdapter(source, Boolean(connection.read_only));
+  return new PostgresAdapter(source, Boolean(connection.read_only), context);
+}
+
+interface SQLiteResponse {
+  id: number;
+  result?: unknown;
+  error?: {
+    message: string;
+    outcomeUnknown?: boolean;
+  };
+}
+
+interface PendingSQLiteCall {
+  batch: boolean;
+  resolve(value: unknown): void;
+  reject(error: unknown): void;
 }
 
 class SQLiteAdapter implements Adapter {
   readonly confidence = "database_reported" as const;
-  private readonly db: DatabaseSync;
+  private readonly child: ChildProcess;
+  private readonly pending = new Map<number, PendingSQLiteCall>();
+  private nextId = 1;
+  private closed = false;
 
   constructor(
     private readonly source: string,
     private readonly readOnly: boolean,
+    private readonly context: AdapterContext,
   ) {
-    this.db = new DatabaseSync(source, {
-      readOnly,
-      enableForeignKeyConstraints: true,
+    this.child = fork(new URL("./sqlite-process.js", import.meta.url), [], {
+      execArgv: [],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      serialization: "advanced",
     });
-    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.child.on("message", (message: SQLiteResponse) => {
+      const call = this.pending.get(message.id);
+      if (!call) return;
+      if (message.error) {
+        call.reject(
+          call.batch
+            ? new BatchWriteError(
+                message.error.message,
+                message.error.outcomeUnknown ?? true,
+              )
+            : new Error(message.error.message),
+        );
+      } else {
+        call.resolve(message.result);
+      }
+    });
+    this.child.on("error", (error) => this.failPending(error));
+    this.child.on("exit", (code, signal) => {
+      if (!this.closed) {
+        this.failPending(
+          new Error(
+            `SQLite execution process exited unexpectedly (${signal ?? code ?? "unknown"}).`,
+          ),
+        );
+      }
+    });
   }
 
   async read(sql: string, params: SqlParameters): Promise<ReadResult> {
-    const statement = this.db.prepare(sql);
-    const rows = bindAll(statement, params) as Row[];
-    return {
-      rows: toJsonSafe(rows),
-      columns: statement.columns().map((column) => ({
-        name: column.name,
-        type: column.type?.toLowerCase() ?? inferType(rows, column.name),
-      })),
-    };
+    return this.call<ReadResult>("read", [sql, params], false, false);
   }
 
   async write(sql: string, params: SqlParameters): Promise<WriteResult> {
-    if (this.readOnly) throw new Error("Connection is read-only.");
-    const result = bindRun(this.db.prepare(sql), params);
-    return { affectedRows: Number(result.changes) };
+    return this.call<WriteResult>("write", [sql, params], true, false);
   }
 
   async writeBatch(
     operations: OperationRecord[],
     isolation: string,
   ): Promise<WriteResult[]> {
-    if (this.readOnly) throw new Error("Connection is read-only.");
-    if (isolation !== "serializable") {
-      throw new Error(`SQLite does not support isolation level "${isolation}".`);
-    }
-    const results: WriteResult[] = [];
-    try {
-      this.db.exec("BEGIN");
-    } catch (error) {
-      throw new BatchWriteError(errorText(error), false);
-    }
-    try {
-      for (const operation of operations) {
-        results.push(
-          await this.write(
-            operation.sql,
-            parseJson<SqlParameters>(operation.parameters, []),
-          ),
-        );
-      }
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        throw new BatchWriteError(errorText(error), true);
-      }
-      throw new BatchWriteError(errorText(error), false);
-    }
-    try {
-      this.db.exec("COMMIT");
-      return results;
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-        throw new BatchWriteError(errorText(error), false);
-      } catch (rollbackError) {
-        if (rollbackError instanceof BatchWriteError) throw rollbackError;
-        throw new BatchWriteError(errorText(error), true);
-      }
-    }
+    return this.call<WriteResult[]>(
+      "writeBatch",
+      [operations, isolation],
+      true,
+      true,
+    );
   }
 
   async signature(): Promise<string> {
-    if (this.source === ":memory:") return "memory";
-    const stats = statSync(this.source, { bigint: true });
-    const walPath = `${this.source}-wal`;
-    const wal = existsSync(walPath)
-      ? statSync(walPath, { bigint: true })
-      : undefined;
-    return hash({
-      size: stats.size.toString(),
-      modified: stats.mtimeNs.toString(),
-      walSize: wal?.size.toString() ?? "0",
-      walModified: wal?.mtimeNs.toString() ?? "0",
-    });
+    return this.call<string>("signature", [], false, false);
   }
 
   async inspect(kind: string, table?: string): Promise<unknown> {
-    if (kind === "schema") {
-      const tables = this.db
-        .prepare(
-          `SELECT name, type
-           FROM sqlite_master
-           WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
-           ORDER BY name`,
-        )
-        .all();
-      return { schema: "main", tables };
-    }
-    if (!table) throw new Error(`Table is required for inspect ${kind}.`);
-    const quoted = quoteSqliteLiteral(table);
-    const columns = this.db
-      .prepare(`PRAGMA table_info(${quoted})`)
-      .all() as Array<Record<string, unknown>>;
-    if (columns.length === 0) throw new Error(`Table "${table}" was not found.`);
-    const indexes = this.db
-      .prepare(`PRAGMA index_list(${quoted})`)
-      .all() as Array<Record<string, unknown>>;
-    const foreignKeys = this.db
-      .prepare(`PRAGMA foreign_key_list(${quoted})`)
-      .all() as Array<Record<string, unknown>>;
-
-    if (kind === "columns") return { table, columns };
-    if (kind === "indexes") return { table, indexes };
-    if (kind === "constraints") {
-      return {
-        table,
-        primary_key: columns
-          .filter((column) => Number(column.pk) > 0)
-          .map((column) => column.name),
-        foreign_keys: foreignKeys,
-      };
-    }
-    if (kind !== "table") throw new Error(`Unknown inspection kind "${kind}".`);
-    return {
-      table,
-      schema: "main",
-      columns: columns.map((column) => ({
-        name: column.name,
-        type: String(column.type).toLowerCase(),
-        nullable: column.notnull === 0 && Number(column.pk) === 0,
-        primary_key: Number(column.pk) > 0,
-      })),
-      indexes: indexes.length,
-      foreign_keys: foreignKeys.length,
-    };
+    return this.call("inspect", [kind, table], false, false);
   }
 
   async close(): Promise<void> {
-    this.db.close();
+    if (this.closed) return;
+    this.closed = true;
+    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        try {
+          this.child.kill("SIGKILL");
+        } catch {
+          // Process already exited.
+        }
+        resolve();
+      }, 1_000);
+      timer.unref();
+      this.child.once("exit", done);
+      try {
+        this.child.disconnect();
+      } catch {
+        try {
+          this.child.kill("SIGKILL");
+        } catch {
+          // Process already exited.
+        }
+      }
+    });
+  }
+
+  private async call<T>(
+    operation: "read" | "write" | "writeBatch" | "signature" | "inspect",
+    args: unknown[],
+    outcomeUnknown: boolean,
+    batch: boolean,
+  ): Promise<T> {
+    throwIfStopped(this.context, false);
+    if (this.closed) throw new Error("SQLite adapter is closed.");
+    const id = this.nextId++;
+    const result = new Promise<unknown>((resolve, reject) => {
+      this.pending.set(id, { batch, resolve, reject });
+      try {
+        this.child.send(
+          {
+            id,
+            source: this.source,
+            readOnly: this.readOnly,
+            operation,
+            args,
+            busyTimeoutMs: Math.min(5_000, remainingMilliseconds(this.context)),
+          },
+          (error) => {
+            if (error) reject(error);
+          },
+        );
+      } catch (error) {
+        reject(error);
+      }
+    });
+    try {
+      return (await withContext(
+        result,
+        this.context,
+        () => this.terminate(),
+        outcomeUnknown,
+      )) as T;
+    } finally {
+      this.pending.delete(id);
+    }
+  }
+
+  private terminate(): void {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.child.kill("SIGKILL");
+    } catch {
+      // Process already exited.
+    }
+  }
+
+  private failPending(error: unknown): void {
+    for (const call of this.pending.values()) call.reject(error);
+    this.pending.clear();
   }
 }
 
@@ -212,20 +260,31 @@ class PostgresAdapter implements Adapter {
   readonly confidence = "ttl_based" as const;
   private readonly client: Client;
   private connected = false;
+  private ending: Promise<void> | undefined;
 
   constructor(
     source: string,
     private readonly readOnly: boolean,
+    private readonly context: AdapterContext,
   ) {
-    this.client = new Client({ connectionString: source });
+    const timeout = Math.min(
+      2_147_483_647,
+      remainingMilliseconds(context),
+    );
+    this.client = new Client({
+      connectionString: source,
+      connectionTimeoutMillis: timeout,
+      statement_timeout: timeout,
+    });
   }
 
   async read(sql: string, params: SqlParameters): Promise<ReadResult> {
     await this.connect();
-    await this.client.query("BEGIN READ ONLY");
+    await this.query("BEGIN READ ONLY", [], false);
     try {
-      const result = await this.client.query(sql, postgresParams(params));
-      await this.client.query("COMMIT");
+      await this.setLocalDeadline();
+      const result = await this.query(sql, postgresParams(params), false);
+      await this.query("COMMIT", [], false);
       return {
         rows: toJsonSafe(result.rows as Row[]),
         columns: result.fields.map((field) => ({
@@ -236,7 +295,7 @@ class PostgresAdapter implements Adapter {
         })),
       };
     } catch (error) {
-      await this.client.query("ROLLBACK");
+      await this.rollbackQuietly();
       throw error;
     }
   }
@@ -244,8 +303,25 @@ class PostgresAdapter implements Adapter {
   async write(sql: string, params: SqlParameters): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
     await this.connect();
-    const result = await this.client.query(sql, postgresParams(params));
-    return { affectedRows: result.rowCount ?? 0 };
+    await this.query("BEGIN", [], false);
+    let committing = false;
+    try {
+      await this.setLocalDeadline();
+      const result = await this.query(sql, postgresParams(params), true);
+      committing = true;
+      await this.query("COMMIT", [], true);
+      return { affectedRows: result.rowCount ?? 0 };
+    } catch (error) {
+      const rolledBack = await this.rollbackQuietly();
+      if (
+        error instanceof AdapterExecutionError &&
+        !committing &&
+        rolledBack
+      ) {
+        throw new AdapterExecutionError(error.message, error.reason, false);
+      }
+      throw error;
+    }
   }
 
   async writeBatch(
@@ -259,53 +335,71 @@ class PostgresAdapter implements Adapter {
       throw new Error(`Unsupported PostgreSQL isolation level "${isolation}".`);
     }
     try {
-      await this.client.query(`BEGIN ISOLATION LEVEL ${level}`);
+      await this.query(`BEGIN ISOLATION LEVEL ${level}`, [], false);
     } catch (error) {
       throw new BatchWriteError(errorText(error), false);
     }
     const results: WriteResult[] = [];
     try {
       for (const operation of operations) {
-        results.push(
-          await this.write(
-            operation.sql,
-            parseJson<SqlParameters>(operation.parameters, []),
-          ),
+        await this.setLocalDeadline();
+        const result = await this.query(
+          operation.sql,
+          postgresParams(parseJson<SqlParameters>(operation.parameters, [])),
+          true,
         );
+        results.push({ affectedRows: result.rowCount ?? 0 });
       }
     } catch (error) {
-      try {
-        await this.client.query("ROLLBACK");
-      } catch {
-        throw new BatchWriteError(errorText(error), true);
+      if (await this.rollbackQuietly()) {
+        throw new BatchWriteError(errorText(error), false);
       }
-      throw new BatchWriteError(errorText(error), false);
+      throw new BatchWriteError(errorText(error), true);
     }
     try {
-      await this.client.query("COMMIT");
+      await this.query("COMMIT", [], true);
       return results;
     } catch (error) {
-      try {
-        await this.client.query("ROLLBACK");
-      } catch {
-        // COMMIT response was lost; rollback cannot establish outcome.
-      }
+      await this.rollbackQuietly();
       throw new BatchWriteError(errorText(error), true);
     }
   }
 
   async signature(): Promise<string> {
+    throwIfStopped(this.context, false);
     return "ttl";
   }
 
   async inspect(kind: string, table?: string): Promise<unknown> {
     await this.connect();
+    await this.query("BEGIN READ ONLY", [], false);
+    try {
+      const result = await this.inspectTransaction(kind, table);
+      await this.query("COMMIT", [], false);
+      return result;
+    } catch (error) {
+      await this.rollbackQuietly();
+      throw error;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (!this.ending) {
+      this.ending = this.client.end().catch(() => undefined);
+    }
+    await this.ending;
+  }
+
+  private async inspectTransaction(kind: string, table?: string): Promise<unknown> {
     if (kind === "schema") {
-      const result = await this.client.query(
+      await this.setLocalDeadline();
+      const result = await this.query(
         `SELECT table_schema AS schema, table_name AS name, table_type AS type
          FROM information_schema.tables
          WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
          ORDER BY table_schema, table_name`,
+        [],
+        false,
       );
       return { tables: result.rows };
     }
@@ -313,31 +407,37 @@ class PostgresAdapter implements Adapter {
     const [schema, name] = table.includes(".")
       ? table.split(".", 2)
       : ["public", table];
-    const columns = await this.client.query(
+    await this.setLocalDeadline();
+    const columns = await this.query(
       `SELECT column_name AS name, data_type AS type,
               is_nullable = 'YES' AS nullable
        FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = $2
        ORDER BY ordinal_position`,
       [schema, name],
+      false,
     );
     if (columns.rows.length === 0) {
       throw new Error(`Table "${table}" was not found.`);
     }
     if (kind === "columns") return { table: name, schema, columns: columns.rows };
 
-    const indexes = await this.client.query(
+    await this.setLocalDeadline();
+    const indexes = await this.query(
       `SELECT indexname AS name, indexdef AS definition
        FROM pg_indexes WHERE schemaname = $1 AND tablename = $2
        ORDER BY indexname`,
       [schema, name],
+      false,
     );
-    const constraints = await this.client.query(
+    await this.setLocalDeadline();
+    const constraints = await this.query(
       `SELECT constraint_name AS name, constraint_type AS type
        FROM information_schema.table_constraints
        WHERE table_schema = $1 AND table_name = $2
        ORDER BY constraint_name`,
       [schema, name],
+      false,
     );
     if (kind === "indexes") return { table: name, schema, indexes: indexes.rows };
     if (kind === "constraints") {
@@ -353,18 +453,64 @@ class PostgresAdapter implements Adapter {
     };
   }
 
-  async close(): Promise<void> {
-    if (this.connected) await this.client.end();
-  }
-
   private async connect(): Promise<void> {
     if (this.connected) return;
-    await this.client.connect();
+    throwIfStopped(this.context, false);
+    await withContext(
+      this.client.connect(),
+      this.context,
+      () => this.stop(),
+      false,
+    );
     this.connected = true;
     if (this.readOnly) {
-      await this.client.query(
-        "SET default_transaction_read_only = on",
+      await this.query("SET default_transaction_read_only = on", [], false);
+    }
+  }
+
+  private async setLocalDeadline(): Promise<void> {
+    await this.query(
+      `SET LOCAL statement_timeout = ${remainingMilliseconds(this.context)}`,
+      [],
+      false,
+    );
+  }
+
+  private async query(
+    sql: string,
+    params: unknown[],
+    outcomeUnknown: boolean,
+  ): Promise<QueryResult> {
+    throwIfStopped(this.context, outcomeUnknown);
+    try {
+      return await withContext(
+        this.client.query(sql, params),
+        this.context,
+        () => this.stop(),
+        outcomeUnknown,
       );
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      if (postgresErrorCode(error) === "57014") {
+        throw stoppedError(this.context, outcomeUnknown);
+      }
+      throw error;
+    }
+  }
+
+  private async rollbackQuietly(): Promise<boolean> {
+    if (this.ending) return false;
+    try {
+      await this.query("ROLLBACK", [], false);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private stop(): void {
+    if (!this.ending) {
+      this.ending = this.client.end().catch(() => undefined);
     }
   }
 }
@@ -376,38 +522,94 @@ const POSTGRES_ISOLATION_LEVELS = new Set([
   "READ UNCOMMITTED",
 ]);
 
-function bindAll(
-  statement: StatementSync,
-  params: SqlParameters,
-): Array<Record<string, unknown>> {
-  if (Array.isArray(params)) return statement.all(...(params as never[]));
-  return statement.all(params as never);
-}
-
-function bindRun(
-  statement: StatementSync,
-  params: SqlParameters,
-): { changes: number | bigint } {
-  if (Array.isArray(params)) return statement.run(...(params as never[]));
-  return statement.run(params as never);
-}
-
 function postgresParams(params: SqlParameters): unknown[] {
   if (Array.isArray(params)) return params;
   throw new Error("PostgreSQL parameters must be a JSON array.");
 }
 
+function remainingMilliseconds(context: AdapterContext): number {
+  return Math.max(1, Math.ceil(context.deadline - Date.now()));
+}
+
+function throwIfStopped(
+  context: AdapterContext,
+  outcomeUnknown: boolean,
+): void {
+  if (context.signal?.aborted || context.deadline <= Date.now()) {
+    throw stoppedError(context, outcomeUnknown);
+  }
+}
+
+function stoppedError(
+  context: AdapterContext,
+  outcomeUnknown: boolean,
+): AdapterExecutionError {
+  const aborted = context.signal?.aborted ?? false;
+  return new AdapterExecutionError(
+    aborted ? "Database operation cancelled." : "Database operation timed out.",
+    aborted ? "aborted" : "timeout",
+    outcomeUnknown,
+  );
+}
+
+function withContext<T>(
+  promise: Promise<T>,
+  context: AdapterContext,
+  onStop: () => void,
+  outcomeUnknown: boolean,
+): Promise<T> {
+  try {
+    throwIfStopped(context, outcomeUnknown);
+  } catch (error) {
+    try {
+      onStop();
+    } catch {
+      // Preserve deadline/cancellation error.
+    }
+    return Promise.reject(error);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      context.signal?.removeEventListener("abort", stop);
+      action();
+    };
+    const stop = (): void => {
+      finish(() => {
+        try {
+          onStop();
+        } catch {
+          // Preserve deadline/cancellation error.
+        }
+        reject(stoppedError(context, outcomeUnknown));
+      });
+    };
+    const stopped = (): boolean =>
+      Boolean(context.signal?.aborted) || context.deadline <= Date.now();
+    const timer = setTimeout(stop, remainingMilliseconds(context));
+    context.signal?.addEventListener("abort", stop, { once: true });
+    promise.then(
+      (value) => {
+        if (stopped()) stop();
+        else finish(() => resolve(value));
+      },
+      (error) => {
+        if (stopped()) stop();
+        else finish(() => reject(error));
+      },
+    );
+  });
+}
+
+function postgresErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function inferType(rows: Row[], name: string): string {
-  const value = rows.find((row) => row[name] !== null)?.[name];
-  if (value === undefined) return "unknown";
-  if (Buffer.isBuffer(value)) return "binary";
-  return typeof value;
-}
-
-function quoteSqliteLiteral(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
 }

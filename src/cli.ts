@@ -34,6 +34,7 @@ const parsed = parseArgs({
     "allow-destructive": { type: "boolean" },
     offset: { type: "string" },
     limit: { type: "string" },
+    "timeout-ms": { type: "string" },
     format: { type: "string" },
     output: { type: "string" },
     isolation: { type: "string" },
@@ -55,7 +56,14 @@ if (values.help || !command) {
   process.exit(0);
 }
 
-const stateql = new StateQL();
+const abortController = new AbortController();
+process.once("SIGINT", () => abortController.abort());
+const stateql = new StateQL({
+  ...(values["timeout-ms"] === undefined
+    ? {}
+    : { timeoutMs: Number(values["timeout-ms"]) }),
+  signal: abortController.signal,
+});
 
 try {
   if (command === "batch" || command === "pipe") {
@@ -609,6 +617,7 @@ Commands:
   pipe
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
+Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;
 }

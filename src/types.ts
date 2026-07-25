@@ -48,7 +48,12 @@ export type Response<T> = Success<T> | Failure;
 
 export type SqlParameters = unknown[] | Record<string, unknown>;
 
-export interface StateQLOptions {
+export interface ExecutionOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface StateQLOptions extends ExecutionOptions {
   home?: string;
   session?: string;
   previewRows?: number;
@@ -59,7 +64,7 @@ export interface StateQLOptions {
   now?: () => Date;
 }
 
-export interface QueryOptions {
+export interface QueryOptions extends ExecutionOptions {
   params?: SqlParameters;
   cache?: "auto" | "bypass" | "require";
 }
@@ -68,7 +73,7 @@ export interface FilterOptions {
   params?: SqlParameters;
 }
 
-export interface ExecOptions {
+export interface ExecOptions extends ExecutionOptions {
   params?: SqlParameters;
   replay?: boolean;
   idempotencyKey?: string;
@@ -76,7 +81,7 @@ export interface ExecOptions {
   allowDestructive?: boolean;
 }
 
-export interface ConnectOptions {
+export interface ConnectOptions extends ExecutionOptions {
   name?: string;
   readOnly?: boolean;
   secretEnv?: string;
@@ -93,7 +98,7 @@ export interface RowsOptions {
   limit?: number;
 }
 
-export interface PlanOptions {
+export interface PlanOptions extends ExecutionOptions {
   params?: SqlParameters;
   allowUnbounded?: boolean;
   allowDestructive?: boolean;
@@ -153,6 +158,7 @@ export interface BatchCommand {
   offset?: number;
   limit?: number;
   isolation?: string;
+  timeout_ms?: number;
 }
 
 export interface BatchOptions {

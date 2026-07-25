@@ -97,6 +97,12 @@ stql batch [commands.json|commands.jsonl|-] [--continue-on-error]
 stql pipe [--continue-on-error]
 ```
 
+Database commands accept `--timeout-ms N`; default is 30,000 ms. `Ctrl+C`
+cancels active work. SQLite runs in a killable child process so long synchronous
+statements cannot block StateQL's event loop. PostgreSQL uses server-side
+`statement_timeout` plus client deadlines. A timed-out write may return
+`OUTCOME_UNKNOWN` when commit status cannot be proven.
+
 ## Output modes
 
 CLI output defaults to compact, one-line `agent` JSON. Successes flatten useful
@@ -176,14 +182,16 @@ Run the array with `stql batch commands.json`. Batch fields use snake case;
 supported command names match CLI paths, such as `filter`,
 `transaction.begin`, `session.summary`, `alias.set`, `plan`, and `apply`.
 Batch filters use `where` for the predicate and may assign the derived result
-with `as`.
+with `as`. Database commands may set `timeout_ms`; otherwise they use the
+30-second default.
 
 State metadata lives under `STQL_HOME`, or the platform data directory when
 unset. Set `STQL_SESSION` to select a named session.
 
 Read cache entries expire after five minutes; materialized handles expire after
 24 hours. Queries exceeding 10,000 rows fail before materialization; add a
-narrower `WHERE` clause or `LIMIT`. Command history keeps the latest 10,000
+narrower `WHERE` clause or `LIMIT`. This row cap bounds materialization, while
+the independent deadline bounds execution time. Command history keeps the latest 10,000
 entries per session. SQLite cache reuse also checks
 the database file signature; PostgreSQL reuse is labeled `ttl_based`, never
 authoritative. Transactions are staged in local state so they survive CLI
@@ -214,8 +222,12 @@ Interrupted commits remain fail-closed; stale `committing` records become
 ```ts
 import { StateQL } from "stateql";
 
-const stateql = new StateQL({ home: "./.stql" });
-const response = await stateql.query("SELECT * FROM users");
+const stateql = new StateQL({ home: "./.stql", timeoutMs: 30_000 });
+const controller = new AbortController();
+const response = await stateql.query("SELECT * FROM users", {
+  signal: controller.signal,
+  timeoutMs: 5_000,
+});
 if (response.ok) {
   const handle = (response.data as { result_id: string }).result_id;
   await stateql.filter(handle, "email LIKE ?", {

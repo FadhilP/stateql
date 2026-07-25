@@ -6,6 +6,7 @@ export type {
   BatchOptions,
   ConnectOptions,
   ExecOptions,
+  ExecutionOptions,
   Failure,
   FilterOptions,
   PlanOptions,

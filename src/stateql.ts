@@ -3,9 +3,12 @@ import { basename, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { env } from "node:process";
 import {
+  AdapterExecutionError,
   BatchWriteError,
   createAdapter,
+  createAdapterContext,
   type Adapter,
+  type AdapterContext,
 } from "./adapters.js";
 import { asStateQLError, StateQLError } from "./errors.js";
 import { analyzeSql } from "./sql.js";
@@ -23,6 +26,7 @@ import type {
   Column,
   ConnectOptions,
   ExecOptions,
+  ExecutionOptions,
   Failure,
   FilterOptions,
   PlanOptions,
@@ -64,6 +68,8 @@ export class StateQL {
   private readonly resultTtlSeconds: number;
   private readonly maxCellCharacters: number;
   private readonly maxResultRows: number;
+  private readonly timeoutMs: number;
+  private readonly signal?: AbortSignal;
   private readonly now: () => Date;
 
   constructor(options: StateQLOptions = {}) {
@@ -77,6 +83,8 @@ export class StateQL {
       options.maxResultRows ?? 10_000,
       "maxResultRows",
     );
+    this.timeoutMs = executionTimeout(options.timeoutMs ?? 30_000);
+    this.signal = options.signal;
     if (this.maxResultRows >= Number.MAX_SAFE_INTEGER) {
       throw new StateQLError(
         "INVALID_COMMAND",
@@ -176,10 +184,16 @@ export class StateQL {
         created_at: this.now().toISOString(),
       };
 
-      const adapter = await createAdapter(draft);
+      const adapter = await createAdapter(
+        draft,
+        this.executionContext(options),
+      );
       try {
         await adapter.read("SELECT 1", []);
       } catch (error) {
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, false);
+        }
         throw new StateQLError(
           "CONNECTION_FAILED",
           errorMessage(error),
@@ -457,7 +471,10 @@ export class StateQL {
         );
       }
       const parameters = options.params ?? [];
-      const adapter = await createAdapter(connection);
+      const adapter = await createAdapter(
+        connection,
+        this.executionContext(options),
+      );
       try {
         const stateVersion = version(connection);
         const stateSignature = await adapter.signature();
@@ -531,6 +548,9 @@ export class StateQL {
         };
       } catch (error) {
         if (error instanceof StateQLError) throw error;
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
         throw new StateQLError("QUERY_FAILED", errorMessage(error), {
           retryable: true,
           executed: true,
@@ -712,7 +732,13 @@ export class StateQL {
   async exec(sql: string, options: ExecOptions = {}): Promise<Response<unknown>> {
     return this.run("exec", async (session) => {
       const connection = this.requireConnection(session);
-      return this.performExec(session, connection, sql, options);
+      return this.performExec(
+        session,
+        connection,
+        sql,
+        options,
+        this.executionContext(options),
+      );
     });
   }
 
@@ -795,7 +821,10 @@ export class StateQL {
     });
   }
 
-  async commitTransaction(id?: string): Promise<Response<unknown>> {
+  async commitTransaction(
+    id?: string,
+    options: ExecutionOptions = {},
+  ): Promise<Response<unknown>> {
     return this.run("transaction.commit", async (session) => {
       const transaction = this.requireActiveTransaction(session, id);
       const connection = this.store.getConnection(transaction.connection_id);
@@ -820,7 +849,10 @@ export class StateQL {
           { suggestedAction: "Roll back the transaction." },
         );
       }
-      const adapter = await createAdapter(connection);
+      const adapter = await createAdapter(
+        connection,
+        this.executionContext(options),
+      );
       try {
         if (!this.store.markTransactionCommitting(transaction.id)) {
           throw new StateQLError(
@@ -836,8 +868,14 @@ export class StateQL {
             transaction.isolation_level,
           );
         } catch (error) {
-          if (error instanceof BatchWriteError && !error.outcomeUnknown) {
+          if (
+            (error instanceof BatchWriteError && !error.outcomeUnknown) ||
+            (error instanceof AdapterExecutionError && !error.outcomeUnknown)
+          ) {
             this.store.finishTransaction(transaction.id, session.id, "failed");
+            if (error instanceof AdapterExecutionError) {
+              throw stoppedStateQLError(error, false);
+            }
             throw new StateQLError("TRANSACTION_FAILED", error.message, {
               retryable: true,
             });
@@ -939,10 +977,17 @@ export class StateQL {
     });
   }
 
-  async inspect(kind: string, table?: string): Promise<Response<unknown>> {
+  async inspect(
+    kind: string,
+    table?: string,
+    options: ExecutionOptions = {},
+  ): Promise<Response<unknown>> {
     return this.run(`inspect.${kind}`, async (session) => {
       const connection = this.requireConnection(session);
-      const adapter = await createAdapter(connection);
+      const adapter = await createAdapter(
+        connection,
+        this.executionContext(options),
+      );
       try {
         const data = await adapter.inspect(kind, table);
         return {
@@ -952,6 +997,9 @@ export class StateQL {
           confidence: adapter.confidence,
         };
       } catch (error) {
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
         throw new StateQLError("QUERY_FAILED", errorMessage(error), {
           retryable: false,
           executed: true,
@@ -972,7 +1020,10 @@ export class StateQL {
           "plan accepts write statements only.",
         );
       }
-      const adapter = await createAdapter(connection);
+      const adapter = await createAdapter(
+        connection,
+        this.executionContext(options),
+      );
       try {
         const stateSignature = await adapter.signature();
         const expiresAt = new Date(this.now().getTime() + 10 * 60_000).toISOString();
@@ -1013,13 +1064,21 @@ export class StateQL {
           stateVersion: plan.state_version,
           confidence: adapter.confidence,
         };
+      } catch (error) {
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
+        throw error;
       } finally {
         await adapter.close();
       }
     });
   }
 
-  async apply(planId: string): Promise<Response<unknown>> {
+  async apply(
+    planId: string,
+    options: ExecutionOptions = {},
+  ): Promise<Response<unknown>> {
     return this.run("apply", async (session) => {
       const plan = this.store.getPlan(planId);
       if (!plan || plan.session_id !== session.id) {
@@ -1043,7 +1102,8 @@ export class StateQL {
           "Database state changed after this plan was created.",
         );
       }
-      const adapter = await createAdapter(connection);
+      const context = this.executionContext(options);
+      const adapter = await createAdapter(connection, context);
       try {
         if ((await adapter.signature()) !== plan.state_signature) {
           throw new StateQLError(
@@ -1051,6 +1111,11 @@ export class StateQL {
             "Database state changed after this plan was created.",
           );
         }
+      } catch (error) {
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
+        throw error;
       } finally {
         await adapter.close();
       }
@@ -1063,6 +1128,7 @@ export class StateQL {
           allowUnbounded: Boolean(plan.allow_unbounded),
           allowDestructive: Boolean(plan.allow_destructive),
         },
+        context,
       );
       const operationId = String(
         (result.data as Record<string, unknown>).operation_id,
@@ -1107,6 +1173,8 @@ export class StateQL {
           persistent_sessions: true,
           result_filtering: true,
           schema_inspection: true,
+          deadlines: true,
+          cancellation: true,
         },
       },
     }));
@@ -1125,6 +1193,7 @@ export class StateQL {
             readOnly: command.read_only,
             secretEnv: command.secret_env,
             profile: command.profile,
+            timeoutMs: command.timeout_ms,
           });
         case "disconnect":
           return this.disconnect();
@@ -1159,6 +1228,7 @@ export class StateQL {
           const response = await this.query(batchString(command.sql, "sql"), {
             params: command.params ?? [],
             cache: command.cache ?? "auto",
+            timeoutMs: command.timeout_ms,
           });
           if (!response.ok || !command.as) return response;
           const resultId = (response.data as Record<string, unknown>).result_id;
@@ -1191,6 +1261,7 @@ export class StateQL {
             idempotencyKey: command.idempotency_key,
             allowUnbounded: command.allow_unbounded ?? false,
             allowDestructive: command.allow_destructive ?? false,
+            timeoutMs: command.timeout_ms,
           });
         case "show":
           return this.show(batchString(command.handle, "handle"));
@@ -1209,13 +1280,17 @@ export class StateQL {
             batchString(command.handle, "handle"),
           );
         case "inspect":
-          return this.inspect(batchString(command.kind, "kind"), command.table);
+          return this.inspect(batchString(command.kind, "kind"), command.table, {
+            timeoutMs: command.timeout_ms,
+          });
         case "transaction.begin":
           return this.beginTransaction(command.isolation);
         case "transaction.status":
           return this.transactionStatus(command.handle);
         case "transaction.commit":
-          return this.commitTransaction(command.handle);
+          return this.commitTransaction(command.handle, {
+            timeoutMs: command.timeout_ms,
+          });
         case "transaction.rollback":
           return this.rollbackTransaction(command.handle);
         case "plan":
@@ -1223,9 +1298,12 @@ export class StateQL {
             params: command.params ?? [],
             allowUnbounded: command.allow_unbounded ?? false,
             allowDestructive: command.allow_destructive,
+            timeoutMs: command.timeout_ms,
           });
         case "apply":
-          return this.apply(batchString(command.handle, "handle"));
+          return this.apply(batchString(command.handle, "handle"), {
+            timeoutMs: command.timeout_ms,
+          });
         case "history":
           return this.history(command.limit ?? 20);
         case "receipt":
@@ -1272,6 +1350,7 @@ export class StateQL {
     connection: ConnectionRecord,
     sql: string,
     options: ExecOptions,
+    context: AdapterContext,
   ): Promise<ActionResult<unknown>> {
     if (connection.read_only) {
       throw new StateQLError(
@@ -1391,7 +1470,7 @@ export class StateQL {
 
     let adapter: Adapter;
     try {
-      adapter = await createAdapter(connection);
+      adapter = await createAdapter(connection, context);
     } catch (error) {
       this.store.failOperation(operation.id);
       throw new StateQLError("QUERY_FAILED", errorMessage(error), {
@@ -1429,6 +1508,10 @@ export class StateQL {
       }
     } catch (error) {
       if (error instanceof StateQLError) throw error;
+      if (error instanceof AdapterExecutionError && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        throw stoppedStateQLError(error, false);
+      }
       this.store.markOperationOutcomeUnknown(operation.id);
       throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
         executed: true,
@@ -1518,6 +1601,13 @@ export class StateQL {
       );
     }
     return transaction;
+  }
+
+  private executionContext(options: ExecutionOptions): AdapterContext {
+    return createAdapterContext(
+      executionTimeout(options.timeoutMs ?? this.timeoutMs),
+      options.signal ?? this.signal,
+    );
   }
 
   private resultData(result: ResultRecord, cached: boolean): unknown {
@@ -2143,6 +2233,17 @@ function positiveInteger(value: number, name: string): number {
   throw new StateQLError("INVALID_COMMAND", `${name} must be a positive integer.`);
 }
 
+function executionTimeout(value: number): number {
+  const timeout = positiveInteger(value, "timeoutMs");
+  if (timeout > 2_147_483_647) {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "timeoutMs cannot exceed 2147483647 milliseconds.",
+    );
+  }
+  return timeout;
+}
+
 function rowsToCsv(rows: Row[], columns: string[]): string {
   const encode = (value: unknown): string => {
     const text =
@@ -2157,6 +2258,17 @@ function rowsToCsv(rows: Row[], columns: string[]): string {
     columns.map(encode).join(","),
     ...rows.map((row) => columns.map((column) => encode(row[column])).join(",")),
   ].join("\n") + "\n";
+}
+
+function stoppedStateQLError(
+  error: AdapterExecutionError,
+  executed: boolean,
+): StateQLError {
+  return new StateQLError(
+    error.reason === "timeout" ? "DEADLINE_EXCEEDED" : "OPERATION_CANCELLED",
+    error.message,
+    { retryable: true, executed },
+  );
 }
 
 function errorMessage(error: unknown): string {
