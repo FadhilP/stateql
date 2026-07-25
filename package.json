@@ -2,6 +2,10 @@
   "name": "@fadhilp/stateql",
   "version": "0.1.1",
   "description": "Stateful, agent-oriented database CLI for safe result reuse",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FadhilP/stateql.git"
+  },
   "type": "module",
   "bin": {
     "stql": "dist/src/cli.js"

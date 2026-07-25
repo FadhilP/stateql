@@ -8,6 +8,10 @@ Requires Node.js 22.5 or newer.
 
 ## Quick start
 
+```bash
+npm install -g @fadhilp/stateql
+```
+
 Connect to an existing SQLite database, then run a filtered, parameterized
 query. Parameters keep values separate from SQL; `ORDER BY` makes paging
 stable, while `LIMIT` bounds work at the database.
