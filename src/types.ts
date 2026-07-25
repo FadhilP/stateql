@@ -64,6 +64,10 @@ export interface QueryOptions {
   cache?: "auto" | "bypass" | "require";
 }
 
+export interface FilterOptions {
+  params?: SqlParameters;
+}
+
 export interface ExecOptions {
   params?: SqlParameters;
   replay?: boolean;
@@ -109,6 +113,7 @@ export type BatchCommandName =
   | "session.summary"
   | "session.close"
   | "query"
+  | "filter"
   | "exec"
   | "show"
   | "rows"
@@ -130,6 +135,7 @@ export interface BatchCommand {
   command: BatchCommandName;
   target?: string;
   sql?: string;
+  where?: string;
   handle?: string;
   name?: string;
   as?: string;

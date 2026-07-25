@@ -13,6 +13,8 @@ import type {
   SqlParameters,
 } from "./types.js";
 
+type OutputMode = "agent" | "json" | "jsonl" | "text" | "silent";
+
 const parsed = parseArgs({
   allowPositionals: true,
   strict: true,
@@ -67,29 +69,35 @@ try {
 
 async function runSingle(): Promise<void> {
   let response: Response<unknown>;
-  let mode: "json" | "jsonl" | "text" | "silent" = "json";
+  let mode: OutputMode = "agent";
   try {
-    response = await dispatch();
     mode = outputMode(command ?? "", values.output);
+    response = await dispatch();
   } catch (error) {
     response = cliFailure(error);
   }
-  print(response, mode);
+  print(response, mode, command ?? "");
   if (!response.ok) process.exitCode = exitCodeFor(response.error.code);
 }
 
 async function runBatch(): Promise<void> {
-  const mode = values.output
-    ? outputMode(command ?? "batch", values.output)
-    : "jsonl";
+  const mode = outputMode(command ?? "batch", values.output);
   const jsonResponses: Response<unknown>[] = [];
+  const pendingCommands: string[] = [];
+  const commands = readBatchCommands(subcommand ?? "-");
+  const trackedCommands = (async function* (): AsyncGenerator<BatchCommand> {
+    for await (const item of commands) {
+      pendingCommands.push(item.command);
+      yield item;
+    }
+  })();
   try {
-    for await (const response of stateql.batch(
-      readBatchCommands(subcommand ?? "-"),
-      { continueOnError: values["continue-on-error"] ?? false },
-    )) {
+    for await (const response of stateql.batch(trackedCommands, {
+      continueOnError: values["continue-on-error"] ?? false,
+    })) {
+      const responseCommand = pendingCommands.shift() ?? command ?? "batch";
       if (mode === "json") jsonResponses.push(response);
-      else print(response, mode);
+      else print(response, mode, responseCommand);
       if (!response.ok && process.exitCode === undefined) {
         process.exitCode = exitCodeFor(response.error.code);
       }
@@ -97,7 +105,7 @@ async function runBatch(): Promise<void> {
   } catch (error) {
     const response = cliFailure(error);
     if (mode === "json") jsonResponses.push(response);
-    else print(response, mode);
+    else print(response, mode, pendingCommands.shift() ?? command ?? "batch");
     process.exitCode = exitCodeFor(response.error.code);
   }
   if (mode === "json") console.log(JSON.stringify(jsonResponses, null, 2));
@@ -143,6 +151,12 @@ async function dispatch(): Promise<Response<unknown>> {
         params,
         cache: cacheMode(values.cache),
       });
+    case "filter":
+      return stateql.filter(
+        requireValue(subcommand, "result handle"),
+        requireValue(rest.join(" ").trim(), "filter predicate"),
+        { params },
+      );
     case "exec":
       return stateql.exec(sql, {
         params,
@@ -405,10 +419,13 @@ function requireValue(
 function outputMode(
   currentCommand: string,
   value: string | undefined,
-): "json" | "jsonl" | "text" | "silent" {
-  if (currentCommand === "export") return "json";
-  const mode = value ?? process.env.STQL_OUTPUT ?? "json";
+): OutputMode {
+  const mode =
+    currentCommand === "export"
+      ? process.env.STQL_OUTPUT ?? "agent"
+      : value ?? process.env.STQL_OUTPUT ?? "agent";
   if (
+    mode === "agent" ||
     mode === "json" ||
     mode === "jsonl" ||
     mode === "text" ||
@@ -416,12 +433,15 @@ function outputMode(
   ) {
     return mode;
   }
-  throw new Error("--output must be json, jsonl, text, or silent.");
+  throw new Error(
+    "--output must be agent, json, jsonl, text, or silent.",
+  );
 }
 
 function print(
   result: Response<unknown>,
-  mode: "json" | "jsonl" | "text" | "silent",
+  mode: OutputMode,
+  currentCommand: string,
 ): void {
   if (mode === "silent") {
     if (result.ok) {
@@ -439,7 +459,105 @@ function print(
     console.log(handle ? `ok ${handle}` : "ok");
     return;
   }
-  console.log(mode === "json" ? JSON.stringify(result, null, 2) : JSON.stringify(result));
+  if (mode === "agent") {
+    console.log(JSON.stringify(toAgentResponse(result, currentCommand)));
+    return;
+  }
+  console.log(
+    mode === "json" ? JSON.stringify(result, null, 2) : JSON.stringify(result),
+  );
+}
+
+function toAgentResponse(
+  result: Response<unknown>,
+  currentCommand: string,
+): Record<string, unknown> {
+  if (!result.ok) return { ok: false, error: result.error };
+  if (
+    !result.data ||
+    typeof result.data !== "object" ||
+    Array.isArray(result.data)
+  ) {
+    return { ok: true, data: result.data };
+  }
+
+  const data = { ...(result.data as Record<string, unknown>) };
+  const handleKey = primaryHandleKey(currentCommand);
+  const handle =
+    handleKey && typeof data[handleKey] === "string" && data[handleKey]
+      ? data[handleKey]
+      : undefined;
+  if (handle && handleKey) delete data[handleKey];
+
+  if (
+    (currentCommand === "query" ||
+      currentCommand === "filter" ||
+      currentCommand === "show") &&
+    typeof data.rows === "number" &&
+    Array.isArray(data.preview)
+  ) {
+    const total = data.rows;
+    const rows = data.preview;
+    const truncated = Boolean(data.truncated);
+    data.rows = rows;
+    data.total = total;
+    data.next_offset = truncated ? rows.length : null;
+    delete data.preview;
+    delete data.preview_count;
+    delete data.columns;
+    delete data.storage;
+    delete data.state_version;
+    delete data.duplicate_of;
+  } else if (currentCommand === "rows") {
+    delete data.offset;
+    delete data.limit;
+    delete data.returned;
+  } else if (currentCommand === "count" && typeof data.rows === "number") {
+    data.total = data.rows;
+    delete data.rows;
+  }
+
+  for (const key of ["ok", "error", "handle", "warnings"]) {
+    if (!(key in data)) continue;
+    data[`data_${key}`] = data[key];
+    delete data[key];
+  }
+
+  return {
+    ok: true,
+    ...(handle ? { handle } : {}),
+    ...data,
+    ...(result.warnings.length ? { warnings: result.warnings } : {}),
+  };
+}
+
+function primaryHandleKey(currentCommand: string): string | undefined {
+  const keys: Record<string, string> = {
+    query: "result_id",
+    filter: "result_id",
+    show: "result_id",
+    rows: "result_id",
+    count: "result_id",
+    columns: "result_id",
+    export: "result_id",
+    alias: "result_id",
+    "alias.set": "result_id",
+    exec: "operation_id",
+    receipt: "operation_id",
+    apply: "operation_id",
+    plan: "plan_id",
+    connect: "connection_id",
+    transaction: "transaction_id",
+    "transaction.begin": "transaction_id",
+    "transaction.status": "transaction_id",
+    "transaction.commit": "transaction_id",
+    "transaction.rollback": "transaction_id",
+    session: "session_id",
+    "session.start": "session_id",
+    "session.show": "session_id",
+    "session.close": "session_id",
+  };
+  return keys[currentCommand];
 }
 
 function cliFailure(error: unknown): Failure {
@@ -482,7 +600,7 @@ Commands:
   connect, disconnect, status
   profile add|list|show|remove
   session start|list|show|summary|close
-  query, exec, show, rows, count, columns, export
+  query, filter, exec, show, rows, count, columns, export
   alias set
   inspect schema|table|columns|indexes|constraints
   transaction begin|status|commit|rollback
@@ -491,5 +609,6 @@ Commands:
   pipe
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
+Output: --output agent|json|jsonl|text|silent (default: agent).
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;
 }

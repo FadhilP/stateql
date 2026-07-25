@@ -7,6 +7,7 @@ export type {
   ConnectOptions,
   ExecOptions,
   Failure,
+  FilterOptions,
   PlanOptions,
   ProfileOptions,
   QueryOptions,

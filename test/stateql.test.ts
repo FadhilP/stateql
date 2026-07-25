@@ -103,6 +103,142 @@ test("durable handles, normalized cache reuse, parameters, and compact rows", as
   fixture.stateql.close();
 });
 
+test("filters materialized handles locally into durable derived results", async () => {
+  const fixture = await createFixture();
+  await succeed(
+    fixture.stateql.exec(
+      "CREATE TABLE filter_users (id INTEGER PRIMARY KEY, email TEXT, active INTEGER)",
+    ),
+  );
+  await succeed(
+    fixture.stateql.exec(
+      `INSERT INTO filter_users (email, active) VALUES
+       ('a@example.com', 1), ('b@other.test', 0), ('c@example.com', 1)`,
+    ),
+  );
+  const source = await succeed(
+    fixture.stateql.query(
+      "SELECT id, email, active FROM filter_users ORDER BY id",
+    ),
+  );
+  await succeed(fixture.stateql.disconnect());
+
+  const filtered = await succeed(
+    fixture.stateql.filter(String(source.result_id), "email LIKE ? AND active = ?", {
+      params: ["%@example.com", 1],
+    }),
+  );
+  assert.equal(filtered.result_id, "q_2");
+  assert.equal(filtered.rows, 2);
+  assert.deepEqual(
+    filtered.preview.map((row: Record<string, unknown>) => row.id),
+    [1, 3],
+  );
+  assert.equal(filtered.storage.expires_at, source.storage.expires_at);
+  assert.equal(
+    (await succeed(fixture.stateql.count(String(source.result_id)))).rows,
+    3,
+  );
+  assert.equal(
+    (await succeed(fixture.stateql.count(String(filtered.result_id)))).rows,
+    2,
+  );
+
+  const repeated = await succeed(
+    fixture.stateql.filter(String(source.result_id), "email LIKE ? AND active = ?", {
+      params: ["%@example.com", 1],
+    }),
+  );
+  assert.equal(repeated.result_id, filtered.result_id);
+  assert.equal(repeated.cached, true);
+  const changedParameter = await succeed(
+    fixture.stateql.filter(String(source.result_id), "email LIKE ?", {
+      params: ["%@other.test"],
+    }),
+  );
+  assert.notEqual(changedParameter.result_id, filtered.result_id);
+  assert.equal(changedParameter.preview[0].id, 2);
+
+  const named = await succeed(
+    fixture.stateql.filter(String(source.result_id), "lower(email) LIKE :domain", {
+      params: { domain: "%@example.com" },
+    }),
+  );
+  assert.equal(named.rows, 2);
+
+  assertFailure(
+    await fixture.stateql.filter(String(source.result_id), "missing = 1"),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(String(source.result_id), "email LIKE ?"),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(String(source.result_id), "active = 1", {
+      params: [1],
+    }),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(
+      String(source.result_id),
+      "1 = 1) UNION SELECT 0 --",
+    ),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(
+      String(source.result_id),
+      "1 = 1); DROP TABLE source; --",
+    ),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(
+      String(source.result_id),
+      "EXISTS (SELECT 1)",
+    ),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(
+      String(source.result_id),
+      "randomblob(100000000) IS NOT NULL",
+    ),
+    "INVALID_SQL",
+  );
+  assertFailure(
+    await fixture.stateql.filter(
+      String(source.result_id),
+      "email = :domain OR email = $domain",
+      { params: { domain: "a@example.com" } },
+    ),
+    "INVALID_SQL",
+  );
+  fixture.stateql.close();
+});
+
+test("filters reject ambiguous result columns", async () => {
+  const fixture = await createFixture();
+  const source = await succeed(fixture.stateql.query("SELECT 1 AS value"));
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db
+    .prepare("UPDATE results SET columns_json = ? WHERE id = ?")
+    .run(
+      JSON.stringify([
+        { name: "value", type: "number" },
+        { name: "Value", type: "number" },
+      ]),
+      source.result_id,
+    );
+  assertFailure(
+    await fixture.stateql.filter(String(source.result_id), "value = 1"),
+    "INVALID_SQL",
+  );
+  fixture.stateql.close();
+});
+
 test("writes are safe, idempotent, replayable, and invalidate reads", async () => {
   const fixture = await createFixture();
   await succeed(
@@ -309,6 +445,10 @@ test("state persists across restarts, expires, and detects external SQLite write
   clock = new Date(clock.getTime() + 86_401_000);
   assertFailure(
     await restarted.show(String(refreshed.result_id)),
+    "RESULT_EXPIRED",
+  );
+  assertFailure(
+    await restarted.filter(String(refreshed.result_id), "value IS NOT NULL"),
     "RESULT_EXPIRED",
   );
   restarted.close();
@@ -695,9 +835,7 @@ test("local profiles persist and connect by bare or explicit name", async () => 
   );
   assert.equal(cliConnect.status, 0, cliConnect.stderr);
   assert.equal(
-    (JSON.parse(cliConnect.stdout) as {
-      data: { profile: string };
-    }).data.profile,
+    (JSON.parse(cliConnect.stdout) as { profile: string }).profile,
     "cli",
   );
 });
@@ -764,9 +902,7 @@ test("CLI accepts shell-safe parameters and applies destructive plans", async ()
     },
   );
   assert.equal(plan.status, 0, plan.stdout);
-  const planId = (JSON.parse(plan.stdout) as {
-    data: { plan_id: string };
-  }).data.plan_id;
+  const planId = (JSON.parse(plan.stdout) as { handle: string }).handle;
   const apply = spawnSync(
     process.execPath,
     ["dist/src/cli.js", "apply", planId],
@@ -777,6 +913,10 @@ test("CLI accepts shell-safe parameters and applies destructive plans", async ()
     },
   );
   assert.equal(apply.status, 0, apply.stdout);
+  const applied = JSON.parse(apply.stdout) as Record<string, unknown>;
+  assert.match(String(applied.handle), /^op_/);
+  assert.equal(applied.plan_id, planId);
+  assert.equal("operation_id" in applied, false);
 
   const restarted = new StateQL({ home: fixture.home });
   const rows = await succeed(
@@ -785,6 +925,161 @@ test("CLI accepts shell-safe parameters and applies destructive plans", async ()
   assert.equal(rows.rows, 1);
   assert.equal(rows.preview[0].name, "Bob");
   restarted.close();
+});
+
+test("CLI defaults to compact agent output and preserves verbose JSON", async () => {
+  const fixture = await createFixture();
+  await succeed(
+    fixture.stateql.exec(
+      "CREATE TABLE output_rows (id INTEGER PRIMARY KEY, name TEXT)",
+    ),
+  );
+  await succeed(
+    fixture.stateql.exec(
+      "INSERT INTO output_rows (name) VALUES ('Ada'), ('Grace'), ('Linus')",
+    ),
+  );
+  fixture.stateql.close();
+
+  const compactQuery = spawnSync(
+    process.execPath,
+    [
+      "dist/src/cli.js",
+      "query",
+      "SELECT id, name FROM output_rows ORDER BY id",
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactQuery.status, 0, compactQuery.stderr);
+  assert.equal(compactQuery.stdout.trim().split(/\r?\n/).length, 1);
+  const compact = JSON.parse(compactQuery.stdout) as Record<string, any>;
+  assert.equal(compact.ok, true);
+  assert.equal(compact.handle, "q_1");
+  assert.equal(compact.total, 3);
+  assert.equal(compact.rows.length, 3);
+  assert.equal(compact.next_offset, null);
+  assert.equal("data" in compact, false);
+  assert.equal("command_id" in compact, false);
+  assert.equal("session_id" in compact, false);
+  assert.equal("columns" in compact, false);
+  assert.equal("meta" in compact, false);
+
+  const compactRows = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "rows", "q_1", "--limit", "2"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactRows.status, 0, compactRows.stderr);
+  const page = JSON.parse(compactRows.stdout) as Record<string, any>;
+  assert.equal(page.handle, "q_1");
+  assert.equal(page.rows.length, 2);
+  assert.equal(page.total, 3);
+  assert.equal(page.next_offset, 2);
+  assert.equal("offset" in page, false);
+  assert.equal("limit" in page, false);
+  assert.equal("returned" in page, false);
+
+  const compactCount = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "count", "q_1"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactCount.status, 0, compactCount.stderr);
+  assert.deepEqual(JSON.parse(compactCount.stdout), {
+    ok: true,
+    handle: "q_1",
+    total: 3,
+  });
+
+  const compactFilter = spawnSync(
+    process.execPath,
+    [
+      "dist/src/cli.js",
+      "filter",
+      "q_1",
+      "name LIKE ?",
+      "--param",
+      "A%",
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactFilter.status, 0, compactFilter.stderr);
+  const filtered = JSON.parse(compactFilter.stdout) as Record<string, any>;
+  assert.equal(filtered.handle, "q_2");
+  assert.equal(filtered.total, 1);
+  assert.equal(filtered.rows[0].name, "Ada");
+  assert.equal(filtered.next_offset, null);
+
+  const compactWarning = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "query", "SELECT id FROM output_rows"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactWarning.status, 0, compactWarning.stderr);
+  const warning = JSON.parse(compactWarning.stdout) as Record<string, any>;
+  assert.equal(warning.warnings[0].code, "NON_DETERMINISTIC_PAGINATION");
+
+  const verboseQuery = spawnSync(
+    process.execPath,
+    [
+      "dist/src/cli.js",
+      "query",
+      "SELECT id, name FROM output_rows ORDER BY id",
+      "--cache",
+      "bypass",
+      "--output",
+      "json",
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(verboseQuery.status, 0, verboseQuery.stderr);
+  const verbose = JSON.parse(verboseQuery.stdout) as Record<string, any>;
+  assert.equal(verbose.ok, true);
+  assert.equal(typeof verbose.command_id, "string");
+  assert.equal(typeof verbose.session_id, "string");
+  assert.equal(verbose.data.rows, 3);
+  assert.equal(verbose.data.columns.length, 2);
+  assert.equal(typeof verbose.meta.duration_ms, "number");
+
+  const compactError = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "exec", "UPDATE output_rows SET name = 'unsafe'"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.notEqual(compactError.status, 0);
+  const failure = JSON.parse(compactError.stdout) as Record<string, any>;
+  assert.deepEqual(Object.keys(failure), ["ok", "error"]);
+  assert.equal(failure.error.code, "UNBOUNDED_MUTATION");
+  assert.equal(failure.error.executed, false);
+  assert.equal(failure.error.retryable, false);
 });
 
 test("batch and pipe execute sequential JSON commands with safe failure control", async () => {
@@ -805,10 +1100,17 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
         sql: "SELECT * FROM batch_items ORDER BY id",
         as: "batch_rows",
       },
-      { command: "rows", handle: "batch_rows", limit: 1 },
+      {
+        command: "filter",
+        handle: "batch_rows",
+        where: "name LIKE ?",
+        params: ["o%"],
+        as: "filtered_rows",
+      },
+      { command: "rows", handle: "filtered_rows", limit: 1 },
     ]),
   );
-  assert.equal(responses.length, 2);
+  assert.equal(responses.length, 3);
   assert.equal(responses.every((response) => response.ok), true);
   assert.equal(
     (
@@ -816,6 +1118,13 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
         .data as Record<string, unknown>
     ).alias,
     "batch_rows",
+  );
+  assert.equal(
+    (
+      (responses[1] as Extract<Response<unknown>, { ok: true }>)
+        .data as Record<string, unknown>
+    ).alias,
+    "filtered_rows",
   );
 
   const invalid = { command: "query" } as BatchCommand;
@@ -853,9 +1162,12 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
   const output = pipe.stdout
     .trim()
     .split(/\r?\n/)
-    .map((line) => JSON.parse(line) as Response<unknown>);
+    .map((line) => JSON.parse(line) as Record<string, any>);
   assert.equal(output.length, 2);
   assert.equal(output.every((response) => response.ok), true);
+  assert.equal("data" in output[0]!, false);
+  assert.equal(output[0]!.handle, "q_1");
+  assert.equal(output[1]!.total, 1);
 
   const batchFile = join(fixture.home, "commands.json");
   writeFileSync(

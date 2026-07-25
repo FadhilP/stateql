@@ -6,14 +6,60 @@ results reusable and operations traceable across commands.
 
 Requires Node.js 22.5 or newer.
 
+## Quick start
+
+Connect to an existing SQLite database, then run a filtered, parameterized
+query. Parameters keep values separate from SQL; `ORDER BY` makes paging
+stable, while `LIMIT` bounds work at the database.
+
 ```bash
 npm install --global stateql
-stql session start --name audit
-stql profile add local ./app.sqlite --read-write
+export STQL_SESSION=audit
+stql profile add local ./app.sqlite
 stql connect local
-stql query "SELECT id, email FROM users ORDER BY id"
-stql rows q_1 --offset 5 --limit 5
+
+stql query \
+  "SELECT id, name, email FROM users WHERE status = ? AND created_at >= ? ORDER BY id LIMIT 50" \
+  --param active \
+  --param 2026-01-01
 ```
+
+Example output:
+
+```json
+{"ok":true,"handle":"q_1","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"},{"id":18,"name":"Linus","email":"linus@kernel.org"}],"truncated":false,"cached":false,"total":3,"next_offset":null}
+```
+
+`q_1` is a durable result handle. Filter its stored snapshot without querying
+the original database; the result becomes another durable handle:
+
+```bash
+stql filter q_1 "email LIKE ?" --param "%@example.com"
+```
+
+```json
+{"ok":true,"handle":"q_2","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"}],"truncated":false,"cached":false,"total":2,"next_offset":null}
+```
+
+Give the derived result a readable alias, page through it, inspect its count,
+or export it—all without rerunning SQL:
+
+```bash
+stql alias set example-users q_2
+stql rows example-users --offset 0 --limit 1
+stql rows example-users --offset 1 --limit 1
+stql count example-users
+stql export example-users --output example-users.csv --format csv
+```
+
+Example first page:
+
+```json
+{"ok":true,"handle":"q_2","rows":[{"id":7,"name":"Ada","email":"ada@example.com"}],"total":2,"truncated":true,"next_offset":1}
+```
+
+Running the same normalized query with the same parameters reuses `q_1` while
+its cache is valid. Use `--cache bypass` when a fresh read is required.
 
 PostgreSQL credentials should come from an environment variable:
 
@@ -31,6 +77,7 @@ stql status
 stql profile add|list|show|remove
 stql session start|list|show|summary|close
 stql query <sql> [--params JSON | --param VALUE...] [--cache auto|bypass|require]
+stql filter <result-handle> <predicate> [--params JSON | --param VALUE...]
 stql exec <sql> [--params JSON | --param VALUE...] [--idempotency-key KEY] [--replay]
               [--allow-unbounded] [--allow-destructive]
 stql show|count|columns <result-handle>
@@ -46,6 +93,23 @@ stql capabilities
 stql batch [commands.json|commands.jsonl|-] [--continue-on-error]
 stql pipe [--continue-on-error]
 ```
+
+## Output modes
+
+CLI output defaults to compact, one-line `agent` JSON. Successes flatten useful
+data and expose the primary durable ID as `handle`; errors retain their complete
+error object. Empty warnings and tracing metadata are omitted.
+
+```json
+{"ok":false,"error":{"code":"UNBOUNDED_MUTATION","message":"Mutation has no WHERE clause.","retryable":false,"executed":false,"override_flag":"--allow-unbounded"}}
+```
+
+Use `--output json` for the original pretty, verbose envelope, or
+`--output jsonl` for that envelope on one line. `--output text` prints a short
+human status; `--output silent` prints only a successful handle. Set
+`STQL_OUTPUT` to choose a mode globally. For `export`, `--output` names the
+file, so use `STQL_OUTPUT` to choose its response mode. Library responses keep
+the full envelope regardless of CLI mode.
 
 For shell-safe positional parameters, repeat `--param`. JSON scalars become
 their native types; other values remain strings.
@@ -78,12 +142,14 @@ policy, and environment-variable names. Credential values are never stored.
 
 `batch` reads a JSON array from a `.json` file or JSONL from a `.jsonl` file.
 `pipe` reads JSONL from standard input. Commands run sequentially and stop on
-the first error unless `--continue-on-error` is set. Output defaults to JSONL.
+the first error unless `--continue-on-error` is set. Output defaults to one
+compact `agent` JSON object per line.
 
 ```bash
 printf '%s\n' \
-  '{"command":"query","sql":"SELECT id FROM users ORDER BY id","as":"users"}' \
-  '{"command":"rows","handle":"users","limit":10}' |
+  '{"command":"query","sql":"SELECT id, email FROM users ORDER BY id","as":"users"}' \
+  '{"command":"filter","handle":"users","where":"email LIKE ?","params":["%@example.com"],"as":"example_users"}' \
+  '{"command":"rows","handle":"example_users","limit":10}' |
   stql pipe
 ```
 
@@ -104,12 +170,13 @@ printf '%s\n' \
 ```
 
 Run the array with `stql batch commands.json`. Batch fields use snake case;
-supported command names match CLI paths, such as `transaction.begin`,
-`session.summary`, `alias.set`, `plan`, and `apply`.
+supported command names match CLI paths, such as `filter`,
+`transaction.begin`, `session.summary`, `alias.set`, `plan`, and `apply`.
+Batch filters use `where` for the predicate and may assign the derived result
+with `as`.
 
-JSON envelopes are the default. State metadata lives under
-`STQL_HOME`, or the platform data directory when unset. Set `STQL_SESSION` to
-select a named session.
+State metadata lives under `STQL_HOME`, or the platform data directory when
+unset. Set `STQL_SESSION` to select a named session.
 
 Read cache entries expire after five minutes; materialized handles expire after
 24 hours. Queries exceeding 10,000 rows fail before materialization; add a
@@ -125,6 +192,11 @@ transactions.
 
 StateQL stores no PostgreSQL password. Credential-bearing URLs must be supplied
 through `--env`. SQLite result rows are materialized locally for durable access.
+`filter` evaluates one scalar SQLite predicate against those stored rows, keeps
+source order, state metadata, and expiry, and never accesses the original
+database. Use parameters for values. Subqueries, query-shaping clauses, and
+non-allowlisted functions are rejected; common deterministic functions such as
+`lower`, `upper`, `length`, and `coalesce` are supported.
 
 Destructive and unbounded operations require their respective flags
 independently. Plans persist only flags explicitly supplied when the plan is
@@ -141,4 +213,10 @@ import { StateQL } from "stateql";
 
 const stateql = new StateQL({ home: "./.stql" });
 const response = await stateql.query("SELECT * FROM users");
+if (response.ok) {
+  const handle = (response.data as { result_id: string }).result_id;
+  await stateql.filter(handle, "email LIKE ?", {
+    params: ["%@example.com"],
+  });
+}
 ```
