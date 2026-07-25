@@ -25,7 +25,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/stateql.test.js",
+    "test": "npm run build && node --test dist/test/cli.test.js dist/test/query.test.js dist/test/store.test.js dist/test/transaction.test.js dist/test/write.test.js",
     "prepack": "npm test"
   },
   "keywords": [
