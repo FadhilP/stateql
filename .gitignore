@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+.stql/
+coverage/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
