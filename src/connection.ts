@@ -26,7 +26,12 @@ export function detectDriver(target: string): Driver {
 
 export function normalizeSqliteSource(target: string): string {
   const source = target.startsWith("sqlite:") ? target.slice(7) : target;
-  if (source === ":memory:") return source;
+  if (source === ":memory:") {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "SQLite :memory: databases cannot persist across StateQL commands.",
+    );
+  }
   return resolve(source);
 }
 

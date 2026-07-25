@@ -13,6 +13,15 @@ import {
   succeed,
 } from "./helpers.js";
 
+test("CLI version matches the published package version", () => {
+  const version = spawnSync(process.execPath, ["dist/src/cli.js", "--version"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+  assert.equal(version.status, 0, version.stderr);
+  assert.equal(version.stdout.trim(), "0.1.2");
+});
+
 test("local profiles persist and connect by bare or explicit name", async () => {
   const root = createTemporaryDirectory("stateql-profile-test-");
   const home = join(root, "state");

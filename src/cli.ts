@@ -48,7 +48,7 @@ const [command, subcommand, ...rest] = parsed.positionals;
 const values = parsed.values;
 
 if (values.version) {
-  console.log("0.1.0");
+  console.log("0.1.2");
   process.exit(0);
 }
 if (values.help || !command) {
@@ -600,7 +600,7 @@ function extractHandle(data: unknown): string | undefined {
 }
 
 function helpText(): string {
-  return `StateQL 0.1.0
+  return `StateQL 0.1.2
 
 Usage: stql <command> [arguments] [options]
 

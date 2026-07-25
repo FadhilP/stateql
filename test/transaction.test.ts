@@ -42,6 +42,18 @@ test("transactions survive staging, commit atomically, and rollback clears dupli
       params: ["keep"],
     }),
   );
+  assertFailure(
+    await fixture.stateql.query("SELECT * FROM events"),
+    "TRANSACTION_FAILED",
+  );
+  assertFailure(
+    await fixture.stateql.inspect("schema"),
+    "TRANSACTION_FAILED",
+  );
+  assertFailure(
+    await fixture.stateql.plan("INSERT INTO events (label) VALUES ('later')"),
+    "TRANSACTION_FAILED",
+  );
   const committed = await succeed(
     fixture.stateql.commitTransaction(String(transaction.transaction_id)),
   );

@@ -61,6 +61,7 @@ export interface StateQLOptions extends ExecutionOptions {
   resultTtlSeconds?: number;
   maxCellCharacters?: number;
   maxResultRows?: number;
+  maxResultBytes?: number;
   now?: () => Date;
 }
 

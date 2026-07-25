@@ -261,6 +261,22 @@ test("query materialization stops at the configured row bound", async () => {
   stateql.close();
 });
 
+test("query materialization enforces a serialized byte bound", async () => {
+  const root = createTemporaryDirectory("stateql-byte-bound-test-");
+  const stateql = new StateQL({
+    home: join(root, "state"),
+    maxResultBytes: 16,
+  });
+  await succeed(
+    stateql.connect(join(root, "target.sqlite"), { readOnly: false }),
+  );
+  assertFailure(
+    await stateql.query("SELECT 'larger than limit' AS value"),
+    "OUTPUT_LIMIT_EXCEEDED",
+  );
+  stateql.close();
+});
+
 test("schema inspection and secret handling stay machine-safe", async () => {
   const fixture = await createFixture();
   await succeed(

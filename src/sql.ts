@@ -94,7 +94,9 @@ export function analyzeSql(sql: string, driver: Driver): SqlAnalysis {
       statementType === "alter" ||
       statementType === "delete" ||
       statementType === "replace" ||
-      statementType === "truncate";
+      statementType === "truncate" ||
+      (driver === "sqlite" &&
+        /^(?:INSERT|UPDATE) OR REPLACE\b/i.test(normalized));
 
     return {
       ast,

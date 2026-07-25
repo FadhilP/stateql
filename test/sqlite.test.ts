@@ -4,7 +4,8 @@ import { test } from "node:test";
 import { detectDriver } from "../src/connection.js";
 import { analyzeSql } from "../src/sql.js";
 import type { Response } from "../src/types.js";
-import { createFixture, succeed } from "./helpers.js";
+import { createFixture, createTemporaryDirectory, succeed } from "./helpers.js";
+import { StateQL } from "../src/stateql.js";
 
 test("SQLite detection and SQL parsing stay explicit", () => {
   assert.equal(detectDriver("target.sqlite"), "sqlite");
@@ -12,6 +13,16 @@ test("SQLite detection and SQL parsing stay explicit", () => {
     analyzeSql("SELECT value FROM items WHERE id = ?", "sqlite").statementType,
     "select",
   );
+});
+
+test("SQLite in-memory targets are rejected instead of losing committed writes", async () => {
+  const stateql = new StateQL({ home: createTemporaryDirectory() });
+  for (const target of [":memory:", "sqlite::memory:"]) {
+    const response = await stateql.connect(target, { readOnly: false });
+    assert.equal(response.ok, false);
+    if (!response.ok) assert.equal(response.error.code, "INVALID_COMMAND");
+  }
+  stateql.close();
 });
 
 test("SQLite deadlines and AbortSignal cancellation stay off the event loop", async () => {

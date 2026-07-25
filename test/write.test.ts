@@ -57,12 +57,19 @@ test("writes are safe, idempotent, replayable, and invalidate reads", async () =
   );
   const keyedAgain = await succeed(
     fixture.stateql.exec("INSERT INTO users (status) VALUES (?)", {
-      params: ["changed-but-same-key"],
+      params: ["keyed"],
       idempotencyKey: "insert-keyed",
     }),
   );
   assert.equal(keyedAgain.operation_id, keyed.operation_id);
   assert.equal(keyedAgain.duplicate, true);
+  assertFailure(
+    await fixture.stateql.exec("INSERT INTO users (status) VALUES (?)", {
+      params: ["changed-but-same-key"],
+      idempotencyKey: "insert-keyed",
+    }),
+    "IDEMPOTENCY_CONFLICT",
+  );
 
   assertFailure(
     await fixture.stateql.exec("UPDATE users SET status = 'bad'"),
@@ -193,6 +200,12 @@ test("SQL safety fails closed and plans require explicit overrides", async () =>
     "DESTRUCTIVE_OPERATION_BLOCKED",
   );
   assertFailure(
+    await fixture.stateql.exec(
+      "INSERT OR REPLACE INTO policy_rows (id) VALUES (1)",
+    ),
+    "DESTRUCTIVE_OPERATION_BLOCKED",
+  );
+  assertFailure(
     await fixture.stateql.exec("ATTACH DATABASE 'other.sqlite' AS other"),
     "INVALID_SQL",
   );
@@ -223,6 +236,52 @@ test("SQL safety fails closed and plans require explicit overrides", async () =>
   );
   assert.equal(allowed.requires_confirmation, false);
   await succeed(fixture.stateql.apply(String(allowed.plan_id)));
+  fixture.stateql.close();
+});
+
+test("idempotency conflicts are rejected while the first write is pending", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE keyed_rows (value TEXT)"));
+  await succeed(fixture.stateql.beginTransaction());
+  await succeed(
+    fixture.stateql.exec("INSERT INTO keyed_rows (value) VALUES (?)", {
+      params: ["first"],
+      idempotencyKey: "pending-key",
+    }),
+  );
+  assertFailure(
+    await fixture.stateql.exec("INSERT INTO keyed_rows (value) VALUES (?)", {
+      params: ["different"],
+      idempotencyKey: "pending-key",
+    }),
+    "IDEMPOTENCY_CONFLICT",
+  );
+  await succeed(fixture.stateql.rollbackTransaction());
+  fixture.stateql.close();
+});
+
+test("known SQLite write failures do not poison duplicate protection", async () => {
+  const fixture = await createFixture();
+  await succeed(
+    fixture.stateql.exec("CREATE TABLE unique_rows (id INTEGER PRIMARY KEY)"),
+  );
+  await succeed(fixture.stateql.exec("INSERT INTO unique_rows (id) VALUES (1)"));
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const failed = await fixture.stateql.exec(
+      "INSERT INTO unique_rows (id) VALUES (?)",
+      { params: [1] },
+    );
+    assert.equal(failed.ok, false);
+    if (!failed.ok) {
+      assert.equal(failed.error.code, "QUERY_FAILED");
+      assert.equal(failed.error.executed, true);
+    }
+  }
+  assert.equal(
+    (await succeed(fixture.stateql.query("SELECT * FROM unique_rows"))).rows,
+    1,
+  );
   fixture.stateql.close();
 });
 

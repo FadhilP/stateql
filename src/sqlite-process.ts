@@ -81,8 +81,24 @@ function execute(request: Request): unknown {
     case "write": {
       if (readOnly) throw new Error("Connection is read-only.");
       const [sql, params] = request.args as [string, SqlParameters];
-      const result = bindRun(database.prepare(sql), params);
-      return { affectedRows: Number(result.changes) };
+      try {
+        database.exec("BEGIN");
+      } catch (error) {
+        throw new SQLiteBatchError(errorText(error), false);
+      }
+      try {
+        const result = bindRun(database.prepare(sql), params);
+        database.exec("COMMIT");
+        return { affectedRows: Number(result.changes) };
+      } catch (error) {
+        try {
+          database.exec("ROLLBACK");
+          throw new SQLiteBatchError(errorText(error), false);
+        } catch (rollbackError) {
+          if (rollbackError instanceof SQLiteBatchError) throw rollbackError;
+          throw new SQLiteBatchError(errorText(error), true);
+        }
+      }
     }
     case "writeBatch": {
       if (readOnly) throw new Error("Connection is read-only.");

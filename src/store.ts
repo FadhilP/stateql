@@ -134,6 +134,7 @@ export class StateStore {
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
     this.recoverStaleCommittingTransactions();
+    this.deleteExpiredData();
   }
 
   close(): void {
@@ -151,9 +152,22 @@ export class StateStore {
   }
 
   ensureSession(name = "default"): SessionRecord {
-    const existing = this.getSession(name);
+    const existing = this.getSessionByName(name);
     if (existing) return existing;
-    return this.createSession(name);
+
+    const closed = this.db
+      .prepare("SELECT id FROM sessions WHERE name = ? LIMIT 1")
+      .get(name) as { id: string } | undefined;
+    if (!closed) return this.createSession(name);
+
+    this.db
+      .prepare(
+        `UPDATE sessions
+         SET status = 'active', active_transaction_id = NULL, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(this.now().toISOString(), closed.id);
+    return this.getSessionByName(name)!;
   }
 
   createSession(name: string): SessionRecord {
@@ -177,6 +191,14 @@ export class StateStore {
          LIMIT 1`,
       )
       .get(idOrName, idOrName) as SessionRecord | undefined;
+  }
+
+  getSessionByName(name: string): SessionRecord | undefined {
+    return this.db
+      .prepare(
+        "SELECT * FROM sessions WHERE name = ? AND status = 'active' LIMIT 1",
+      )
+      .get(name) as SessionRecord | undefined;
   }
 
   listSessions(): SessionRecord[] {
@@ -872,6 +894,27 @@ export class StateStore {
       .all(sessionId, limit) as unknown as Array<
       ResultRecord & { alias: string | null }
     >;
+  }
+
+  private deleteExpiredData(): void {
+    const timestamp = this.now().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM aliases
+           WHERE result_id IN (
+             SELECT id FROM results WHERE expires_at <= ?
+           )`,
+        )
+        .run(timestamp);
+      this.db.prepare("DELETE FROM results WHERE expires_at <= ?").run(timestamp);
+      this.db.prepare("DELETE FROM plans WHERE expires_at <= ?").run(timestamp);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private recoverStaleCommittingTransactions(): void {

@@ -196,14 +196,16 @@ State metadata lives under `STQL_HOME`, or the platform data directory when
 unset. Set `STQL_SESSION` to select a named session.
 
 Read cache entries expire after five minutes; materialized handles expire after
-24 hours. Queries exceeding 10,000 rows fail before materialization; add a
-narrower `WHERE` clause or `LIMIT`. This row cap bounds materialization, while
-the independent deadline bounds execution time. Command history keeps the latest 10,000
-entries per session. SQLite cache reuse also checks
+24 hours. Expired results and plans are deleted when StateQL next opens. Queries
+exceeding 10,000 rows or 16 MiB of serialized row data fail before persistence;
+add a narrower `WHERE` clause, `LIMIT`, or smaller column selection. These caps
+bound persisted materialization, while the independent deadline bounds execution
+time. Command history keeps the latest 10,000 entries per session. SQLite cache reuse also checks
 the database file signature; PostgreSQL and MySQL reuse is labeled `ttl_based`,
 never authoritative. Transactions are staged in local state so they survive CLI
-invocations, then executed atomically on commit. Connections cannot be changed
-or disconnected while a transaction is active. SQLite supports `serializable`;
+invocations, then executed atomically on commit. Database reads, plans,
+connection changes, and disconnects are rejected while a transaction is active;
+commit or roll back first. SQLite supports `serializable`;
 PostgreSQL and MySQL also support `repeatable read`, `read committed`, and
 `read uncommitted`. Server reads run inside database-enforced read-only
 transactions. MySQL staged transactions reject DDL because MySQL implicitly
@@ -229,9 +231,13 @@ Interrupted commits remain fail-closed; stale `committing` records become
 ## Library
 
 ```ts
-import { StateQL } from "stateql";
+import { StateQL } from "@fadhilp/stateql";
 
-const stateql = new StateQL({ home: "./.stql", timeoutMs: 30_000 });
+const stateql = new StateQL({
+  home: "./.stql",
+  timeoutMs: 30_000,
+  maxResultBytes: 16 * 1024 * 1024,
+});
 const controller = new AbortController();
 const response = await stateql.query("SELECT * FROM users", {
   signal: controller.signal,

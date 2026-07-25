@@ -43,7 +43,11 @@ export function exitCodeFor(code: string): number {
   ) {
     return 5;
   }
-  if (code === "POTENTIAL_DUPLICATE_WRITE" || code === "OUTCOME_UNKNOWN") return 6;
+  if (
+    code === "POTENTIAL_DUPLICATE_WRITE" ||
+    code === "OUTCOME_UNKNOWN" ||
+    code === "IDEMPOTENCY_CONFLICT"
+  ) return 6;
   if (code.startsWith("STALE_") || code === "RESULT_EXPIRED") return 7;
   if (code === "PERMISSION_DENIED") return 8;
   if (code === "UNSUPPORTED_DRIVER") return 9;

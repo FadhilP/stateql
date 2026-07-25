@@ -49,6 +49,16 @@ export class BatchWriteError extends Error {
   }
 }
 
+export class AdapterWriteError extends Error {
+  constructor(
+    message: string,
+    readonly outcomeUnknown: boolean,
+  ) {
+    super(message);
+    this.name = "AdapterWriteError";
+  }
+}
+
 export interface Adapter {
   readonly confidence: StateConfidence;
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
@@ -135,7 +145,12 @@ class SQLiteAdapter implements Adapter {
                 message.error.message,
                 message.error.outcomeUnknown ?? true,
               )
-            : new Error(message.error.message),
+            : message.error.outcomeUnknown === undefined
+              ? new Error(message.error.message)
+              : new AdapterWriteError(
+                  message.error.message,
+                  message.error.outcomeUnknown,
+                ),
         );
       } else {
         call.resolve(message.result);
@@ -315,8 +330,13 @@ class PostgresAdapter implements Adapter {
 
   async write(sql: string, params: SqlParameters): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
-    await this.connect();
-    await this.query("BEGIN", [], false);
+    try {
+      await this.connect();
+      await this.query("BEGIN", [], false);
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), false);
+    }
     let committing = false;
     try {
       await this.setLocalDeadline();
@@ -326,14 +346,14 @@ class PostgresAdapter implements Adapter {
       return { affectedRows: result.rowCount ?? 0 };
     } catch (error) {
       const rolledBack = await this.rollbackQuietly();
-      if (
-        error instanceof AdapterExecutionError &&
-        !committing &&
-        rolledBack
-      ) {
-        throw new AdapterExecutionError(error.message, error.reason, false);
+      if (!committing && rolledBack) {
+        if (error instanceof AdapterExecutionError) {
+          throw new AdapterExecutionError(error.message, error.reason, false);
+        }
+        throw new AdapterWriteError(errorText(error), false);
       }
-      throw error;
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), true);
     }
   }
 
@@ -566,28 +586,26 @@ class MySqlAdapter implements Adapter {
 
   async write(sql: string, params: SqlParameters): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
-    await this.query("START TRANSACTION", [], false, false);
-    let committing = false;
+    let values: ExecuteValues[];
     try {
-      const [result] = await this.query(
-        sql,
-        mysqlParams(params),
-        true,
-        true,
-      );
-      committing = true;
+      values = mysqlParams(params);
+    } catch (error) {
+      throw new AdapterWriteError(errorText(error), false);
+    }
+    try {
+      await this.query("START TRANSACTION", [], false, false);
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), false);
+    }
+    try {
+      const [result] = await this.query(sql, values, true, true);
       await this.query("COMMIT", [], true, false);
       return { affectedRows: mysqlAffectedRows(result) };
     } catch (error) {
-      const rolledBack = await this.rollbackQuietly();
-      if (
-        error instanceof AdapterExecutionError &&
-        !committing &&
-        rolledBack
-      ) {
-        throw new AdapterExecutionError(error.message, error.reason, false);
-      }
-      throw error;
+      await this.rollbackQuietly();
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), true);
     }
   }
 

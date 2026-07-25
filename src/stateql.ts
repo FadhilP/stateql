@@ -3,6 +3,7 @@ import { basename, resolve } from "node:path";
 import { env } from "node:process";
 import {
   AdapterExecutionError,
+  AdapterWriteError,
   BatchWriteError,
   createAdapter,
   createAdapterContext,
@@ -86,6 +87,7 @@ export class StateQL {
   private readonly resultTtlSeconds: number;
   private readonly maxCellCharacters: number;
   private readonly maxResultRows: number;
+  private readonly maxResultBytes: number;
   private readonly timeoutMs: number;
   private readonly signal?: AbortSignal;
   private readonly now: () => Date;
@@ -100,6 +102,10 @@ export class StateQL {
     this.maxResultRows = positiveInteger(
       options.maxResultRows ?? 10_000,
       "maxResultRows",
+    );
+    this.maxResultBytes = positiveInteger(
+      options.maxResultBytes ?? 16 * 1024 * 1024,
+      "maxResultBytes",
     );
     this.timeoutMs = executionTimeout(options.timeoutMs ?? 30_000);
     this.signal = options.signal;
@@ -388,13 +394,13 @@ export class StateQL {
       if (!name.trim()) {
         throw new StateQLError("INVALID_COMMAND", "Session name is required.");
       }
-      if (this.store.getSession(name)) {
+      if (this.store.getSessionByName(name)) {
         throw new StateQLError(
           "INVALID_COMMAND",
           `Active session "${name}" already exists.`,
         );
       }
-      const session = this.store.createSession(name);
+      const session = this.store.ensureSession(name);
       return {
         data: sessionData(session),
         handle: session.id,
@@ -481,6 +487,7 @@ export class StateQL {
   async query(sql: string, options: QueryOptions = {}): Promise<Response<unknown>> {
     return this.run("query", async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectDuringStagedTransaction(session, "Queries");
       const analysis = analyzeSql(sql, connection.driver);
       if (!analysis.read) {
         throw new StateQLError(
@@ -538,6 +545,17 @@ export class StateQL {
             "OUTPUT_LIMIT_EXCEEDED",
             `Query exceeds the ${this.maxResultRows}-row materialization limit.`,
             { suggestedAction: "Add a narrower WHERE clause or LIMIT." },
+          );
+        }
+        const resultBytes =
+          Buffer.byteLength(JSON.stringify(parameters), "utf8") +
+          Buffer.byteLength(JSON.stringify(result.rows), "utf8") +
+          Buffer.byteLength(JSON.stringify(result.columns), "utf8");
+        if (resultBytes > this.maxResultBytes) {
+          throw new StateQLError(
+            "OUTPUT_LIMIT_EXCEEDED",
+            `Query exceeds the ${this.maxResultBytes}-byte materialization limit.`,
+            { suggestedAction: "Select fewer rows or smaller columns." },
           );
         }
         const expiresAt = new Date(
@@ -1002,6 +1020,7 @@ export class StateQL {
   ): Promise<Response<unknown>> {
     return this.run(`inspect.${kind}`, async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectDuringStagedTransaction(session, "Schema inspection");
       const adapter = await createAdapter(
         connection,
         this.executionContext(options),
@@ -1031,6 +1050,7 @@ export class StateQL {
   async plan(sql: string, options: PlanOptions = {}): Promise<Response<unknown>> {
     return this.run("plan", async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectDuringStagedTransaction(session, "Plans");
       const analysis = analyzeSql(sql, connection.driver);
       if (analysis.read) {
         throw new StateQLError(
@@ -1098,6 +1118,7 @@ export class StateQL {
     options: ExecutionOptions = {},
   ): Promise<Response<unknown>> {
     return this.run("apply", async (session) => {
+      this.rejectDuringStagedTransaction(session, "Plans");
       const plan = this.store.getPlan(planId);
       if (!plan || plan.session_id !== session.id) {
         throw new StateQLError("STALE_PLAN", `Plan "${planId}" was not found.`);
@@ -1399,6 +1420,15 @@ export class StateQL {
       );
     }
 
+    if (
+      options.idempotencyKey !== undefined &&
+      !options.idempotencyKey.trim()
+    ) {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        "Idempotency key cannot be empty.",
+      );
+    }
     const parameters = options.params ?? [];
     const fingerprint = hash({
       sql: analysis.normalized,
@@ -1434,6 +1464,18 @@ export class StateQL {
       stateVersionBefore: version(connection),
     });
     const previous = reservation.previous;
+    if (
+      previous &&
+      options.idempotencyKey &&
+      !options.replay &&
+      previous.fingerprint !== fingerprint
+    ) {
+      throw new StateQLError(
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency key was already used for a different write.",
+        { extra: { previous_operation_id: previous.id } },
+      );
+    }
     if (previous && !reservation.operation) {
       if (
         previous.status === "executing" ||
@@ -1530,6 +1572,12 @@ export class StateQL {
         this.store.failOperation(operation.id);
         throw stoppedStateQLError(error, false);
       }
+      if (error instanceof AdapterWriteError && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        throw new StateQLError("QUERY_FAILED", error.message, {
+          executed: true,
+        });
+      }
       this.store.markOperationOutcomeUnknown(operation.id);
       throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
         executed: true,
@@ -1570,6 +1618,18 @@ export class StateQL {
       }
       return action(result, session);
     });
+  }
+
+  private rejectDuringStagedTransaction(
+    session: SessionRecord,
+    operation: string,
+  ): void {
+    if (!session.active_transaction_id) return;
+    throw new StateQLError(
+      "TRANSACTION_FAILED",
+      `${operation} cannot run while a staged transaction is active.`,
+      { suggestedAction: "Commit or roll back the transaction first." },
+    );
   }
 
   private requireResult(

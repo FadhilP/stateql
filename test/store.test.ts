@@ -59,6 +59,59 @@ test("state persists across restarts, expires, and detects external SQLite write
   restarted.close();
 });
 
+test("session names do not collide with another session ID", async () => {
+  const stateql = new StateQL({ home: createTemporaryDirectory() });
+  const initial = await succeed(stateql.status());
+  const named = await succeed(
+    stateql.startSession(String(initial.session_id)),
+  );
+  assert.notEqual(named.session_id, initial.session_id);
+  assert.equal(named.name, initial.session_id);
+  stateql.close();
+});
+
+test("closed sessions reactivate without breaking later startup", async () => {
+  const root = createTemporaryDirectory();
+  const stateql = new StateQL({ home: root });
+  const initial = await succeed(stateql.status());
+  await succeed(stateql.closeSession());
+  stateql.close();
+
+  const reopened = new StateQL({ home: root });
+  assert.equal(
+    (await succeed(reopened.status())).session_id,
+    initial.session_id,
+  );
+  reopened.close();
+});
+
+test("startup deletes expired results, aliases, and plans", async () => {
+  let clock = new Date("2026-07-25T00:00:00.000Z");
+  const fixture = await createFixture(() => clock);
+  await succeed(fixture.stateql.exec("CREATE TABLE cleanup_rows (id INTEGER)"));
+  const result = await succeed(
+    fixture.stateql.query("SELECT id FROM cleanup_rows"),
+  );
+  await succeed(
+    fixture.stateql.setAlias("cleanup", String(result.result_id)),
+  );
+  await succeed(
+    fixture.stateql.plan("INSERT INTO cleanup_rows (id) VALUES (1)"),
+  );
+  fixture.stateql.close();
+
+  clock = new Date(clock.getTime() + 86_401_000);
+  const reopened = new StateQL({ home: fixture.home, now: () => clock });
+  const store = (reopened as unknown as { store: StateStore }).store;
+  for (const table of ["results", "aliases", "plans"]) {
+    const row = store.db
+      .prepare(`SELECT COUNT(*) AS count FROM ${table}`)
+      .get() as { count: number };
+    assert.equal(row.count, 0, table);
+  }
+  reopened.close();
+});
+
 test("history keeps the latest 10,000 entries per session", () => {
   const root = createTemporaryDirectory();
   const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
