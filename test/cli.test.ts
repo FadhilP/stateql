@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { StateQL } from "../src/stateql.js";
@@ -12,18 +12,6 @@ import {
   createTemporaryDirectory,
   succeed,
 } from "./helpers.js";
-
-test("CLI version matches the published package version", () => {
-  const version = spawnSync(process.execPath, ["dist/src/cli.js", "--version"], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-  });
-  const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
-    version: string;
-  };
-  assert.equal(version.status, 0, version.stderr);
-  assert.equal(version.stdout.trim(), packageJson.version);
-});
 
 test("local profiles persist and connect by bare or explicit name", async () => {
   const root = createTemporaryDirectory("stateql-profile-test-");

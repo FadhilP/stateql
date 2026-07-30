@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { StateQL } from "../src/stateql.js";
+import {
+  StateQL,
+  type HistoryEntry,
+  type StateQLSnapshot,
+} from "../src/index.js";
 import { StateStore } from "../src/store.js";
 import {
   assertFailure,
@@ -111,6 +115,71 @@ test("startup deletes expired results, aliases, and plans", async () => {
   }
   reopened.close();
 });
+
+test("snapshot is typed, bounded, safe, and does not record history", async () => {
+  const fixture = await createFixture();
+  await succeed(
+    fixture.stateql.exec("CREATE TABLE private_values (value TEXT)"),
+  );
+  await succeed(
+    fixture.stateql.query("SELECT ? AS value", {
+      params: ["snapshot-secret"],
+      cache: "bypass",
+    }),
+  );
+  await succeed(fixture.stateql.beginTransaction());
+
+  const snapshot: StateQLSnapshot = fixture.stateql.snapshot({ historyLimit: 2 });
+  const historyEntry: HistoryEntry | undefined = snapshot.history[0];
+
+  assert.equal(snapshot.session.status, "active");
+  assert.equal(snapshot.connection?.status, "connected");
+  assert.equal(snapshot.transaction?.state, "active");
+  assert.equal(snapshot.state_confidence, "database_reported");
+  assert.ok(snapshot.state_version);
+  assert.ok(snapshot.recent_results.length <= 10);
+  assert.ok(snapshot.recent_operations.length <= 10);
+  assert.equal(snapshot.history.length, 2);
+  assert.ok(historyEntry);
+  assert.deepEqual(
+    Object.keys(snapshot.recent_results[0] ?? {}).sort(),
+    ["alias", "handle", "rows"],
+  );
+  assert.deepEqual(
+    Object.keys(snapshot.recent_operations[0] ?? {}).sort(),
+    ["affected_rows", "handle", "status", "type"],
+  );
+  assert.equal(JSON.stringify(snapshot).includes("snapshot-secret"), false);
+  assert.equal(JSON.stringify(snapshot).includes("SELECT ? AS value"), false);
+  assert.deepEqual(fixture.stateql.snapshot({ historyLimit: 2 }), snapshot);
+
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  for (let index = 0; index < 55; index += 1) {
+    store.addHistory({
+      sessionId: snapshot.session.session_id,
+      command: "seed",
+      executed: false,
+      cached: false,
+      success: true,
+    });
+  }
+  assert.equal(fixture.stateql.snapshot().history.length, 50);
+  assert.throws(() => fixture.stateql.snapshot({ historyLimit: 0 }), /positive integer/);
+  assert.throws(() => fixture.stateql.snapshot({ historyLimit: 1.5 }), /positive integer/);
+  assert.throws(() => fixture.stateql.snapshot({ historyLimit: 101 }), /cannot exceed 100/);
+
+  const before = await fixture.stateql.status();
+  fixture.stateql.snapshot();
+  const after = await fixture.stateql.status();
+  assert.equal(commandNumber(after.command_id), commandNumber(before.command_id) + 1);
+
+  await succeed(fixture.stateql.rollbackTransaction());
+  fixture.stateql.close();
+});
+
+function commandNumber(commandId: string): number {
+  return Number(commandId.slice(commandId.indexOf("_") + 1));
+}
 
 test("history keeps the latest 10,000 entries per session", () => {
   const root = createTemporaryDirectory();

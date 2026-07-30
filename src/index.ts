@@ -9,6 +9,7 @@ export type {
   ExecutionOptions,
   Failure,
   FilterOptions,
+  HistoryEntry,
   PlanOptions,
   ProfileOptions,
   QueryOptions,
@@ -16,5 +17,6 @@ export type {
   RowsOptions,
   SqlParameters,
   StateQLOptions,
+  StateQLSnapshot,
   Success,
 } from "./types.js";

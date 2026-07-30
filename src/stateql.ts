@@ -38,6 +38,7 @@ import { analyzeSql } from "./sql.js";
 import {
   StateStore,
   type ConnectionRecord,
+  type HistoryRecord,
   type ResultRecord,
   type SessionRecord,
 } from "./store.js";
@@ -49,6 +50,7 @@ import type {
   ExecutionOptions,
   Failure,
   FilterOptions,
+  HistoryEntry,
   PlanOptions,
   ProfileOptions,
   QueryOptions,
@@ -57,6 +59,7 @@ import type {
   SqlParameters,
   StateConfidence,
   StateQLOptions,
+  StateQLSnapshot,
   Success,
   Warning,
 } from "./types.js";
@@ -67,6 +70,9 @@ import {
   parseJson,
   redact,
 } from "./util.js";
+
+const DEFAULT_SNAPSHOT_HISTORY_LIMIT = 50;
+const MAX_SNAPSHOT_HISTORY_LIMIT = 100;
 
 interface ActionResult<T> {
   data: T;
@@ -357,6 +363,66 @@ export class StateQL {
       this.store.disconnect(session.id);
       return { data: { disconnected: true }, executed: true };
     });
+  }
+
+  snapshot(options: { historyLimit?: number } = {}): StateQLSnapshot {
+    const session = this.store
+      .listSessions()
+      .find((candidate) => candidate.name === this.sessionName);
+    if (!session) {
+      throw new StateQLError("INVALID_COMMAND", "The active session was not found.");
+    }
+    const connection = this.store.activeConnection(session);
+    const transaction = session.active_transaction_id
+      ? this.store.getTransaction(session.active_transaction_id)
+      : undefined;
+    const historyLimit = positiveInteger(
+      options.historyLimit ?? DEFAULT_SNAPSHOT_HISTORY_LIMIT,
+      "historyLimit",
+    );
+    if (historyLimit > MAX_SNAPSHOT_HISTORY_LIMIT) {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        `historyLimit cannot exceed ${MAX_SNAPSHOT_HISTORY_LIMIT}.`,
+      );
+    }
+
+    return {
+      session: {
+        session_id: session.id,
+        name: session.name,
+        status: session.status,
+      },
+      connection: connection
+        ? {
+            connection_id: connection.id,
+            name: connection.name,
+            status: "connected",
+            driver: connection.driver,
+            database: connection.database_name,
+            read_only: Boolean(connection.read_only),
+          }
+        : null,
+      transaction: transaction
+        ? { transaction_id: transaction.id, state: transaction.state }
+        : null,
+      state_version: connection ? version(connection) : null,
+      state_confidence: connection ? confidence(connection) : null,
+      recent_results: this.store.knownResults(session.id, 10).map((result) => ({
+        alias: result.alias,
+        handle: result.id,
+        rows: result.row_count,
+      })),
+      recent_operations: this.store
+        .recentOperations(session.id, 10)
+        .map((operation) => ({
+          handle: operation.id,
+          type: operation.statement_type,
+          affected_rows: operation.affected_rows,
+          status: operation.status,
+        })),
+      history: this.store.history(session.id, historyLimit).map(historyEntry),
+    };
   }
 
   async status(): Promise<Response<unknown>> {
@@ -1180,22 +1246,12 @@ export class StateQL {
     });
   }
 
-  async history(limit = 20): Promise<Response<unknown>> {
+  async history(limit = 20): Promise<Response<{ history: HistoryEntry[] }>> {
     return this.run("history", async (session) => ({
       data: {
         history: this.store
           .history(session.id, positiveInteger(limit, "limit"))
-          .map((item) => ({
-            command_id: item.id,
-            timestamp: item.timestamp,
-            session_id: item.session_id,
-            command: item.command,
-            handle: item.handle,
-            executed: Boolean(item.executed),
-            cached: Boolean(item.cached),
-            success: Boolean(item.success),
-            error_code: item.error_code,
-          })),
+          .map(historyEntry),
       },
     }));
   }
@@ -1782,6 +1838,20 @@ export class StateQL {
       } satisfies Failure;
     }
   }
+}
+
+function historyEntry(item: HistoryRecord): HistoryEntry {
+  return {
+    command_id: item.id,
+    timestamp: item.timestamp,
+    session_id: item.session_id,
+    command: item.command,
+    handle: item.handle,
+    executed: Boolean(item.executed),
+    cached: Boolean(item.cached),
+    success: Boolean(item.success),
+    error_code: item.error_code,
+  };
 }
 
 function markTransactionOutcomeUnknown(

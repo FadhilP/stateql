@@ -46,6 +46,52 @@ export interface Failure {
 
 export type Response<T> = Success<T> | Failure;
 
+export interface HistoryEntry {
+  command_id: string;
+  timestamp: string;
+  session_id: string;
+  command: string;
+  handle: string | null;
+  executed: boolean;
+  cached: boolean;
+  success: boolean;
+  error_code: string | null;
+}
+
+export interface StateQLSnapshot {
+  session: {
+    session_id: string;
+    name: string;
+    status: string;
+  };
+  connection: {
+    connection_id: string;
+    name: string;
+    status: "connected";
+    driver: Driver;
+    database: string;
+    read_only: boolean;
+  } | null;
+  transaction: {
+    transaction_id: string;
+    state: string;
+  } | null;
+  state_version: string | null;
+  state_confidence: StateConfidence | null;
+  recent_results: Array<{
+    alias: string | null;
+    handle: string;
+    rows: number;
+  }>;
+  recent_operations: Array<{
+    handle: string;
+    type: string;
+    affected_rows: number | null;
+    status: string;
+  }>;
+  history: HistoryEntry[];
+}
+
 export type SqlParameters = unknown[] | Record<string, unknown>;
 
 export interface ExecutionOptions {

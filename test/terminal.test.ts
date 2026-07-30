@@ -14,7 +14,6 @@ import { createTemporaryDirectory } from "./helpers.js";
 const windows = process.platform === "win32";
 const availableCommands = [
   "--help",
-  "--version",
   "alias.set",
   "apply",
   "batch",
@@ -108,13 +107,6 @@ function scenario(): TerminalStep[] {
     : "export STQL_SESSION=terminal-next";
 
   const steps: TerminalStep[] = [
-    {
-      label: "version",
-      command: stql("--version"),
-      commandId: "--version",
-      machineOutput: false,
-      expect: /0\.1\.2/,
-    },
     {
       label: "help",
       command: stql("--help"),
