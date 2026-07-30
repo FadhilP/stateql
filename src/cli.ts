@@ -48,7 +48,7 @@ const [command, subcommand, ...rest] = parsed.positionals;
 const values = parsed.values;
 
 if (values.version) {
-  console.log("0.1.2");
+  console.log(packageVersion());
   process.exit(0);
 }
 if (values.help || !command) {
@@ -600,7 +600,7 @@ function extractHandle(data: unknown): string | undefined {
 }
 
 function helpText(): string {
-  return `StateQL 0.1.2
+  return `StateQL ${packageVersion()}
 
 Usage: stql <command> [arguments] [options]
 
@@ -620,4 +620,11 @@ SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;
+}
+
+function packageVersion(): string {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as { version: string };
+  return packageJson.version;
 }
