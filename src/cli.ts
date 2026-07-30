@@ -62,6 +62,7 @@ const stateql = new StateQL({
   ...(values["timeout-ms"] === undefined
     ? {}
     : { timeoutMs: Number(values["timeout-ms"]) }),
+  ...(process.env.STQL_ACTOR ? { actor: process.env.STQL_ACTOR } : {}),
   signal: abortController.signal,
 });
 

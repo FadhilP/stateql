@@ -193,7 +193,12 @@ with `as`. Database commands may set `timeout_ms`; otherwise they use the
 30-second default.
 
 State metadata lives under `STQL_HOME`, or the platform data directory when
-unset. Set `STQL_SESSION` to select a named session.
+unset. Set `STQL_SESSION` to select a named session and `STQL_ACTOR` to select
+an attached actor for CLI invocations. A session is a shared workspace:
+attached actors reuse its connection, handles, aliases, cache, and
+state version, while plans and staged transactions remain owned by their
+creating actor. Callers that omit `actor` keep the legacy behavior where the
+actor ID is the session name.
 
 Read cache entries expire after five minutes; materialized handles expire after
 24 hours. Expired results and plans are deleted when StateQL next opens. Queries
@@ -235,6 +240,8 @@ import { StateQL } from "@fadhilp/stateql";
 
 const stateql = new StateQL({
   home: "./.stql",
+  session: "shared-workspace",
+  actor: "pi-session-id",
   timeoutMs: 30_000,
   maxResultBytes: 16 * 1024 * 1024,
 });
@@ -250,3 +257,9 @@ if (response.ok) {
   });
 }
 ```
+
+Membership is managed only through the library API, not batch commands:
+`linkActor(session, actorId)`, `unlinkActor(session, actorId)`,
+`listActors(session)`, and `resolveActor(actorId)`. An existing member must link
+an actor before that actor opens an existing workspace. Integrations should ask
+for user confirmation before changing membership or the shared connection.

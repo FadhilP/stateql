@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
@@ -89,6 +90,25 @@ test("closed sessions reactivate without breaking later startup", async () => {
   reopened.close();
 });
 
+test("reactivation preserves an unresolved transaction lease", async () => {
+  const fixture = await createFixture();
+  const transaction = await succeed(fixture.stateql.beginTransaction());
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db
+    .prepare("UPDATE sessions SET status = 'closed' WHERE active_transaction_id = ?")
+    .run(String(transaction.transaction_id));
+  fixture.stateql.close();
+
+  const reopened = new StateQL({ home: fixture.home });
+  assert.equal(
+    (await succeed(reopened.transactionStatus(String(transaction.transaction_id))))
+      .state,
+    "active",
+  );
+  await succeed(reopened.rollbackTransaction(String(transaction.transaction_id)));
+  reopened.close();
+});
+
 test("startup deletes expired results, aliases, and plans", async () => {
   let clock = new Date("2026-07-25T00:00:00.000Z");
   const fixture = await createFixture(() => clock);
@@ -147,7 +167,7 @@ test("snapshot is typed, bounded, safe, and does not record history", async () =
   );
   assert.deepEqual(
     Object.keys(snapshot.recent_operations[0] ?? {}).sort(),
-    ["affected_rows", "handle", "status", "type"],
+    ["actor_id", "affected_rows", "handle", "status", "type"],
   );
   assert.equal(JSON.stringify(snapshot).includes("snapshot-secret"), false);
   assert.equal(JSON.stringify(snapshot).includes("SELECT ? AS value"), false);
@@ -157,6 +177,7 @@ test("snapshot is typed, bounded, safe, and does not record history", async () =
   for (let index = 0; index < 55; index += 1) {
     store.addHistory({
       sessionId: snapshot.session.session_id,
+      actorId: snapshot.actor_id,
       command: "seed",
       executed: false,
       cached: false,
@@ -193,11 +214,12 @@ test("history keeps the latest 10,000 entries per session", () => {
       SELECT value + 1 FROM sequence WHERE value < 10001
     )
     INSERT INTO history
-      (id, timestamp, session_id, command, executed, cached, success)
+      (id, timestamp, session_id, actor_id, command, executed, cached, success)
     SELECT
       'seed_' || value,
       '2026-01-01T00:00:00Z',
       '${session.id}',
+      'default',
       'seed',
       0,
       0,
@@ -207,6 +229,7 @@ test("history keeps the latest 10,000 entries per session", () => {
 
   const latest = store.addHistory({
     sessionId: session.id,
+    actorId: "default",
     command: "latest",
     executed: false,
     cached: false,
@@ -220,4 +243,204 @@ test("history keeps the latest 10,000 entries per session", () => {
     .get("seed_1", "seed_2") as { count: number };
   assert.equal(removed.count, 0);
   store.close();
+});
+
+test("actors share workspace handles, aliases, history, and restarts", async () => {
+  const root = createTemporaryDirectory();
+  const home = join(root, "state");
+  const database = join(root, "shared.sqlite");
+  const owner = new StateQL({ home, session: "workspace" });
+  await succeed(owner.connect(database, { readOnly: false }));
+  await succeed(owner.exec("CREATE TABLE shared_rows (value TEXT)"));
+  const result = await succeed(owner.query("SELECT * FROM shared_rows"));
+  await succeed(owner.setAlias("shared", String(result.result_id)));
+
+  const stranger = new StateQL({
+    home,
+    session: "workspace",
+    actor: "actor-b",
+  });
+  assertFailure(await stranger.status(), "PERMISSION_DENIED");
+  await succeed(owner.linkActor("workspace", "actor-b"));
+
+  assert.equal(
+    (await succeed(stranger.show(String(result.result_id)))).result_id,
+    result.result_id,
+  );
+  assert.equal(
+    (await succeed(stranger.show("shared"))).result_id,
+    result.result_id,
+  );
+  const operation = await succeed(
+    stranger.exec("INSERT INTO shared_rows (value) VALUES ('actor-b')"),
+  );
+  assert.equal(operation.actor_id, "actor-b");
+  assert.equal(
+    (await succeed(stranger.receipt(String(operation.operation_id)))).actor_id,
+    "actor-b",
+  );
+  assert.equal((await succeed(owner.query("SELECT * FROM shared_rows"))).rows, 1);
+
+  const actors = await succeed(owner.listActors("workspace"));
+  assert.deepEqual(
+    actors.actors.map((actor: { actor_id: string }) => actor.actor_id).sort(),
+    ["actor-b", "workspace"],
+  );
+  const resolved = await succeed(owner.resolveActor("actor-b"));
+  assert.equal(resolved.session.name, "workspace");
+  const history = await succeed(owner.history(50));
+  assert.ok(
+    history.history.some(
+      (entry: HistoryEntry) =>
+        entry.actor_id === "actor-b" && entry.command === "exec",
+    ),
+  );
+  assert.equal(stranger.snapshot().actor_id, "actor-b");
+
+  stranger.close();
+  const restarted = new StateQL({
+    home,
+    session: "workspace",
+    actor: "actor-b",
+  });
+  assert.equal(
+    (await succeed(restarted.show("shared"))).result_id,
+    result.result_id,
+  );
+  restarted.close();
+  owner.close();
+});
+
+test("plans and transactions remain actor-owned across concurrent clients", async () => {
+  const root = createTemporaryDirectory();
+  const home = join(root, "state");
+  const database = join(root, "owned.sqlite");
+  const owner = new StateQL({ home, session: "workspace" });
+  await succeed(owner.connect(database, { readOnly: false }));
+  await succeed(owner.exec("CREATE TABLE owned_rows (value TEXT)"));
+  await succeed(owner.linkActor("workspace", "actor-b"));
+  const actor = new StateQL({ home, session: "workspace", actor: "actor-b" });
+
+  const plan = await succeed(
+    owner.plan("INSERT INTO owned_rows (value) VALUES ('planned')"),
+  );
+  assertFailure(await actor.apply(String(plan.plan_id)), "PERMISSION_DENIED");
+
+  const transaction = await succeed(owner.beginTransaction());
+  const inspected = await succeed(
+    actor.transactionStatus(String(transaction.transaction_id)),
+  );
+  assert.equal(inspected.owner_actor_id, "workspace");
+  assertFailure(
+    await actor.exec("INSERT INTO owned_rows (value) VALUES ('blocked')"),
+    "PERMISSION_DENIED",
+  );
+  assertFailure(
+    await actor.commitTransaction(String(transaction.transaction_id)),
+    "PERMISSION_DENIED",
+  );
+  assertFailure(
+    await actor.rollbackTransaction(String(transaction.transaction_id)),
+    "PERMISSION_DENIED",
+  );
+  assertFailure(
+    await actor.unlinkActor("workspace", "workspace"),
+    "TRANSACTION_FAILED",
+  );
+  await succeed(owner.rollbackTransaction(String(transaction.transaction_id)));
+  await succeed(owner.apply(String(plan.plan_id)));
+
+  const acquisitions = await Promise.all([
+    owner.beginTransaction(),
+    actor.beginTransaction(),
+  ]);
+  assert.equal(acquisitions.filter((response) => response.ok).length, 1);
+  const winner = acquisitions[0]!.ok ? owner : actor;
+  await succeed(winner.rollbackTransaction());
+
+  const concurrentPlan = await succeed(
+    owner.plan("INSERT INTO owned_rows (value) VALUES ('once')"),
+  );
+  const ownerClone = new StateQL({
+    home,
+    session: "workspace",
+    actor: "workspace",
+  });
+  const applications = await Promise.all([
+    owner.apply(String(concurrentPlan.plan_id)),
+    ownerClone.apply(String(concurrentPlan.plan_id)),
+  ]);
+  assert.equal(applications.filter((response) => response.ok).length, 1);
+
+  const connectionRace = await Promise.all([
+    actor.connect(join(root, "replacement.sqlite"), { readOnly: false }),
+    owner.beginTransaction(),
+  ]);
+  assert.equal(connectionRace.filter((response) => response.ok).length, 1);
+  if (connectionRace[1]!.ok) await succeed(owner.rollbackTransaction());
+
+  ownerClone.close();
+  actor.close();
+  owner.close();
+});
+
+test("legacy sessions migrate actor attribution without losing artifacts", async () => {
+  const root = createTemporaryDirectory();
+  const home = join(root, "state");
+  const database = join(root, "legacy.sqlite");
+  const legacy = new StateQL({ home });
+  await succeed(legacy.connect(database, { readOnly: false }));
+  const operation = await succeed(
+    legacy.exec("CREATE TABLE legacy_rows (value TEXT)"),
+  );
+  const result = await succeed(legacy.query("SELECT * FROM legacy_rows"));
+  await succeed(legacy.setAlias("legacy", String(result.result_id)));
+  const plan = await succeed(
+    legacy.plan("INSERT INTO legacy_rows (value) VALUES ('planned')"),
+  );
+  const transaction = await succeed(legacy.beginTransaction());
+  await succeed(
+    legacy.exec("INSERT INTO legacy_rows (value) VALUES ('staged')"),
+  );
+  legacy.close();
+
+  const state = new DatabaseSync(join(home, "state.sqlite"));
+  state.exec(`
+    DROP TABLE session_members;
+    DROP TABLE schema_migrations;
+    ALTER TABLE operations DROP COLUMN actor_id;
+    ALTER TABLE transactions DROP COLUMN owner_actor_id;
+    ALTER TABLE plans DROP COLUMN owner_actor_id;
+    ALTER TABLE plans DROP COLUMN claim_token;
+    ALTER TABLE history DROP COLUMN actor_id;
+  `);
+  state.close();
+
+  const migrated = new StateQL({ home });
+  assert.equal(
+    (await succeed(migrated.show("legacy"))).result_id,
+    result.result_id,
+  );
+  assert.equal(
+    (await succeed(migrated.receipt(String(operation.operation_id)))).actor_id,
+    "default",
+  );
+  const transactionStatus = await succeed(
+    migrated.transactionStatus(String(transaction.transaction_id)),
+  );
+  assert.equal(transactionStatus.owner_actor_id, "default");
+  await succeed(
+    migrated.rollbackTransaction(String(transaction.transaction_id)),
+  );
+  await succeed(migrated.apply(String(plan.plan_id)));
+  assert.ok(
+    (await succeed(migrated.history(100))).history.every(
+      (entry: HistoryEntry) => entry.actor_id === "default",
+    ),
+  );
+  migrated.close();
+
+  const reopened = new StateQL({ home });
+  assert.equal((await succeed(reopened.query("SELECT * FROM legacy_rows"))).rows, 1);
+  reopened.close();
 });

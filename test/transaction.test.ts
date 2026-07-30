@@ -151,8 +151,13 @@ test("stale committing transactions recover as unknown", async () => {
     ),
   );
   const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  const transactionRecord = store.getTransaction(String(transaction.transaction_id))!;
   assert.equal(
-    store.markTransactionCommitting(String(transaction.transaction_id)),
+    store.markTransactionCommitting(
+      transactionRecord.id,
+      transactionRecord.session_id,
+      transactionRecord.owner_actor_id,
+    ),
     true,
   );
   fixture.stateql.close();

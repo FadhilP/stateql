@@ -88,6 +88,7 @@ interface ActionResult<T> {
 export class StateQL {
   private readonly store: StateStore;
   private readonly sessionName: string;
+  private readonly actorId: string;
   private readonly previewRows: number;
   private readonly cacheTtlSeconds: number;
   private readonly resultTtlSeconds: number;
@@ -101,6 +102,10 @@ export class StateQL {
   constructor(options: StateQLOptions = {}) {
     this.now = options.now ?? (() => new Date());
     this.sessionName = options.session ?? env.STQL_SESSION ?? "default";
+    this.actorId = options.actor ?? this.sessionName;
+    if (!this.actorId.trim()) {
+      throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
+    }
     this.previewRows = options.previewRows ?? 5;
     this.cacheTtlSeconds = options.cacheTtlSeconds ?? 300;
     this.resultTtlSeconds = options.resultTtlSeconds ?? 86_400;
@@ -122,7 +127,11 @@ export class StateQL {
       );
     }
     this.store = new StateStore(options.home ?? defaultHome(), this.now);
-    this.store.ensureSession(this.sessionName);
+    this.store.bootstrapSession(
+      this.sessionName,
+      this.actorId,
+      options.actor === undefined,
+    );
   }
 
   close(): void {
@@ -235,6 +244,7 @@ export class StateQL {
 
       const connection = this.store.addConnection({
         sessionId: session.id,
+        actorId: this.actorId,
         name: draft.name,
         driver,
         databaseName,
@@ -242,6 +252,12 @@ export class StateQL {
         ...(secretEnv ? { secretEnv } : {}),
         readOnly,
       });
+      if (!connection) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "A transaction became active while changing the connection.",
+        );
+      }
       return {
         data: {
           connection_id: connection.id,
@@ -360,7 +376,12 @@ export class StateQL {
           "Commit or roll back the active transaction before disconnecting.",
         );
       }
-      this.store.disconnect(session.id);
+      if (!this.store.disconnect(session.id, this.actorId)) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "A transaction became active while disconnecting.",
+        );
+      }
       return { data: { disconnected: true }, executed: true };
     });
   }
@@ -371,6 +392,12 @@ export class StateQL {
       .find((candidate) => candidate.name === this.sessionName);
     if (!session) {
       throw new StateQLError("INVALID_COMMAND", "The active session was not found.");
+    }
+    if (!this.store.isSessionMember(session.id, this.actorId)) {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        `Actor "${this.actorId}" is not attached to session "${session.name}".`,
+      );
     }
     const connection = this.store.activeConnection(session);
     const transaction = session.active_transaction_id
@@ -393,6 +420,7 @@ export class StateQL {
         name: session.name,
         status: session.status,
       },
+      actor_id: this.actorId,
       connection: connection
         ? {
             connection_id: connection.id,
@@ -404,7 +432,11 @@ export class StateQL {
           }
         : null,
       transaction: transaction
-        ? { transaction_id: transaction.id, state: transaction.state }
+        ? {
+            transaction_id: transaction.id,
+            owner_actor_id: transaction.owner_actor_id,
+            state: transaction.state,
+          }
         : null,
       state_version: connection ? version(connection) : null,
       state_confidence: connection ? confidence(connection) : null,
@@ -417,6 +449,7 @@ export class StateQL {
         .recentOperations(session.id, 10)
         .map((operation) => ({
           handle: operation.id,
+          actor_id: operation.actor_id,
           type: operation.statement_type,
           affected_rows: operation.affected_rows,
           status: operation.status,
@@ -435,6 +468,7 @@ export class StateQL {
         data: {
           session_id: session.id,
           session_name: session.name,
+          actor_id: this.actorId,
           connection: connection
             ? {
                 connection_id: connection.id,
@@ -445,12 +479,102 @@ export class StateQL {
               }
             : null,
           transaction: transaction
-            ? { transaction_id: transaction.id, state: transaction.state }
+            ? {
+                transaction_id: transaction.id,
+                owner_actor_id: transaction.owner_actor_id,
+                state: transaction.state,
+              }
             : null,
           state_version: connection ? version(connection) : null,
         },
         stateVersion: connection ? version(connection) : undefined,
         confidence: connection ? confidence(connection) : undefined,
+      };
+    });
+  }
+
+  async linkActor(
+    session: string,
+    actorId: string,
+  ): Promise<Response<unknown>> {
+    return this.run("actor.link", async (current) => {
+      this.requireSelectedSession(current, session);
+      this.validateActorId(actorId);
+      const result = this.store.linkActor(current.id, this.actorId, actorId);
+      if (result === "actor_conflict") {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          `Actor "${actorId}" is already attached to another session.`,
+        );
+      }
+      if (result === "denied") this.throwMembershipDenied(current);
+      return {
+        data: {
+          session_id: current.id,
+          actor_id: actorId,
+          linked: result === "linked",
+        },
+        executed: result === "linked",
+      };
+    });
+  }
+
+  async unlinkActor(
+    session: string,
+    actorId: string,
+  ): Promise<Response<unknown>> {
+    return this.run("actor.unlink", async (current) => {
+      this.requireSelectedSession(current, session);
+      this.validateActorId(actorId);
+      const result = this.store.unlinkActor(current.id, this.actorId, actorId);
+      if (result === "owns_transaction") {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          `Actor "${actorId}" owns the active transaction.`,
+        );
+      }
+      if (result === "denied") this.throwMembershipDenied(current);
+      return {
+        data: {
+          session_id: current.id,
+          actor_id: actorId,
+          unlinked: result === "unlinked",
+        },
+        executed: result === "unlinked",
+      };
+    });
+  }
+
+  async listActors(session: string): Promise<Response<unknown>> {
+    return this.run("actor.list", async (current) => {
+      this.requireSelectedSession(current, session);
+      return {
+        data: {
+          session_id: current.id,
+          actors: this.store.listActors(current.id).map((member) => ({
+            actor_id: member.actor_id,
+            attached_at: member.attached_at,
+          })),
+        },
+      };
+    });
+  }
+
+  async resolveActor(actorId: string): Promise<Response<unknown>> {
+    return this.run("actor.resolve", async () => {
+      this.validateActorId(actorId);
+      const session = this.store.resolveActor(actorId);
+      return {
+        data: {
+          actor_id: actorId,
+          session: session
+            ? {
+                session_id: session.id,
+                name: session.name,
+                status: session.status,
+              }
+            : null,
+        },
       };
     });
   }
@@ -466,7 +590,7 @@ export class StateQL {
           `Active session "${name}" already exists.`,
         );
       }
-      const session = this.store.ensureSession(name);
+      const session = this.store.bootstrapSession(name, name, true);
       return {
         data: sessionData(session),
         handle: session.id,
@@ -522,6 +646,7 @@ export class StateQL {
             .recentOperations(session.id, 10)
             .map((operation) => ({
               handle: operation.id,
+              actor_id: operation.actor_id,
               type: operation.statement_type,
               affected_rows: operation.affected_rows,
               status: operation.status,
@@ -541,7 +666,12 @@ export class StateQL {
           "Roll back or commit the active transaction first.",
         );
       }
-      this.store.closeSession(session.id);
+      if (!this.store.closeSession(session.id, this.actorId)) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "A transaction became active while closing the session.",
+        );
+      }
       return {
         data: { session_id: session.id, state: "closed" },
         handle: session.id,
@@ -885,10 +1015,16 @@ export class StateQL {
       );
       const transaction = this.store.createTransaction({
         sessionId: session.id,
+        actorId: this.actorId,
         connectionId: connection.id,
         isolation: normalizedIsolation,
-        startVersion: version(connection),
       });
+      if (!transaction) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Another actor acquired the active transaction.",
+        );
+      }
       return {
         data: transactionData(transaction, 0),
         handle: transaction.id,
@@ -943,23 +1079,38 @@ export class StateQL {
           { suggestedAction: "Roll back and begin a new transaction." },
         );
       }
-      const operations = this.store.transactionOperations(transaction.id);
-      if (operations.some((operation) => operation.connection_id !== connection.id)) {
-        throw new StateQLError(
-          "TRANSACTION_FAILED",
-          "Transaction contains writes staged for another connection.",
-          { suggestedAction: "Roll back the transaction." },
-        );
-      }
       const adapter = await createAdapter(
         connection,
         this.executionContext(options),
       );
       try {
-        if (!this.store.markTransactionCommitting(transaction.id)) {
+        if (
+          !this.store.markTransactionCommitting(
+            transaction.id,
+            session.id,
+            this.actorId,
+          )
+        ) {
           throw new StateQLError(
             "TRANSACTION_FAILED",
             "Transaction is no longer active.",
+          );
+        }
+        const operations = this.store.transactionOperations(transaction.id);
+        if (
+          operations.some(
+            (operation) => operation.connection_id !== connection.id,
+          )
+        ) {
+          this.store.finishTransaction(
+            transaction.id,
+            session.id,
+            this.actorId,
+            "failed",
+          );
+          throw new StateQLError(
+            "TRANSACTION_FAILED",
+            "Transaction contains writes staged for another connection.",
           );
         }
 
@@ -974,7 +1125,12 @@ export class StateQL {
             (error instanceof BatchWriteError && !error.outcomeUnknown) ||
             (error instanceof AdapterExecutionError && !error.outcomeUnknown)
           ) {
-            this.store.finishTransaction(transaction.id, session.id, "failed");
+            this.store.finishTransaction(
+              transaction.id,
+              session.id,
+              this.actorId,
+              "failed",
+            );
             if (error instanceof AdapterExecutionError) {
               throw stoppedStateQLError(error, false);
             }
@@ -986,6 +1142,7 @@ export class StateQL {
             this.store,
             transaction.id,
             session.id,
+            this.actorId,
           );
           throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
             executed: true,
@@ -999,6 +1156,7 @@ export class StateQL {
             this.store,
             transaction.id,
             session.id,
+            this.actorId,
           );
           throw new StateQLError(
             "OUTCOME_UNKNOWN",
@@ -1016,6 +1174,7 @@ export class StateQL {
           stateVersion = this.store.commitTransactionMetadata({
             transactionId: transaction.id,
             sessionId: session.id,
+            actorId: this.actorId,
             connectionId: connection.id,
             operations: operations.map((operation, index) => ({
               id: operation.id,
@@ -1027,6 +1186,7 @@ export class StateQL {
             this.store,
             transaction.id,
             session.id,
+            this.actorId,
           );
           throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
             executed: true,
@@ -1065,7 +1225,19 @@ export class StateQL {
     return this.run("transaction.rollback", async (session) => {
       const transaction = this.requireActiveTransaction(session, id);
       const count = this.store.transactionOperations(transaction.id).length;
-      this.store.finishTransaction(transaction.id, session.id, "rolled_back");
+      if (
+        !this.store.finishTransaction(
+          transaction.id,
+          session.id,
+          this.actorId,
+          "rolled_back",
+        )
+      ) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Transaction is no longer active.",
+        );
+      }
       return {
         data: {
           transaction_id: transaction.id,
@@ -1133,6 +1305,7 @@ export class StateQL {
         const expiresAt = new Date(this.now().getTime() + 10 * 60_000).toISOString();
         const plan = this.store.savePlan({
           sessionId: session.id,
+          ownerActorId: this.actorId,
           connectionId: connection.id,
           sql,
           parameters: options.params ?? [],
@@ -1161,6 +1334,7 @@ export class StateQL {
                 : []),
             ],
             state_version: plan.state_version,
+            owner_actor_id: plan.owner_actor_id,
             expires_at: plan.expires_at,
           },
           handle: plan.id,
@@ -1189,6 +1363,12 @@ export class StateQL {
       if (!plan || plan.session_id !== session.id) {
         throw new StateQLError("STALE_PLAN", `Plan "${planId}" was not found.`);
       }
+      if (plan.owner_actor_id !== this.actorId) {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          "Only the actor that created this plan may apply it.",
+        );
+      }
       if (plan.applied_operation_id) {
         throw new StateQLError("STALE_PLAN", "Plan was already applied.", {
           extra: { previous_operation_id: plan.applied_operation_id },
@@ -1197,52 +1377,73 @@ export class StateQL {
       if (Date.parse(plan.expires_at) <= this.now().getTime()) {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
-      const connection = this.requireConnection(session);
-      if (
-        connection.id !== plan.connection_id ||
-        version(connection) !== plan.state_version
-      ) {
-        throw new StateQLError(
-          "STALE_PLAN",
-          "Database state changed after this plan was created.",
-        );
+      const claimToken = this.store.nextId("claim");
+      const claimed = this.store.claimPlan(
+        plan.id,
+        session.id,
+        this.actorId,
+        claimToken,
+      );
+      if (!claimed) {
+        throw new StateQLError("STALE_PLAN", "Plan is already being applied.");
       }
-      const context = this.executionContext(options);
-      const adapter = await createAdapter(connection, context);
+
+      let retainClaim = false;
       try {
-        if ((await adapter.signature()) !== plan.state_signature) {
+        const connection = this.requireConnection(session);
+        if (
+          connection.id !== claimed.connection_id ||
+          version(connection) !== claimed.state_version
+        ) {
           throw new StateQLError(
             "STALE_PLAN",
             "Database state changed after this plan was created.",
           );
         }
+        const context = this.executionContext(options);
+        const adapter = await createAdapter(connection, context);
+        try {
+          if ((await adapter.signature()) !== claimed.state_signature) {
+            throw new StateQLError(
+              "STALE_PLAN",
+              "Database state changed after this plan was created.",
+            );
+          }
+        } catch (error) {
+          if (error instanceof AdapterExecutionError) {
+            throw stoppedStateQLError(error, true);
+          }
+          throw error;
+        } finally {
+          await adapter.close();
+        }
+        const result = await this.performExec(
+          session,
+          connection,
+          claimed.sql,
+          {
+            params: parseJson<SqlParameters>(claimed.parameters, []),
+            allowUnbounded: Boolean(claimed.allow_unbounded),
+            allowDestructive: Boolean(claimed.allow_destructive),
+          },
+          context,
+          { planId: claimed.id, claimToken },
+        );
+        return {
+          ...result,
+          data: { plan_id: claimed.id, ...(result.data as object) },
+        };
       } catch (error) {
-        if (error instanceof AdapterExecutionError) {
-          throw stoppedStateQLError(error, true);
+        if (
+          error instanceof StateQLError &&
+          error.details.code === "OUTCOME_UNKNOWN"
+        ) {
+          retainClaim = true;
         }
         throw error;
       } finally {
-        await adapter.close();
+        if (!retainClaim) this.store.releasePlanClaim(plan.id, claimToken);
       }
-      const result = await this.performExec(
-        session,
-        connection,
-        plan.sql,
-        {
-          params: parseJson<SqlParameters>(plan.parameters, []),
-          allowUnbounded: Boolean(plan.allow_unbounded),
-          allowDestructive: Boolean(plan.allow_destructive),
-        },
-        context,
-      );
-      const operationId = String(
-        (result.data as Record<string, unknown>).operation_id,
-      );
-      this.store.markPlanApplied(plan.id, operationId);
-      return {
-        ...result,
-        data: { plan_id: plan.id, ...(result.data as object) },
-      };
     });
   }
 
@@ -1446,6 +1647,7 @@ export class StateQL {
     sql: string,
     options: ExecOptions,
     context: AdapterContext,
+    planClaim?: { planId: string; claimToken: string },
   ): Promise<ActionResult<unknown>> {
     if (connection.read_only) {
       throw new StateQLError(
@@ -1505,9 +1707,16 @@ export class StateQL {
           "Active transaction does not match the active connection.",
         );
       }
+      if (transaction.owner_actor_id !== this.actorId) {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          "Only the transaction owner may stage writes.",
+        );
+      }
     }
     const reservation = this.store.reserveOperation({
       sessionId: session.id,
+      actorId: this.actorId,
       connectionId: connection.id,
       fingerprint,
       sql,
@@ -1519,6 +1728,26 @@ export class StateQL {
       idempotencyKey: options.idempotencyKey,
       stateVersionBefore: version(connection),
     });
+    if (reservation.denied === "membership") {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        "Actor membership changed before the write was reserved.",
+      );
+    }
+    if (reservation.denied === "transaction") {
+      const active = this.store.getSession(session.id)?.active_transaction_id;
+      const transaction = active ? this.store.getTransaction(active) : undefined;
+      if (transaction && transaction.owner_actor_id !== this.actorId) {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          "Only the transaction owner may stage writes.",
+        );
+      }
+      throw new StateQLError(
+        "TRANSACTION_FAILED",
+        "The active transaction changed before the write was reserved.",
+      );
+    }
     const previous = reservation.previous;
     if (
       previous &&
@@ -1597,12 +1826,27 @@ export class StateQL {
     try {
       const write = await adapter.write(sql, parameters);
       try {
-        const after = this.store.bumpVersion(connection.id);
-        const committed = this.store.finishOperation(
-          operation.id,
-          write.affectedRows,
-          after,
-        );
+        const finalized = planClaim
+          ? this.store.finishPlannedOperation({
+              planId: planClaim.planId,
+              claimToken: planClaim.claimToken,
+              operationId: operation.id,
+              connectionId: connection.id,
+              affectedRows: write.affectedRows,
+            })
+          : (() => {
+              const stateVersion = this.store.bumpVersion(connection.id);
+              return {
+                operation: this.store.finishOperation(
+                  operation.id,
+                  write.affectedRows,
+                  stateVersion,
+                ),
+                stateVersion,
+              };
+            })();
+        const committed = finalized.operation;
+        const after = finalized.stateVersion;
         return {
           data: {
             ...operationData(committed),
@@ -1734,7 +1978,35 @@ export class StateQL {
         `Active transaction "${transactionId}" was not found.`,
       );
     }
+    if (transaction.owner_actor_id !== this.actorId) {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        "Only the transaction owner may control it.",
+      );
+    }
     return transaction;
+  }
+
+  private requireSelectedSession(current: SessionRecord, selected: string): void {
+    if (selected !== current.id && selected !== current.name) {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        "Membership can only be managed for the selected session.",
+      );
+    }
+  }
+
+  private validateActorId(actorId: string): void {
+    if (!actorId.trim()) {
+      throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
+    }
+  }
+
+  private throwMembershipDenied(session: SessionRecord): never {
+    throw new StateQLError(
+      "PERMISSION_DENIED",
+      `Actor "${this.actorId}" is not attached to session "${session.name}".`,
+    );
   }
 
   private executionContext(options: ExecutionOptions): AdapterContext {
@@ -1788,12 +2060,28 @@ export class StateQL {
     const started = performance.now();
     let session = this.store.ensureSession(this.sessionName);
     const commandId = this.store.nextId("cmd");
+    if (!this.store.isSessionMember(session.id, this.actorId)) {
+      const error = new StateQLError(
+        "PERMISSION_DENIED",
+        `Actor "${this.actorId}" is not attached to session "${session.name}".`,
+      );
+      return {
+        ok: false,
+        command_id: commandId,
+        session_id: session.id,
+        error: error.details,
+        meta: {
+          duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+        },
+      } satisfies Failure;
+    }
     try {
       const result = await action(session);
-      session = result.session ?? session;
+      const responseSession = result.session ?? session;
       this.store.addHistory({
         id: commandId,
         sessionId: session.id,
+        actorId: this.actorId,
         command,
         ...(result.handle ? { handle: result.handle } : {}),
         executed: result.executed ?? false,
@@ -1803,7 +2091,7 @@ export class StateQL {
       return {
         ok: true,
         command_id: commandId,
-        session_id: session.id,
+        session_id: responseSession.id,
         data: result.data,
         warnings: result.warnings ?? [],
         meta: {
@@ -1821,6 +2109,7 @@ export class StateQL {
       this.store.addHistory({
         id: commandId,
         sessionId: session.id,
+        actorId: this.actorId,
         command,
         executed: stateqlError.details.executed,
         cached: false,
@@ -1845,6 +2134,7 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     command_id: item.id,
     timestamp: item.timestamp,
     session_id: item.session_id,
+    actor_id: item.actor_id,
     command: item.command,
     handle: item.handle,
     executed: Boolean(item.executed),
@@ -1858,9 +2148,10 @@ function markTransactionOutcomeUnknown(
   store: StateStore,
   transactionId: string,
   sessionId: string,
+  actorId: string,
 ): void {
   try {
-    store.markTransactionOutcomeUnknown(transactionId, sessionId);
+    store.markTransactionOutcomeUnknown(transactionId, sessionId, actorId);
   } catch {
     // A stale committing transaction is recovered as unknown after five minutes.
   }

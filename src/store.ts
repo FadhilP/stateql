@@ -64,6 +64,7 @@ export interface ResultRecord {
 export interface OperationRecord {
   id: string;
   session_id: string;
+  actor_id: string;
   connection_id: string;
   fingerprint: string;
   sql: string;
@@ -82,6 +83,7 @@ export interface OperationRecord {
 export interface TransactionRecord {
   id: string;
   session_id: string;
+  owner_actor_id: string;
   connection_id: string;
   state: string;
   isolation_level: string;
@@ -93,6 +95,7 @@ export interface TransactionRecord {
 export interface PlanRecord {
   id: string;
   session_id: string;
+  owner_actor_id: string;
   connection_id: string;
   sql: string;
   parameters: string;
@@ -104,6 +107,7 @@ export interface PlanRecord {
   allow_destructive: number;
   expires_at: string;
   applied_operation_id: string | null;
+  claim_token: string | null;
   created_at: string;
 }
 
@@ -111,12 +115,19 @@ export interface HistoryRecord {
   id: string;
   timestamp: string;
   session_id: string;
+  actor_id: string;
   command: string;
   handle: string | null;
   executed: number;
   cached: number;
   success: number;
   error_code: string | null;
+}
+
+export interface SessionMemberRecord {
+  session_id: string;
+  actor_id: string;
+  attached_at: string;
 }
 
 export class StateStore {
@@ -163,24 +174,166 @@ export class StateStore {
     this.db
       .prepare(
         `UPDATE sessions
-         SET status = 'active', active_transaction_id = NULL, updated_at = ?
+         SET status = 'active', updated_at = ?
          WHERE id = ?`,
       )
       .run(this.now().toISOString(), closed.id);
     return this.getSessionByName(name)!;
   }
 
-  createSession(name: string): SessionRecord {
+  bootstrapSession(
+    name: string,
+    actorId: string,
+    ensureLegacyMembership: boolean,
+  ): SessionRecord {
     const timestamp = this.now().toISOString();
-    const id = this.nextId("s");
-    this.db
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      let row = this.db
+        .prepare("SELECT id, status FROM sessions WHERE name = ? LIMIT 1")
+        .get(name) as { id: string; status: string } | undefined;
+      const created = !row;
+      if (!row) {
+        const id = this.nextId("s");
+        this.db
+          .prepare(
+            `INSERT INTO sessions
+              (id, name, status, created_at, updated_at)
+             VALUES (?, ?, 'active', ?, ?)`,
+          )
+          .run(id, name, timestamp, timestamp);
+        row = { id, status: "active" };
+      } else if (row.status !== "active") {
+        this.db
+          .prepare(
+            `UPDATE sessions
+             SET status = 'active', updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(timestamp, row.id);
+      }
+      if (created) {
+        this.db
+          .prepare(
+            `INSERT INTO session_members(session_id, actor_id, attached_at)
+             VALUES (?, ?, ?)`,
+          )
+          .run(row.id, actorId, timestamp);
+      } else if (ensureLegacyMembership) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO session_members
+              (session_id, actor_id, attached_at)
+             VALUES (?, ?, ?)`,
+          )
+          .run(row.id, actorId, timestamp);
+      }
+      this.db.exec("COMMIT");
+      return this.getSession(row.id)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  createSession(name: string): SessionRecord {
+    return this.bootstrapSession(name, name, true);
+  }
+
+  isSessionMember(sessionId: string, actorId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM session_members
+           WHERE session_id = ? AND actor_id = ?`,
+        )
+        .get(sessionId, actorId),
+    );
+  }
+
+  linkActor(
+    sessionId: string,
+    requestingActorId: string,
+    actorId: string,
+  ): "linked" | "already_linked" | "actor_conflict" | "denied" {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.isSessionMember(sessionId, requestingActorId)) {
+        this.db.exec("COMMIT");
+        return "denied";
+      }
+      const existing = this.resolveActor(actorId);
+      if (existing) {
+        this.db.exec("COMMIT");
+        return existing.id === sessionId ? "already_linked" : "actor_conflict";
+      }
+      this.db
+        .prepare(
+          `INSERT INTO session_members(session_id, actor_id, attached_at)
+           VALUES (?, ?, ?)`,
+        )
+        .run(sessionId, actorId, this.now().toISOString());
+      this.db.exec("COMMIT");
+      return "linked";
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  unlinkActor(
+    sessionId: string,
+    requestingActorId: string,
+    actorId: string,
+  ): "unlinked" | "not_linked" | "owns_transaction" | "denied" {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.isSessionMember(sessionId, requestingActorId)) {
+        this.db.exec("COMMIT");
+        return "denied";
+      }
+      const ownsTransaction = this.db
+        .prepare(
+          `SELECT 1 FROM transactions
+           WHERE session_id = ? AND owner_actor_id = ?
+             AND state IN ('active', 'committing')
+           LIMIT 1`,
+        )
+        .get(sessionId, actorId);
+      if (ownsTransaction) {
+        this.db.exec("COMMIT");
+        return "owns_transaction";
+      }
+      const result = this.db
+        .prepare(
+          "DELETE FROM session_members WHERE session_id = ? AND actor_id = ?",
+        )
+        .run(sessionId, actorId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) ? "unlinked" : "not_linked";
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listActors(sessionId: string): SessionMemberRecord[] {
+    return this.db
       .prepare(
-        `INSERT INTO sessions
-          (id, name, status, created_at, updated_at)
-         VALUES (?, ?, 'active', ?, ?)`,
+        `SELECT * FROM session_members
+         WHERE session_id = ? ORDER BY attached_at, actor_id`,
       )
-      .run(id, name, timestamp, timestamp);
-    return this.getSession(id)!;
+      .all(sessionId) as unknown as SessionMemberRecord[];
+  }
+
+  resolveActor(actorId: string): SessionRecord | undefined {
+    return this.db
+      .prepare(
+        `SELECT sessions.* FROM sessions
+         JOIN session_members ON session_members.session_id = sessions.id
+         WHERE session_members.actor_id = ? LIMIT 1`,
+      )
+      .get(actorId) as SessionRecord | undefined;
   }
 
   getSession(idOrName: string): SessionRecord | undefined {
@@ -207,15 +360,26 @@ export class StateStore {
       .all() as unknown as SessionRecord[];
   }
 
-  closeSession(sessionId: string): void {
-    const timestamp = this.now().toISOString();
-    this.db
-      .prepare(
-        `UPDATE sessions
-         SET status = 'closed', active_transaction_id = NULL, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(timestamp, sessionId);
+  closeSession(sessionId: string, actorId: string): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db
+        .prepare(
+          `UPDATE sessions
+           SET status = 'closed', updated_at = ?
+           WHERE id = ? AND active_transaction_id IS NULL
+             AND EXISTS (
+               SELECT 1 FROM session_members
+               WHERE session_id = sessions.id AND actor_id = ?
+             )`,
+        )
+        .run(this.now().toISOString(), sessionId, actorId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   addProfile(input: {
@@ -263,40 +427,61 @@ export class StateStore {
 
   addConnection(input: {
     sessionId: string;
+    actorId: string;
     name: string;
     driver: Driver;
     databaseName: string;
     source: string;
     secretEnv?: string;
     readOnly: boolean;
-  }): ConnectionRecord {
-    const id = this.nextId("conn");
-    this.db
-      .prepare(
-        `INSERT INTO connections
-          (id, session_id, name, driver, database_name, source, secret_env,
-           read_only, version, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-      )
-      .run(
-        id,
-        input.sessionId,
-        input.name,
-        input.driver,
-        input.databaseName,
-        input.source,
-        input.secretEnv ?? null,
-        input.readOnly ? 1 : 0,
-        this.now().toISOString(),
-      );
-    this.db
-      .prepare(
-        `UPDATE sessions
-         SET active_connection_id = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(id, this.now().toISOString(), input.sessionId);
-    return this.getConnection(id)!;
+  }): ConnectionRecord | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const allowed = this.db
+        .prepare(
+          `SELECT 1 FROM sessions
+           JOIN session_members ON session_members.session_id = sessions.id
+           WHERE sessions.id = ? AND session_members.actor_id = ?
+             AND sessions.active_transaction_id IS NULL`,
+        )
+        .get(input.sessionId, input.actorId);
+      if (!allowed) {
+        this.db.exec("COMMIT");
+        return undefined;
+      }
+      const id = this.nextId("conn");
+      const timestamp = this.now().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO connections
+            (id, session_id, name, driver, database_name, source, secret_env,
+             read_only, version, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        )
+        .run(
+          id,
+          input.sessionId,
+          input.name,
+          input.driver,
+          input.databaseName,
+          input.source,
+          input.secretEnv ?? null,
+          input.readOnly ? 1 : 0,
+          timestamp,
+        );
+      this.db
+        .prepare(
+          `UPDATE sessions
+           SET active_connection_id = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(id, timestamp, input.sessionId);
+      this.db.exec("COMMIT");
+      return this.getConnection(id)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getConnection(id: string): ConnectionRecord | undefined {
@@ -310,15 +495,26 @@ export class StateStore {
     return this.getConnection(session.active_connection_id);
   }
 
-  disconnect(sessionId: string): void {
-    this.db
-      .prepare(
-        `UPDATE sessions
-         SET active_connection_id = NULL, active_transaction_id = NULL,
-             updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(this.now().toISOString(), sessionId);
+  disconnect(sessionId: string, actorId: string): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db
+        .prepare(
+          `UPDATE sessions
+           SET active_connection_id = NULL, updated_at = ?
+           WHERE id = ? AND active_transaction_id IS NULL
+             AND EXISTS (
+               SELECT 1 FROM session_members
+               WHERE session_id = sessions.id AND actor_id = ?
+             )`,
+        )
+        .run(this.now().toISOString(), sessionId, actorId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   bumpVersion(connectionId: string): string {
@@ -422,6 +618,7 @@ export class StateStore {
 
   saveOperation(input: {
     sessionId: string;
+    actorId: string;
     connectionId: string;
     fingerprint: string;
     sql: string;
@@ -439,14 +636,15 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO operations
-          (id, session_id, connection_id, fingerprint, sql, parameters,
+          (id, session_id, actor_id, connection_id, fingerprint, sql, parameters,
            statement_type, affected_rows, status, transaction_id, replay_of,
            idempotency_key, state_version_before, state_version_after, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         input.sessionId,
+        input.actorId,
         input.connectionId,
         input.fingerprint,
         input.sql,
@@ -511,6 +709,7 @@ export class StateStore {
 
   reserveOperation(input: {
     sessionId: string;
+    actorId: string;
     connectionId: string;
     fingerprint: string;
     sql: string;
@@ -521,9 +720,45 @@ export class StateStore {
     replay: boolean;
     idempotencyKey?: string;
     stateVersionBefore: string;
-  }): { operation?: OperationRecord; previous?: OperationRecord } {
+  }): {
+    operation?: OperationRecord;
+    previous?: OperationRecord;
+    denied?: "membership" | "transaction";
+  } {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (!this.isSessionMember(input.sessionId, input.actorId)) {
+        this.db.exec("COMMIT");
+        return { denied: "membership" };
+      }
+      const session = this.db
+        .prepare(
+          "SELECT active_transaction_id FROM sessions WHERE id = ? AND active_connection_id = ?",
+        )
+        .get(input.sessionId, input.connectionId) as
+        | { active_transaction_id: string | null }
+        | undefined;
+      const validTransaction = input.transactionId
+        ? session?.active_transaction_id === input.transactionId &&
+          Boolean(
+            this.db
+              .prepare(
+                `SELECT 1 FROM transactions
+                 WHERE id = ? AND session_id = ? AND connection_id = ?
+                   AND owner_actor_id = ? AND state = 'active'`,
+              )
+              .get(
+                input.transactionId,
+                input.sessionId,
+                input.connectionId,
+                input.actorId,
+              ),
+          )
+        : session?.active_transaction_id === null;
+      if (!validTransaction) {
+        this.db.exec("COMMIT");
+        return { denied: "transaction" };
+      }
       const previous = this.findDuplicateOperation({
         connectionId: input.connectionId,
         fingerprint: input.fingerprint,
@@ -535,6 +770,7 @@ export class StateStore {
       }
       const operation = this.saveOperation({
         sessionId: input.sessionId,
+        actorId: input.actorId,
         connectionId: input.connectionId,
         fingerprint: input.fingerprint,
         sql: input.sql,
@@ -583,35 +819,63 @@ export class StateStore {
 
   createTransaction(input: {
     sessionId: string;
+    actorId: string;
     connectionId: string;
     isolation: string;
-    startVersion: string;
-  }): TransactionRecord {
+  }): TransactionRecord | undefined {
     const id = this.nextId("tx");
     const timestamp = this.now().toISOString();
-    this.db
-      .prepare(
-        `INSERT INTO transactions
-          (id, session_id, connection_id, state, isolation_level,
-           start_version, created_at)
-         VALUES (?, ?, ?, 'active', ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.sessionId,
-        input.connectionId,
-        input.isolation,
-        input.startVersion,
-        timestamp,
-      );
-    this.db
-      .prepare(
-        `UPDATE sessions
-         SET active_transaction_id = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(id, timestamp, input.sessionId);
-    return this.getTransaction(id)!;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const eligible = this.db
+        .prepare(
+          `SELECT connections.version FROM sessions
+           JOIN session_members ON session_members.session_id = sessions.id
+           JOIN connections ON connections.id = sessions.active_connection_id
+           WHERE sessions.id = ? AND session_members.actor_id = ?
+             AND connections.id = ? AND sessions.active_transaction_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM operations
+               WHERE operations.session_id = sessions.id
+                 AND operations.status = 'executing'
+             )`,
+        )
+        .get(input.sessionId, input.actorId, input.connectionId) as
+        | { version: number }
+        | undefined;
+      if (!eligible) {
+        this.db.exec("COMMIT");
+        return undefined;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO transactions
+            (id, session_id, owner_actor_id, connection_id, state,
+             isolation_level, start_version, created_at)
+           VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.sessionId,
+          input.actorId,
+          input.connectionId,
+          input.isolation,
+          `sv_${eligible.version}`,
+          timestamp,
+        );
+      this.db
+        .prepare(
+          `UPDATE sessions
+           SET active_transaction_id = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(id, timestamp, input.sessionId);
+      this.db.exec("COMMIT");
+      return this.getTransaction(id)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getTransaction(id: string): TransactionRecord | undefined {
@@ -628,31 +892,53 @@ export class StateStore {
       .all(transactionId) as unknown as OperationRecord[];
   }
 
-  markTransactionCommitting(transactionId: string): boolean {
-    const result = this.db
-      .prepare(
-        `UPDATE transactions
-         SET state = 'committing', ended_at = ?
-         WHERE id = ? AND state = 'active'`,
-      )
-      .run(this.now().toISOString(), transactionId);
-    return Number(result.changes) === 1;
+  markTransactionCommitting(
+    transactionId: string,
+    sessionId: string,
+    actorId: string,
+  ): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db
+        .prepare(
+          `UPDATE transactions
+           SET state = 'committing', ended_at = ?
+           WHERE id = ? AND session_id = ? AND owner_actor_id = ?
+             AND state = 'active'
+             AND EXISTS (
+               SELECT 1 FROM sessions
+               WHERE sessions.id = transactions.session_id
+                 AND sessions.active_transaction_id = transactions.id
+             )`,
+        )
+        .run(this.now().toISOString(), transactionId, sessionId, actorId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   markTransactionOutcomeUnknown(
     transactionId: string,
     sessionId: string,
+    actorId: string,
   ): void {
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db
+      const result = this.db
         .prepare(
           `UPDATE transactions
            SET state = 'outcome_unknown', ended_at = ?
-           WHERE id = ?`,
+           WHERE id = ? AND session_id = ? AND owner_actor_id = ?
+             AND state = 'committing'`,
         )
-        .run(timestamp, transactionId);
+        .run(timestamp, transactionId, sessionId, actorId);
+      if (Number(result.changes) !== 1) {
+        throw new Error("Transaction ownership changed.");
+      }
       this.db
         .prepare(
           `UPDATE operations SET status = 'outcome_unknown'
@@ -663,9 +949,9 @@ export class StateStore {
         .prepare(
           `UPDATE sessions
            SET active_transaction_id = NULL, updated_at = ?
-           WHERE id = ?`,
+           WHERE id = ? AND active_transaction_id = ?`,
         )
-        .run(timestamp, sessionId);
+        .run(timestamp, sessionId, transactionId);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -676,32 +962,38 @@ export class StateStore {
   finishTransaction(
     transactionId: string,
     sessionId: string,
-    state: "committed" | "rolled_back" | "failed",
-  ): void {
+    actorId: string,
+    state: "rolled_back" | "failed",
+  ): boolean {
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db
+      const expectedState = state === "rolled_back" ? "active" : "committing";
+      const result = this.db
         .prepare(
-          "UPDATE transactions SET state = ?, ended_at = ? WHERE id = ?",
+          `UPDATE transactions SET state = ?, ended_at = ?
+           WHERE id = ? AND session_id = ? AND owner_actor_id = ? AND state = ?`,
         )
-        .run(state, timestamp, transactionId);
+        .run(state, timestamp, transactionId, sessionId, actorId, expectedState);
+      if (Number(result.changes) !== 1) {
+        this.db.exec("COMMIT");
+        return false;
+      }
       this.db
         .prepare(
           `UPDATE sessions
            SET active_transaction_id = NULL, updated_at = ?
-           WHERE id = ?`,
+           WHERE id = ? AND active_transaction_id = ?`,
         )
-        .run(timestamp, sessionId);
-      if (state === "rolled_back" || state === "failed") {
-        this.db
-          .prepare(
-            `UPDATE operations SET status = ?
-             WHERE transaction_id = ? AND status = 'pending'`,
-          )
-          .run(state, transactionId);
-      }
+        .run(timestamp, sessionId, transactionId);
+      this.db
+        .prepare(
+          `UPDATE operations SET status = ?
+           WHERE transaction_id = ? AND status = 'pending'`,
+        )
+        .run(state, transactionId);
       this.db.exec("COMMIT");
+      return true;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -711,12 +1003,30 @@ export class StateStore {
   commitTransactionMetadata(input: {
     transactionId: string;
     sessionId: string;
+    actorId: string;
     connectionId: string;
     operations: Array<{ id: string; affectedRows: number }>;
   }): string {
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const transaction = this.db
+        .prepare(
+          `SELECT 1 FROM transactions
+           JOIN sessions ON sessions.id = transactions.session_id
+           WHERE transactions.id = ? AND transactions.session_id = ?
+             AND transactions.owner_actor_id = ?
+             AND transactions.connection_id = ?
+             AND transactions.state = 'committing'
+             AND sessions.active_transaction_id = transactions.id`,
+        )
+        .get(
+          input.transactionId,
+          input.sessionId,
+          input.actorId,
+          input.connectionId,
+        );
+      if (!transaction) throw new Error("Transaction ownership changed.");
       let stateVersion = `sv_${(
         this.getConnection(input.connectionId)?.version ?? 0
       )}`;
@@ -762,6 +1072,7 @@ export class StateStore {
 
   savePlan(input: {
     sessionId: string;
+    ownerActorId: string;
     connectionId: string;
     sql: string;
     parameters: SqlParameters;
@@ -777,14 +1088,15 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO plans
-          (id, session_id, connection_id, sql, parameters, statement_type,
-           state_version, state_signature, destructive, allow_unbounded,
-           allow_destructive, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, session_id, owner_actor_id, connection_id, sql, parameters,
+           statement_type, state_version, state_signature, destructive,
+           allow_unbounded, allow_destructive, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         input.sessionId,
+        input.ownerActorId,
         input.connectionId,
         input.sql,
         JSON.stringify(toJsonSafe(input.parameters)),
@@ -806,14 +1118,93 @@ export class StateStore {
       .get(id) as PlanRecord | undefined;
   }
 
-  markPlanApplied(planId: string, operationId: string): void {
+  claimPlan(
+    planId: string,
+    sessionId: string,
+    actorId: string,
+    claimToken: string,
+  ): PlanRecord | undefined {
+    return this.db
+      .prepare(
+        `UPDATE plans SET claim_token = ?
+         WHERE id = ? AND session_id = ? AND owner_actor_id = ?
+           AND applied_operation_id IS NULL AND claim_token IS NULL
+           AND EXISTS (
+             SELECT 1 FROM session_members
+             WHERE session_id = plans.session_id AND actor_id = plans.owner_actor_id
+           )
+         RETURNING *`,
+      )
+      .get(claimToken, planId, sessionId, actorId) as PlanRecord | undefined;
+  }
+
+  releasePlanClaim(planId: string, claimToken: string): void {
     this.db
-      .prepare("UPDATE plans SET applied_operation_id = ? WHERE id = ?")
-      .run(operationId, planId);
+      .prepare(
+        "UPDATE plans SET claim_token = NULL WHERE id = ? AND claim_token = ?",
+      )
+      .run(planId, claimToken);
+  }
+
+  finishPlannedOperation(input: {
+    planId: string;
+    claimToken: string;
+    operationId: string;
+    connectionId: string;
+    affectedRows: number;
+  }): { operation: OperationRecord; stateVersion: string } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const eligible = this.db
+        .prepare(
+          `SELECT 1 FROM operations
+           JOIN plans ON plans.id = ?
+           WHERE operations.id = ? AND operations.connection_id = ?
+             AND operations.status = 'executing'
+             AND plans.connection_id = operations.connection_id
+             AND plans.session_id = operations.session_id
+             AND plans.claim_token = ?
+             AND plans.applied_operation_id IS NULL`,
+        )
+        .get(
+          input.planId,
+          input.operationId,
+          input.connectionId,
+          input.claimToken,
+        );
+      if (!eligible) throw new Error("Plan claim changed before finalization.");
+      const row = this.db
+        .prepare(
+          `UPDATE connections SET version = version + 1
+           WHERE id = ? RETURNING version`,
+        )
+        .get(input.connectionId) as { version: number };
+      const stateVersion = `sv_${row.version}`;
+      this.db
+        .prepare(
+          `UPDATE operations
+           SET status = 'committed', affected_rows = ?, state_version_after = ?
+           WHERE id = ?`,
+        )
+        .run(input.affectedRows, stateVersion, input.operationId);
+      this.db
+        .prepare(
+          `UPDATE plans SET applied_operation_id = ?, claim_token = NULL
+           WHERE id = ? AND claim_token = ?`,
+        )
+        .run(input.operationId, input.planId, input.claimToken);
+      const operation = this.getOperation(input.operationId)!;
+      this.db.exec("COMMIT");
+      return { operation, stateVersion };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   addHistory(input: {
     sessionId: string;
+    actorId: string;
     command: string;
     handle?: string;
     executed: boolean;
@@ -826,14 +1217,15 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO history
-          (id, timestamp, session_id, command, handle, executed, cached,
-           success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, timestamp, session_id, actor_id, command, handle, executed,
+           cached, success, error_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         this.now().toISOString(),
         input.sessionId,
+        input.actorId,
         input.command,
         input.handle ?? null,
         input.executed ? 1 : 0,
@@ -909,7 +1301,9 @@ export class StateStore {
         )
         .run(timestamp);
       this.db.prepare("DELETE FROM results WHERE expires_at <= ?").run(timestamp);
-      this.db.prepare("DELETE FROM plans WHERE expires_at <= ?").run(timestamp);
+      this.db
+        .prepare("DELETE FROM plans WHERE expires_at <= ? AND claim_token IS NULL")
+        .run(timestamp);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -956,7 +1350,22 @@ export class StateStore {
   }
 
   private migrate(): void {
-    this.db.exec(`
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+      `);
+      const actorMigrationApplied = Boolean(
+        this.db
+          .prepare(
+            "SELECT 1 FROM schema_migrations WHERE name = 'shared_session_actors_v1'",
+          )
+          .get(),
+      );
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS counters (
         prefix TEXT PRIMARY KEY,
         value INTEGER NOT NULL
@@ -969,6 +1378,13 @@ export class StateStore {
         active_transaction_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_members (
+        session_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL UNIQUE,
+        attached_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, actor_id),
+        FOREIGN KEY(session_id) REFERENCES sessions(id)
       );
       CREATE TABLE IF NOT EXISTS profiles (
         name TEXT PRIMARY KEY,
@@ -1020,6 +1436,7 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS operations (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
         connection_id TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
         sql TEXT NOT NULL,
@@ -1042,6 +1459,7 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS transactions (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        owner_actor_id TEXT NOT NULL,
         connection_id TEXT NOT NULL,
         state TEXT NOT NULL,
         isolation_level TEXT NOT NULL,
@@ -1052,6 +1470,7 @@ export class StateStore {
       CREATE TABLE IF NOT EXISTS plans (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        owner_actor_id TEXT NOT NULL,
         connection_id TEXT NOT NULL,
         sql TEXT NOT NULL,
         parameters TEXT NOT NULL,
@@ -1063,12 +1482,14 @@ export class StateStore {
         allow_destructive INTEGER NOT NULL,
         expires_at TEXT NOT NULL,
         applied_operation_id TEXT,
+        claim_token TEXT,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS history (
         id TEXT PRIMARY KEY,
         timestamp TEXT NOT NULL,
         session_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
         command TEXT NOT NULL,
         handle TEXT,
         executed INTEGER NOT NULL,
@@ -1078,6 +1499,51 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS history_session
         ON history(session_id);
-    `);
+      `);
+      this.addColumn("operations", "actor_id", "TEXT");
+      this.addColumn("transactions", "owner_actor_id", "TEXT");
+      this.addColumn("plans", "owner_actor_id", "TEXT");
+      this.addColumn("plans", "claim_token", "TEXT");
+      this.addColumn("history", "actor_id", "TEXT");
+      if (!actorMigrationApplied) {
+        this.db.exec(`
+          INSERT OR IGNORE INTO session_members(session_id, actor_id, attached_at)
+          SELECT id, name, created_at FROM sessions;
+        `);
+      }
+      this.db.exec(`
+        UPDATE operations SET actor_id = (
+          SELECT name FROM sessions WHERE sessions.id = operations.session_id
+        ) WHERE actor_id IS NULL;
+        UPDATE transactions SET owner_actor_id = (
+          SELECT name FROM sessions WHERE sessions.id = transactions.session_id
+        ) WHERE owner_actor_id IS NULL;
+        UPDATE plans SET owner_actor_id = (
+          SELECT name FROM sessions WHERE sessions.id = plans.session_id
+        ) WHERE owner_actor_id IS NULL;
+        UPDATE history SET actor_id = (
+          SELECT name FROM sessions WHERE sessions.id = history.session_id
+        ) WHERE actor_id IS NULL;
+      `);
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO schema_migrations(name, applied_at)
+           VALUES ('shared_session_actors_v1', ?)`,
+        )
+        .run(this.now().toISOString());
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private addColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!columns.some((candidate) => candidate.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
   }
 }

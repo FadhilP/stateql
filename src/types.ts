@@ -50,6 +50,7 @@ export interface HistoryEntry {
   command_id: string;
   timestamp: string;
   session_id: string;
+  actor_id: string;
   command: string;
   handle: string | null;
   executed: boolean;
@@ -64,6 +65,7 @@ export interface StateQLSnapshot {
     name: string;
     status: string;
   };
+  actor_id: string;
   connection: {
     connection_id: string;
     name: string;
@@ -74,6 +76,7 @@ export interface StateQLSnapshot {
   } | null;
   transaction: {
     transaction_id: string;
+    owner_actor_id: string;
     state: string;
   } | null;
   state_version: string | null;
@@ -85,6 +88,7 @@ export interface StateQLSnapshot {
   }>;
   recent_operations: Array<{
     handle: string;
+    actor_id: string;
     type: string;
     affected_rows: number | null;
     status: string;
@@ -102,6 +106,7 @@ export interface ExecutionOptions {
 export interface StateQLOptions extends ExecutionOptions {
   home?: string;
   session?: string;
+  actor?: string;
   previewRows?: number;
   cacheTtlSeconds?: number;
   resultTtlSeconds?: number;

@@ -9,7 +9,8 @@ import {
 import { randomUUID } from "node:crypto";
 import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
-import { createTemporaryDirectory } from "./helpers.js";
+import { StateQL } from "../src/stateql.js";
+import { createTemporaryDirectory, succeed } from "./helpers.js";
 
 const windows = process.platform === "win32";
 const availableCommands = [
@@ -102,9 +103,15 @@ function scenario(): TerminalStep[] {
   const exportFile = process.env.STQL_PTY_EXPORT!;
   const batchFile = process.env.STQL_PTY_BATCH!;
   const pipeFile = process.env.STQL_PTY_PIPE!;
+  const switchToOwner = windows
+    ? 'set "STQL_ACTOR=pty-test" & ver >nul'
+    : "export STQL_ACTOR=pty-test";
+  const switchToActor = windows
+    ? 'set "STQL_ACTOR=terminal-actor" & ver >nul'
+    : "export STQL_ACTOR=terminal-actor";
   const switchSession = windows
-    ? 'set "STQL_SESSION=terminal-next"'
-    : "export STQL_SESSION=terminal-next";
+    ? 'set "STQL_SESSION=terminal-next" & set "STQL_ACTOR=" & ver >nul'
+    : "export STQL_SESSION=terminal-next; unset STQL_ACTOR";
 
   const steps: TerminalStep[] = [
     {
@@ -141,7 +148,7 @@ function scenario(): TerminalStep[] {
       label: "connected status",
       command: stql("status"),
       commandId: "status",
-      expect: /"driver":"sqlite"/,
+      expect: /"actor_id":"terminal-actor".*"driver":"sqlite"/,
     },
     {
       label: "create schema",
@@ -250,6 +257,21 @@ function scenario(): TerminalStep[] {
       expect: /"total":1/,
     },
     {
+      label: "switch to workspace owner",
+      command: switchToOwner,
+      machineOutput: false,
+    },
+    {
+      label: "owner reuses shared alias",
+      command: stql("count", "ada-items"),
+      expect: /"total":1/,
+    },
+    {
+      label: "switch back to attached actor",
+      command: switchToActor,
+      machineOutput: false,
+    },
+    {
       label: "export aliased result",
       command: stql(
         "export",
@@ -270,6 +292,22 @@ function scenario(): TerminalStep[] {
       ),
       commandId: "plan",
       capture: "plan",
+    },
+    {
+      label: "switch owner before applying actor plan",
+      command: switchToOwner,
+      machineOutput: false,
+    },
+    {
+      label: "reject applying another actor plan",
+      command: (state) => stql("apply", required(state, "plan")),
+      expectedStatus: 8,
+      expect: /"code":"PERMISSION_DENIED"/,
+    },
+    {
+      label: "restore plan owner",
+      command: switchToActor,
+      machineOutput: false,
     },
     {
       label: "apply plan",
@@ -299,11 +337,37 @@ function scenario(): TerminalStep[] {
       expect: /"state":"active"/,
     },
     {
+      label: "switch away from transaction owner",
+      command: switchToOwner,
+      machineOutput: false,
+    },
+    {
       label: "inspect active transaction",
       command: (state) =>
         stql("transaction", "status", required(state, "commitTransaction")),
       commandId: "transaction.status",
-      expect: /"state":"active"/,
+      expect: /"state":"active".*"owner_actor_id":"terminal-actor"/,
+    },
+    {
+      label: "reject staging for another actor transaction",
+      command: stql(
+        "exec",
+        "INSERT INTO terminal_items (name, status) VALUES ('Blocked', 'pending')",
+      ),
+      expectedStatus: 8,
+      expect: /"code":"PERMISSION_DENIED"/,
+    },
+    {
+      label: "reject committing another actor transaction",
+      command: (state) =>
+        stql("transaction", "commit", required(state, "commitTransaction")),
+      expectedStatus: 8,
+      expect: /"code":"PERMISSION_DENIED"/,
+    },
+    {
+      label: "restore transaction owner",
+      command: switchToActor,
+      machineOutput: false,
     },
     {
       label: "stage committed write",
@@ -370,7 +434,7 @@ function scenario(): TerminalStep[] {
       label: "read history",
       command: stql("history", "--limit", "1"),
       commandId: "history",
-      expect: /"history":\[\{/,
+      expect: /"history":\[\{.*"actor_id":"terminal-actor"/,
     },
     {
       label: "read capabilities",
@@ -627,7 +691,7 @@ async function runDriver(): Promise<void> {
 if (process.env.STQL_PTY_DRIVER === "1") {
   await runDriver();
 } else {
-  test("all stql commands run in sequence in a real terminal", () => {
+  test("all stql commands run in sequence in a real terminal", async () => {
     const root = createTemporaryDirectory("stateql-pty-test-");
     const bin = join(root, "bin");
     const files = join(root, "terminal files");
@@ -639,6 +703,9 @@ if (process.env.STQL_PTY_DRIVER === "1") {
     mkdirSync(bin);
     mkdirSync(files);
     createStqlShim(bin);
+    const owner = new StateQL({ home, session: "pty-test" });
+    await succeed(owner.linkActor("pty-test", "terminal-actor"));
+    owner.close();
     writeFileSync(
       batchFile,
       JSON.stringify([
@@ -671,6 +738,7 @@ if (process.env.STQL_PTY_DRIVER === "1") {
         env: {
           ...process.env,
           PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+          STQL_ACTOR: "terminal-actor",
           STQL_HOME: home,
           STQL_SESSION: "pty-test",
           STQL_PTY_BATCH: batchFile,

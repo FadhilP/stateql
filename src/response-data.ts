@@ -28,6 +28,7 @@ export function profileData(profile: ProfileRecord): Record<string, unknown> {
 export function operationData(operation: OperationRecord): Record<string, unknown> {
   return {
     operation_id: operation.id,
+    actor_id: operation.actor_id,
     statement_type: operation.statement_type,
     affected_rows: operation.affected_rows,
     status: operation.status,
@@ -46,6 +47,7 @@ export function transactionData(
   return {
     transaction_id: transaction.id,
     state: transaction.state,
+    owner_actor_id: transaction.owner_actor_id,
     connection_id: transaction.connection_id,
     statements,
     pending_writes: transaction.state === "active" ? statements : 0,
