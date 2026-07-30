@@ -238,9 +238,8 @@ Interrupted commits remain fail-closed; stale `committing` records become
 ```ts
 import { StateQL } from "@fadhilp/stateql";
 
-const stateql = new StateQL({
+const stateql = StateQL.forActor({
   home: "./.stql",
-  session: "shared-workspace",
   actor: "pi-session-id",
   timeoutMs: 30_000,
   maxResultBytes: 16 * 1024 * 1024,
@@ -257,6 +256,11 @@ if (response.ok) {
   });
 }
 ```
+
+`StateQL.forActor(...)` resolves the actor's attached session directly from
+StateQL storage, avoiding a duplicate actor-to-session mapping in integrations.
+On first use, it creates a legacy-compatible session named after the actor.
+Use `new StateQL({ session, actor })` when the session is already known.
 
 Membership is managed only through the library API, not batch commands:
 `linkActor(session, actorId)`, `unlinkActor(session, actorId)`,

@@ -245,6 +245,26 @@ test("history keeps the latest 10,000 entries per session", () => {
   store.close();
 });
 
+test("actor-first opening resolves linked workspaces and bootstraps first use", async () => {
+  const root = createTemporaryDirectory();
+  const home = join(root, "state");
+  const owner = new StateQL({ home, session: "workspace" });
+  await succeed(owner.linkActor("workspace", "actor-b"));
+
+  const linked = StateQL.forActor({ home, actor: "actor-b" });
+  assert.equal(linked.snapshot().session.name, "workspace");
+  assert.equal(linked.snapshot().actor_id, "actor-b");
+  linked.close();
+
+  const firstUse = StateQL.forActor({ home, actor: "actor-c" });
+  assert.equal(firstUse.snapshot().session.name, "actor-c");
+  assert.equal(firstUse.snapshot().actor_id, "actor-c");
+  const resolved = await succeed(firstUse.resolveActor("actor-c"));
+  assert.equal(resolved.session.name, "actor-c");
+  firstUse.close();
+  owner.close();
+});
+
 test("actors share workspace handles, aliases, history, and restarts", async () => {
   const root = createTemporaryDirectory();
   const home = join(root, "state");

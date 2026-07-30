@@ -1,6 +1,6 @@
 {
   "name": "@fadhilp/stateql",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Stateful, agent-oriented database CLI for safe result reuse",
   "repository": {
     "type": "git",

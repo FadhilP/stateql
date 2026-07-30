@@ -16,6 +16,7 @@ export type {
   Response,
   RowsOptions,
   SqlParameters,
+  StateQLActorOptions,
   StateQLOptions,
   StateQLSnapshot,
   Success,

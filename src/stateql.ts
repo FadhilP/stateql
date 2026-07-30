@@ -58,6 +58,7 @@ import type {
   RowsOptions,
   SqlParameters,
   StateConfidence,
+  StateQLActorOptions,
   StateQLOptions,
   StateQLSnapshot,
   Success,
@@ -86,6 +87,22 @@ interface ActionResult<T> {
 }
 
 export class StateQL {
+  static forActor(options: StateQLActorOptions): StateQL {
+    if (!options.actor.trim()) {
+      throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
+    }
+    const now = options.now ?? (() => new Date());
+    const store = new StateStore(options.home ?? defaultHome(), now);
+    try {
+      const session = store.resolveActor(options.actor);
+      if (session) return new StateQL({ ...options, session: session.name });
+      const { actor, ...legacyOptions } = options;
+      return new StateQL({ ...legacyOptions, session: actor });
+    } finally {
+      store.close();
+    }
+  }
+
   private readonly store: StateStore;
   private readonly sessionName: string;
   private readonly actorId: string;

@@ -116,6 +116,10 @@ export interface StateQLOptions extends ExecutionOptions {
   now?: () => Date;
 }
 
+export type StateQLActorOptions = Omit<StateQLOptions, "session" | "actor"> & {
+  actor: string;
+};
+
 export interface QueryOptions extends ExecutionOptions {
   params?: SqlParameters;
   cache?: "auto" | "bypass" | "require";
