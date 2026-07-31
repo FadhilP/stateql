@@ -85,15 +85,9 @@ export function createAdapterContext(
 export async function createAdapter(
   connection: ConnectionRecord,
   context: AdapterContext,
+  input: { source: string },
 ): Promise<Adapter> {
-  const source = connection.secret_env
-    ? process.env[connection.secret_env]
-    : connection.source;
-  if (!source) {
-    throw new Error(
-      `Environment variable ${connection.secret_env ?? "(missing)"} is not set.`,
-    );
-  }
+  const { source } = input;
   if (connection.driver === "sqlite") {
     return new SQLiteAdapter(source, Boolean(connection.read_only), context);
   }

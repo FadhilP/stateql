@@ -1,5 +1,18 @@
 import type { StateQLErrorShape } from "./types.js";
 
+export type CredentialResolutionFailure =
+  | "unavailable"
+  | "denied"
+  | "cancelled"
+  | "timeout";
+
+export class CredentialResolutionError extends Error {
+  constructor(readonly reason: CredentialResolutionFailure) {
+    super(`Credential resolution ${reason}.`);
+    this.name = "CredentialResolutionError";
+  }
+}
+
 export class StateQLError extends Error {
   readonly details: StateQLErrorShape;
 
@@ -30,7 +43,7 @@ export class StateQLError extends Error {
 
 export function exitCodeFor(code: string): number {
   if (code === "INVALID_COMMAND" || code === "INVALID_SQL") return 2;
-  if (code.startsWith("CONNECTION_")) return 3;
+  if (code.startsWith("CONNECTION_") || code.startsWith("CREDENTIAL_")) return 3;
   if (
     code === "QUERY_FAILED" ||
     code === "DEADLINE_EXCEEDED" ||

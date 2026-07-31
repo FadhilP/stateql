@@ -20,7 +20,11 @@ import {
   validateProfileName,
   version,
 } from "./connection.js";
-import { asStateQLError, StateQLError } from "./errors.js";
+import {
+  asStateQLError,
+  CredentialResolutionError,
+  StateQLError,
+} from "./errors.js";
 import {
   filterMaterializedRows,
   prepareFilterStatement,
@@ -46,6 +50,10 @@ import type {
   BatchCommand,
   BatchOptions,
   ConnectOptions,
+  CredentialAccess,
+  CredentialOperation,
+  CredentialRequest,
+  CredentialResolver,
   ExecOptions,
   ExecutionOptions,
   Failure,
@@ -114,6 +122,7 @@ export class StateQL {
   private readonly maxResultBytes: number;
   private readonly timeoutMs: number;
   private readonly signal?: AbortSignal;
+  private readonly credentialResolver?: CredentialResolver;
   private readonly now: () => Date;
 
   constructor(options: StateQLOptions = {}) {
@@ -137,6 +146,7 @@ export class StateQL {
     );
     this.timeoutMs = executionTimeout(options.timeoutMs ?? 30_000);
     this.signal = options.signal;
+    this.credentialResolver = options.credentialResolver;
     if (this.maxResultRows >= Number.MAX_SAFE_INTEGER) {
       throw new StateQLError(
         "INVALID_COMMAND",
@@ -189,14 +199,31 @@ export class StateQL {
 
       const resolvedTarget = profile?.target ?? target;
       const secretEnv = options.secretEnv ?? profile?.secret_env ?? undefined;
-      const secret = secretEnv ? env[secretEnv] : resolvedTarget;
-      if (!secret) {
+      if (secretEnv && !isEnvironmentName(secretEnv)) {
         throw new StateQLError(
           "INVALID_COMMAND",
-          secretEnv
-            ? `Environment variable ${secretEnv} is not set.`
-            : "Connection target is required.",
+          "Secret environment variable name is invalid.",
         );
+      }
+      const readOnly =
+        options.readOnly ??
+        (profile ? Boolean(profile.read_only) : true);
+      const context = this.executionContext(options);
+      const secret = secretEnv
+        ? await this.resolveCredential(
+            secretEnv,
+            session,
+            "connect",
+            readOnly ? "read" : "write",
+            context,
+            {
+              ...(profile ? { profile: { name: profile.name } } : {}),
+              requestedReadOnly: readOnly,
+            },
+          )
+        : resolvedTarget;
+      if (!secret) {
+        throw new StateQLError("INVALID_COMMAND", "Connection target is required.");
       }
       const driver = detectDriver(secret);
       if (
@@ -214,19 +241,18 @@ export class StateQL {
         );
       }
 
+      const adapterSource =
+        driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
       const source =
         driver === "sqlite"
-          ? normalizeSqliteSource(secret)
+          ? adapterSource
           : secretEnv
             ? redact(secret)
-            : secret;
+            : adapterSource;
       const databaseName =
         driver === "sqlite"
-          ? basename(source)
+          ? basename(adapterSource)
           : new URL(secret).pathname.replace(/^\//, "") || driver;
-      const readOnly =
-        options.readOnly ??
-        (profile ? Boolean(profile.read_only) : true);
       const draft: ConnectionRecord = {
         id: "pending",
         session_id: session.id,
@@ -240,10 +266,7 @@ export class StateQL {
         created_at: this.now().toISOString(),
       };
 
-      const adapter = await createAdapter(
-        draft,
-        this.executionContext(options),
-      );
+      const adapter = await this.openAdapter(draft, context, adapterSource);
       try {
         await adapter.read("SELECT 1", []);
       } catch (error) {
@@ -252,11 +275,11 @@ export class StateQL {
         }
         throw new StateQLError(
           "CONNECTION_FAILED",
-          errorMessage(error),
+          safeCredentialErrorMessage(error, adapterSource),
           { retryable: true },
         );
       } finally {
-        await adapter.close();
+        await closeAdapterQuietly(adapter);
       }
 
       const connection = this.store.addConnection({
@@ -709,9 +732,18 @@ export class StateQL {
         );
       }
       const parameters = options.params ?? [];
-      const adapter = await createAdapter(
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
         connection,
-        this.executionContext(options),
+        session,
+        "query",
+        "read",
+        context,
+      );
+      const adapter = await this.openAdapter(
+        connection,
+        context,
+        adapterSource,
       );
       try {
         const stateVersion = version(connection);
@@ -800,12 +832,16 @@ export class StateQL {
         if (error instanceof AdapterExecutionError) {
           throw stoppedStateQLError(error, true);
         }
-        throw new StateQLError("QUERY_FAILED", errorMessage(error), {
-          retryable: true,
-          executed: true,
-        });
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          {
+            retryable: true,
+            executed: true,
+          },
+        );
       } finally {
-        await adapter.close();
+        await closeAdapterQuietly(adapter);
       }
     });
   }
@@ -1096,9 +1132,18 @@ export class StateQL {
           { suggestedAction: "Roll back and begin a new transaction." },
         );
       }
-      const adapter = await createAdapter(
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
         connection,
-        this.executionContext(options),
+        session,
+        "transaction.commit",
+        "write",
+        context,
+      );
+      const adapter = await this.openAdapter(
+        connection,
+        context,
+        adapterSource,
       );
       try {
         if (
@@ -1151,9 +1196,11 @@ export class StateQL {
             if (error instanceof AdapterExecutionError) {
               throw stoppedStateQLError(error, false);
             }
-            throw new StateQLError("TRANSACTION_FAILED", error.message, {
-              retryable: true,
-            });
+            throw new StateQLError(
+              "TRANSACTION_FAILED",
+              safeCredentialErrorMessage(error, adapterSource),
+              { retryable: true },
+            );
           }
           markTransactionOutcomeUnknown(
             this.store,
@@ -1161,11 +1208,15 @@ export class StateQL {
             session.id,
             this.actorId,
           );
-          throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
-            executed: true,
-            suggestedAction:
-              "Inspect database state before issuing any replacement write.",
-          });
+          throw new StateQLError(
+            "OUTCOME_UNKNOWN",
+            safeCredentialErrorMessage(error, adapterSource),
+            {
+              executed: true,
+              suggestedAction:
+                "Inspect database state before issuing any replacement write.",
+            },
+          );
         }
 
         if (results.length !== operations.length) {
@@ -1205,11 +1256,15 @@ export class StateQL {
             session.id,
             this.actorId,
           );
-          throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
-            executed: true,
-            suggestedAction:
-              "Inspect database state before issuing any replacement write.",
-          });
+          throw new StateQLError(
+            "OUTCOME_UNKNOWN",
+            safeCredentialErrorMessage(error, adapterSource),
+            {
+              executed: true,
+              suggestedAction:
+                "Inspect database state before issuing any replacement write.",
+            },
+          );
         }
 
         return {
@@ -1276,9 +1331,18 @@ export class StateQL {
     return this.run(`inspect.${kind}`, async (session) => {
       const connection = this.requireConnection(session);
       this.rejectDuringStagedTransaction(session, "Schema inspection");
-      const adapter = await createAdapter(
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
         connection,
-        this.executionContext(options),
+        session,
+        "inspect",
+        "read",
+        context,
+      );
+      const adapter = await this.openAdapter(
+        connection,
+        context,
+        adapterSource,
       );
       try {
         const data = await adapter.inspect(kind, table);
@@ -1292,12 +1356,16 @@ export class StateQL {
         if (error instanceof AdapterExecutionError) {
           throw stoppedStateQLError(error, true);
         }
-        throw new StateQLError("QUERY_FAILED", errorMessage(error), {
-          retryable: false,
-          executed: true,
-        });
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          {
+            retryable: false,
+            executed: true,
+          },
+        );
       } finally {
-        await adapter.close();
+        await closeAdapterQuietly(adapter);
       }
     });
   }
@@ -1313,9 +1381,18 @@ export class StateQL {
           "plan accepts write statements only.",
         );
       }
-      const adapter = await createAdapter(
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
         connection,
-        this.executionContext(options),
+        session,
+        "plan",
+        "read",
+        context,
+      );
+      const adapter = await this.openAdapter(
+        connection,
+        context,
+        adapterSource,
       );
       try {
         const stateSignature = await adapter.signature();
@@ -1360,12 +1437,17 @@ export class StateQL {
           confidence: adapter.confidence,
         };
       } catch (error) {
+        if (error instanceof StateQLError) throw error;
         if (error instanceof AdapterExecutionError) {
           throw stoppedStateQLError(error, true);
         }
-        throw error;
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          { retryable: true, executed: true },
+        );
       } finally {
-        await adapter.close();
+        await closeAdapterQuietly(adapter);
       }
     });
   }
@@ -1418,7 +1500,18 @@ export class StateQL {
           );
         }
         const context = this.executionContext(options);
-        const adapter = await createAdapter(connection, context);
+        const adapterSource = await this.resolveConnectionSource(
+          connection,
+          session,
+          "apply",
+          "write",
+          context,
+        );
+        const adapter = await this.openAdapter(
+          connection,
+          context,
+          adapterSource,
+        );
         try {
           if ((await adapter.signature()) !== claimed.state_signature) {
             throw new StateQLError(
@@ -1427,12 +1520,17 @@ export class StateQL {
             );
           }
         } catch (error) {
+          if (error instanceof StateQLError) throw error;
           if (error instanceof AdapterExecutionError) {
             throw stoppedStateQLError(error, true);
           }
-          throw error;
+          throw new StateQLError(
+            "QUERY_FAILED",
+            safeCredentialErrorMessage(error, adapterSource),
+            { retryable: true, executed: true },
+          );
         } finally {
-          await adapter.close();
+          await closeAdapterQuietly(adapter);
         }
         const result = await this.performExec(
           session,
@@ -1445,6 +1543,7 @@ export class StateQL {
           },
           context,
           { planId: claimed.id, claimToken },
+          adapterSource,
         );
         return {
           ...result,
@@ -1486,6 +1585,7 @@ export class StateQL {
           persistent_sessions: true,
           result_filtering: true,
           schema_inspection: true,
+          credential_resolver: true,
           deadlines: true,
           cancellation: true,
         },
@@ -1665,6 +1765,7 @@ export class StateQL {
     options: ExecOptions,
     context: AdapterContext,
     planClaim?: { planId: string; claimToken: string },
+    resolvedSource?: string,
   ): Promise<ActionResult<unknown>> {
     if (connection.read_only) {
       throw new StateQLError(
@@ -1831,11 +1932,22 @@ export class StateQL {
     }
 
     let adapter: Adapter;
+    let adapterSource: string;
     try {
-      adapter = await createAdapter(connection, context);
+      adapterSource =
+        resolvedSource ??
+        (await this.resolveConnectionSource(
+          connection,
+          session,
+          "exec",
+          "write",
+          context,
+        ));
+      adapter = await this.openAdapter(connection, context, adapterSource);
     } catch (error) {
       this.store.failOperation(operation.id);
-      throw new StateQLError("QUERY_FAILED", errorMessage(error), {
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError("CONNECTION_FAILED", "Database connection failed.", {
         retryable: true,
       });
     }
@@ -1891,16 +2003,22 @@ export class StateQL {
       }
       if (error instanceof AdapterWriteError && !error.outcomeUnknown) {
         this.store.failOperation(operation.id);
-        throw new StateQLError("QUERY_FAILED", error.message, {
-          executed: true,
-        });
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          { executed: true },
+        );
       }
       this.store.markOperationOutcomeUnknown(operation.id);
-      throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
-        executed: true,
-        suggestedAction:
-          "Inspect database state, then use --replay only if another execution is safe.",
-      });
+      throw new StateQLError(
+        "OUTCOME_UNKNOWN",
+        safeCredentialErrorMessage(error, adapterSource),
+        {
+          executed: true,
+          suggestedAction:
+            "Inspect database state, then use --replay only if another execution is safe.",
+        },
+      );
     } finally {
       try {
         await adapter.close();
@@ -2024,6 +2142,104 @@ export class StateQL {
       "PERMISSION_DENIED",
       `Actor "${this.actorId}" is not attached to session "${session.name}".`,
     );
+  }
+
+  private async resolveConnectionSource(
+    connection: ConnectionRecord,
+    session: SessionRecord,
+    operation: CredentialOperation,
+    access: CredentialAccess,
+    context: AdapterContext,
+  ): Promise<string> {
+    if (!connection.secret_env) return connection.source;
+    return this.resolveCredential(
+      connection.secret_env,
+      session,
+      operation,
+      access,
+      context,
+      {
+        connection: {
+          id: connection.id,
+          name: connection.name,
+          driver: connection.driver,
+          database: connection.database_name,
+          readOnly: Boolean(connection.read_only),
+        },
+      },
+    );
+  }
+
+  private async resolveCredential(
+    reference: string,
+    session: SessionRecord,
+    operation: CredentialOperation,
+    access: CredentialAccess,
+    context: AdapterContext,
+    details: Pick<
+      CredentialRequest,
+      "profile" | "requestedReadOnly" | "connection"
+    > = {},
+  ): Promise<string> {
+    const resolver = this.credentialResolver;
+    if (!resolver) {
+      if (context.signal?.aborted) {
+        throw credentialStateQLError(
+          reference,
+          new CredentialResolutionError("cancelled"),
+        );
+      }
+      if (context.deadline <= Date.now()) {
+        throw credentialStateQLError(
+          reference,
+          new CredentialResolutionError("timeout"),
+        );
+      }
+      const value = env[reference];
+      if (value) return value;
+      throw credentialStateQLError(
+        reference,
+        new CredentialResolutionError("unavailable"),
+      );
+    }
+
+    const request: CredentialRequest = {
+      reference,
+      actorId: this.actorId,
+      session: { id: session.id, name: session.name },
+      operation,
+      access,
+      ...(context.signal ? { signal: context.signal } : {}),
+      ...details,
+    };
+    try {
+      const value = await resolveCredentialBeforeDeadline(
+        resolver,
+        request,
+        context,
+      );
+      if (!value) throw new CredentialResolutionError("unavailable");
+      return value;
+    } catch (error) {
+      throw credentialStateQLError(reference, error);
+    }
+  }
+
+  private async openAdapter(
+    connection: ConnectionRecord,
+    context: AdapterContext,
+    source: string,
+  ): Promise<Adapter> {
+    try {
+      return await createAdapter(connection, context, { source });
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError(
+        "CONNECTION_FAILED",
+        safeCredentialErrorMessage(error, source),
+        { retryable: true },
+      );
+    }
   }
 
   private executionContext(options: ExecutionOptions): AdapterContext {
@@ -2231,6 +2447,101 @@ function nonNegativeInteger(value: number, name: string): number {
 function positiveInteger(value: number, name: string): number {
   if (Number.isInteger(value) && value > 0) return value;
   throw new StateQLError("INVALID_COMMAND", `${name} must be a positive integer.`);
+}
+
+async function closeAdapterQuietly(adapter: Adapter): Promise<void> {
+  try {
+    await adapter.close();
+  } catch {
+    // Preserve the operation result or primary sanitized error.
+  }
+}
+
+async function resolveCredentialBeforeDeadline(
+  resolver: CredentialResolver,
+  request: CredentialRequest,
+  context: AdapterContext,
+): Promise<string | undefined> {
+  if (context.signal?.aborted) {
+    throw new CredentialResolutionError("cancelled");
+  }
+  const remaining = context.deadline - Date.now();
+  if (remaining <= 0) throw new CredentialResolutionError("timeout");
+
+  return new Promise<string | undefined>((resolve, reject) => {
+    let settled = false;
+    const finish = (
+      action: (value?: string) => void,
+      value?: string,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      context.signal?.removeEventListener("abort", abort);
+      action(value);
+    };
+    const abort = () =>
+      finish(() => reject(new CredentialResolutionError("cancelled")));
+    const timer = setTimeout(
+      () => finish(() => reject(new CredentialResolutionError("timeout"))),
+      remaining,
+    );
+    timer.unref?.();
+    context.signal?.addEventListener("abort", abort, { once: true });
+
+    Promise.resolve()
+      .then(() => resolver(request))
+      .then(
+        (value) => finish(resolve, value),
+        (error: unknown) => finish(() => reject(error)),
+      );
+  });
+}
+
+function credentialStateQLError(
+  reference: string,
+  error: unknown,
+): StateQLError {
+  if (error instanceof CredentialResolutionError) {
+    switch (error.reason) {
+      case "unavailable":
+        return new StateQLError(
+          "CREDENTIAL_UNAVAILABLE",
+          `Credential reference "${reference}" is unavailable.`,
+          { retryable: true },
+        );
+      case "denied":
+        return new StateQLError(
+          "PERMISSION_DENIED",
+          `Credential access for "${reference}" was denied.`,
+        );
+      case "cancelled":
+        return new StateQLError(
+          "OPERATION_CANCELLED",
+          "Credential resolution was cancelled.",
+          { retryable: true },
+        );
+      case "timeout":
+        return new StateQLError(
+          "DEADLINE_EXCEEDED",
+          "Credential resolution exceeded the operation deadline.",
+          { retryable: true },
+        );
+    }
+  }
+  return new StateQLError(
+    "CREDENTIAL_RESOLUTION_FAILED",
+    `Credential reference "${reference}" could not be resolved.`,
+    { retryable: true },
+  );
+}
+
+function safeCredentialErrorMessage(error: unknown, source: string): string {
+  return redact(errorMessage(error).split(source).join("[credential redacted]"))
+    .replace(
+      /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/giu,
+      "$1***@",
+    );
 }
 
 function executionTimeout(value: number): number {

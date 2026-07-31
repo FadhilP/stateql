@@ -257,6 +257,63 @@ if (response.ok) {
 }
 ```
 
+### Harness credential resolution
+
+Library integrations can resolve a profile's credential reference through a
+trusted approval or secret-storage layer instead of mutating `process.env`:
+
+```ts
+import {
+  CredentialResolutionError,
+  StateQL,
+  type CredentialRequest,
+} from "@fadhilp/stateql";
+
+async function resolveCredential(
+  request: CredentialRequest,
+): Promise<string | undefined> {
+  const approved = await credentialBroker.request({
+    reference: request.reference,
+    actor: request.actorId,
+    session: request.session.id,
+    operation: request.operation,
+    access: request.access,
+    signal: request.signal,
+  });
+  if (approved.denied) throw new CredentialResolutionError("denied");
+  return approved.value;
+}
+
+const stateql = StateQL.forActor({
+  actor: "agent-session-id",
+  credentialResolver: resolveCredential,
+});
+```
+
+When no custom resolver is configured, StateQL continues to read references
+from `process.env`. A configured resolver is authoritative: returning
+`undefined` produces `CREDENTIAL_UNAVAILABLE` and never falls back to the
+process environment. Resolvers may throw `CredentialResolutionError` with
+`denied`, `cancelled`, `timeout`, or `unavailable` to produce controlled,
+secret-free failures. Unknown resolver errors are replaced with a generic
+`CREDENTIAL_RESOLUTION_FAILED` response.
+
+StateQL calls the resolver only immediately before database access, after SQL
+safety and duplicate checks. Requests contain actor/session identity, the
+operation's effective read/write access, an abort signal, and sanitized
+connection metadata. Returned values are passed directly to the adapter.
+Credential-bearing PostgreSQL and MySQL URLs are redacted before connection
+metadata is persisted and never enter history, snapshots, cache keys, or
+responses. SQLite paths remain persisted connection metadata, as they are for
+direct SQLite connections. Harnesses remain responsible for approval policy,
+binding lifetime, revocation, and keeping values out of their own logs and
+model-visible data.
+
+For writes, credential resolution happens after StateQL atomically reserves the
+operation for duplicate protection. A resolution failure keeps a non-executed
+`failed` audit record, does not consume the idempotency key, and permits a safe
+retry.
+
 `StateQL.forActor(...)` resolves the actor's attached session directly from
 StateQL storage, avoiding a duplicate actor-to-session mapping in integrations.
 On first use, it creates a legacy-compatible session named after the actor.

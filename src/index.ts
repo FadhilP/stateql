@@ -1,10 +1,19 @@
 export { StateQL } from "./stateql.js";
-export { StateQLError, exitCodeFor } from "./errors.js";
+export {
+  CredentialResolutionError,
+  StateQLError,
+  exitCodeFor,
+} from "./errors.js";
+export type { CredentialResolutionFailure } from "./errors.js";
 export type {
   BatchCommand,
   BatchCommandName,
   BatchOptions,
   ConnectOptions,
+  CredentialAccess,
+  CredentialOperation,
+  CredentialRequest,
+  CredentialResolver,
   ExecOptions,
   ExecutionOptions,
   Failure,

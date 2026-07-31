@@ -1,4 +1,42 @@
 export type Driver = "sqlite" | "postgres" | "mysql";
+
+export type CredentialAccess = "read" | "write";
+export type CredentialOperation =
+  | "connect"
+  | "query"
+  | "inspect"
+  | "plan"
+  | "exec"
+  | "apply"
+  | "transaction.commit";
+
+export interface CredentialRequest {
+  reference: string;
+  actorId: string;
+  session: {
+    id: string;
+    name: string;
+  };
+  operation: CredentialOperation;
+  access: CredentialAccess;
+  signal?: AbortSignal;
+  profile?: {
+    name: string;
+  };
+  requestedReadOnly?: boolean;
+  connection?: {
+    id: string;
+    name: string;
+    driver: Driver;
+    database: string;
+    readOnly: boolean;
+  };
+}
+
+export type CredentialResolver = (
+  request: CredentialRequest,
+) => string | undefined | Promise<string | undefined>;
+
 export type StateConfidence =
   | "authoritative"
   | "transaction_snapshot"
@@ -113,6 +151,7 @@ export interface StateQLOptions extends ExecutionOptions {
   maxCellCharacters?: number;
   maxResultRows?: number;
   maxResultBytes?: number;
+  credentialResolver?: CredentialResolver;
   now?: () => Date;
 }
 
