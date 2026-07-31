@@ -24,8 +24,47 @@ export function detectDriver(target: string): Driver {
   return "sqlite";
 }
 
+export function credentialSource(
+  value: string,
+  expectedDriver?: Driver,
+): { driver: Driver; source: string } {
+  const explicitSqlite = /^sqlite:(?!\/\/)/i.test(value);
+  const driver = explicitSqlite ? "sqlite" : detectDriver(value);
+  if (driver === "sqlite" && (!explicitSqlite || value.length === 7)) {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "Secret environment variable must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source.",
+      {
+        suggestedAction:
+          "Store the full database URL, or prefix an SQLite path with sqlite:.",
+      },
+    );
+  }
+  if (driver !== "sqlite") {
+    try {
+      const url = new URL(value);
+      if (!url.hostname && !url.pathname.replaceAll("/", "")) throw new Error();
+    } catch {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        "Secret environment variable must contain a valid database URL.",
+      );
+    }
+  }
+  if (expectedDriver && driver !== expectedDriver) {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "Resolved credential driver does not match the selected database connection.",
+    );
+  }
+  return {
+    driver,
+    source: driver === "sqlite" ? normalizeSqliteSource(value) : value,
+  };
+}
+
 export function normalizeSqliteSource(target: string): string {
-  const source = target.startsWith("sqlite:") ? target.slice(7) : target;
+  const source = target.replace(/^sqlite:/i, "");
   if (source === ":memory:") {
     throw new StateQLError(
       "INVALID_COMMAND",

@@ -64,7 +64,9 @@ Example first page:
 Running the same normalized query with the same parameters reuses `q_1` while
 its cache is valid. Use `--cache bypass` when a fresh read is required.
 
-PostgreSQL and MySQL credentials should come from environment variables:
+PostgreSQL and MySQL credentials should come from environment variables. The
+variable must contain the complete connection URL, not only its password.
+Environment-backed SQLite paths require an explicit `sqlite:` prefix.
 
 ```bash
 export APP_DATABASE_URL='postgres://user:password@host/app'
@@ -72,15 +74,20 @@ stql connect --env APP_DATABASE_URL --name app --read-only
 
 export MYSQL_DATABASE_URL='mysql://user:password@host/app'
 stql connect --env MYSQL_DATABASE_URL --name mysql-app --read-only
+
+export SQLITE_DATABASE='sqlite:./app.sqlite'
+stql connect --env SQLITE_DATABASE --name local --read-only
 ```
 
+A connection accepts exactly one direct target, `--env`, or `--profile` source.
 MySQL uses positional `?` parameters. MariaDB compatibility is not currently
 claimed.
 
 ## Commands
 
 ```text
-stql connect <sqlite-path|postgres-url|mysql-url> [--name NAME] [--env ENV] [--read-write]
+stql connect <sqlite-path|postgres-url|mysql-url> [--name NAME] [--read-write]
+stql connect --env ENV [--name NAME] [--read-write]
 stql connect --profile NAME
 stql status
 stql profile add|list|show|remove
@@ -301,8 +308,10 @@ secret-free failures. Unknown resolver errors are replaced with a generic
 StateQL calls the resolver only immediately before database access, after SQL
 safety and duplicate checks. Requests contain actor/session identity, the
 operation's effective read/write access, an abort signal, and sanitized
-connection metadata. Returned values are passed directly to the adapter.
-Credential-bearing PostgreSQL and MySQL URLs are redacted before connection
+connection metadata. Returned values must be complete PostgreSQL/MySQL URLs or
+explicit `sqlite:` sources. StateQL validates the source and its stored driver
+before adapter construction, and normalizes SQLite paths. Credential-bearing
+PostgreSQL and MySQL URLs are redacted before connection
 metadata is persisted and never enter history, snapshots, cache keys, or
 responses. SQLite paths remain persisted connection metadata, as they are for
 direct SQLite connections. Harnesses remain responsible for approval policy,

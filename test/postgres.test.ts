@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { databaseUrlHasSecret, detectDriver } from "../src/connection.js";
+import {
+  credentialSource,
+  databaseUrlHasSecret,
+  detectDriver,
+} from "../src/connection.js";
 import { StateQLError } from "../src/errors.js";
 import { analyzeSql } from "../src/sql.js";
 import { StateQL } from "../src/stateql.js";
@@ -12,6 +16,7 @@ import {
 
 test("PostgreSQL detection and SQL parsing stay explicit", () => {
   assert.equal(detectDriver("postgres://localhost/app"), "postgres");
+  assert.equal(credentialSource("postgres:///app").driver, "postgres");
   assert.equal(
     databaseUrlHasSecret("postgres://user:password@localhost/app"),
     true,

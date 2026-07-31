@@ -12,6 +12,7 @@ import {
 } from "./adapters.js";
 import {
   confidence,
+  credentialSource,
   databaseIdentity,
   databaseUrlHasSecret,
   detectDriver,
@@ -176,10 +177,12 @@ export class StateQL {
           "Commit or roll back the active transaction before connecting again.",
         );
       }
-      if (options.profile && target) {
+      const sourceCount = [target, options.profile, options.secretEnv]
+        .filter((value) => value !== undefined).length;
+      if (sourceCount > 1) {
         throw new StateQLError(
           "INVALID_COMMAND",
-          "Use either a profile or a connection target, not both.",
+          "Use exactly one connection target, profile, or secret environment variable.",
         );
       }
       const implicitProfile =
@@ -225,7 +228,10 @@ export class StateQL {
       if (!secret) {
         throw new StateQLError("INVALID_COMMAND", "Connection target is required.");
       }
-      const driver = detectDriver(secret);
+      const resolvedSource = secretEnv
+        ? credentialSource(secret)
+        : { driver: detectDriver(secret), source: secret };
+      const { driver } = resolvedSource;
       if (
         driver !== "sqlite" &&
         !secretEnv &&
@@ -241,8 +247,9 @@ export class StateQL {
         );
       }
 
-      const adapterSource =
-        driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
+      const adapterSource = secretEnv
+        ? resolvedSource.source
+        : driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
       const source =
         driver === "sqlite"
           ? adapterSource
@@ -2152,7 +2159,7 @@ export class StateQL {
     context: AdapterContext,
   ): Promise<string> {
     if (!connection.secret_env) return connection.source;
-    return this.resolveCredential(
+    const value = await this.resolveCredential(
       connection.secret_env,
       session,
       operation,
@@ -2168,6 +2175,7 @@ export class StateQL {
         },
       },
     );
+    return credentialSource(value, connection.driver).source;
   }
 
   private async resolveCredential(

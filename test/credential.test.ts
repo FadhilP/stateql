@@ -19,11 +19,12 @@ function credentialFixture() {
   const database = join(root, "credentials.sqlite");
   const requests: CredentialRequest[] = [];
   let available = true;
+  let source = `sqlite:${database}`;
   const stateql = new StateQL({
     home,
     credentialResolver(request) {
       requests.push(structuredClone(request));
-      return available ? database : undefined;
+      return available ? source : undefined;
     },
   });
   return {
@@ -32,6 +33,7 @@ function credentialFixture() {
     requests,
     stateql,
     setAvailable(value: boolean) { available = value; },
+    setSource(value: string) { source = value; },
   };
 }
 
@@ -179,7 +181,7 @@ test("the default resolver remains compatible with process environment credentia
   const home = join(root, "state");
   const database = join(root, "default.sqlite");
   const previous = process.env.STQL_TEST_DATABASE_URL;
-  process.env.STQL_TEST_DATABASE_URL = database;
+  process.env.STQL_TEST_DATABASE_URL = `sqlite:${database}`;
   const stateql = new StateQL({ home });
   try {
     await succeed(stateql.connect(undefined, {
@@ -195,6 +197,92 @@ test("the default resolver remains compatible with process environment credentia
     stateql.close();
     if (previous === undefined) delete process.env.STQL_TEST_DATABASE_URL;
     else process.env.STQL_TEST_DATABASE_URL = previous;
+  }
+});
+
+test("connect rejects ambiguous sources before resolving credentials", async () => {
+  const root = createTemporaryDirectory("stateql-credential-source-test-");
+  let resolverCalled = false;
+  const stateql = new StateQL({
+    home: join(root, "state"),
+    credentialResolver() {
+      resolverCalled = true;
+      return "postgres://localhost/app";
+    },
+  });
+  try {
+    assertFailure(
+      await stateql.connect("postgres://localhost/app", {
+        secretEnv: "APP_DATABASE_URL",
+      }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.connect(undefined, {
+        profile: "app",
+        secretEnv: "APP_DATABASE_URL",
+      }),
+      "INVALID_COMMAND",
+    );
+    assert.equal(resolverCalled, false);
+  } finally {
+    stateql.close();
+  }
+});
+
+test("credential sources require an explicit driver and retain stored-driver identity", async () => {
+  const fixture = credentialFixture();
+  try {
+    fixture.setSource("password-only");
+    const invalid = await fixture.stateql.connect(undefined, {
+      secretEnv: "APP_DATABASE_URL",
+      readOnly: false,
+    });
+    assertFailure(invalid, "INVALID_COMMAND");
+    if (!invalid.ok) {
+      assert.match(
+        invalid.error.message,
+        /complete PostgreSQL\/MySQL URL or an explicit sqlite: source/,
+      );
+      assert.equal(JSON.stringify(invalid).includes("password-only"), false);
+      assert.equal(
+        readFileSync(join(fixture.home, "state.sqlite")).includes("password-only"),
+        false,
+      );
+    }
+
+    fixture.setSource("postgres://");
+    assertFailure(
+      await fixture.stateql.connect(undefined, {
+        secretEnv: "APP_DATABASE_URL",
+        readOnly: false,
+      }),
+      "INVALID_COMMAND",
+    );
+
+    fixture.setSource("sqlite://unsupported/path");
+    assertFailure(
+      await fixture.stateql.connect(undefined, {
+        secretEnv: "APP_DATABASE_URL",
+        readOnly: false,
+      }),
+      "UNSUPPORTED_DRIVER",
+    );
+
+    fixture.setSource(`sqlite:${fixture.database}`);
+    await succeed(fixture.stateql.connect(undefined, {
+      secretEnv: "APP_DATABASE_URL",
+      readOnly: false,
+    }));
+    await succeed(fixture.stateql.exec("CREATE TABLE driver_test (id INTEGER PRIMARY KEY)"));
+    fixture.setSource("postgres://localhost/app");
+    const mismatch = await fixture.stateql.query(
+      "SELECT id FROM driver_test ORDER BY id LIMIT 1",
+    );
+    assertFailure(mismatch, "INVALID_COMMAND");
+    if (!mismatch.ok) assert.match(mismatch.error.message, /driver does not match/);
+  } finally {
+    fixture.stateql.close();
   }
 });
 
