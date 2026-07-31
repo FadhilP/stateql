@@ -80,6 +80,11 @@ stql connect --env SQLITE_DATABASE --name local --read-only
 ```
 
 A connection accepts exactly one direct target, `--env`, or `--profile` source.
+For PostgreSQL, StateQL preserves strict TLS verification by normalizing
+`sslmode=prefer`, `require`, and `verify-ca` to `verify-full` before opening the
+adapter. Use `sslmode=verify-full` explicitly for clarity. Setting
+`uselibpqcompat=true` opts out and keeps libpq-compatible SSL semantics.
+
 MySQL uses positional `?` parameters. MariaDB compatibility is not currently
 claimed.
 

@@ -278,6 +278,23 @@ class SQLiteAdapter implements Adapter {
   }
 }
 
+const STRICT_POSTGRES_SSL_MODE_ALIASES = new Set(["prefer", "require", "verify-ca"]);
+
+export function normalizePostgresConnectionString(source: string): string {
+  try {
+    const url = new URL(source);
+    const parameters = [...url.searchParams.entries()];
+    const libpqCompat = parameters.filter(([key]) => key === "uselibpqcompat").at(-1)?.[1];
+    const sslMode = parameters.filter(([key]) => key === "sslmode").at(-1)?.[1];
+    if (libpqCompat === "true" || !sslMode || !STRICT_POSTGRES_SSL_MODE_ALIASES.has(sslMode)) return source;
+    url.searchParams.delete("sslmode");
+    url.searchParams.append("sslmode", "verify-full");
+    return url.toString();
+  } catch {
+    return source;
+  }
+}
+
 class PostgresAdapter implements Adapter {
   readonly confidence = "ttl_based" as const;
   private readonly client: Client;
@@ -294,7 +311,7 @@ class PostgresAdapter implements Adapter {
       remainingMilliseconds(context),
     );
     this.client = new Client({
-      connectionString: source,
+      connectionString: normalizePostgresConnectionString(source),
       connectionTimeoutMillis: timeout,
       statement_timeout: timeout,
     });

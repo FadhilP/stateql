@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { normalizePostgresConnectionString } from "../src/adapters.js";
 import {
   credentialSource,
   databaseUrlHasSecret,
@@ -13,6 +14,37 @@ import {
   createTemporaryDirectory,
   succeed,
 } from "./helpers.js";
+
+test("PostgreSQL strict SSL aliases normalize without opting out of libpq compatibility", () => {
+  for (const mode of ["prefer", "require", "verify-ca"]) {
+    const source = `postgresql://user:p%25ss@localhost/app?application_name=stateql&sslmode=${mode}`;
+    const normalized = normalizePostgresConnectionString(source);
+    const url = new URL(normalized);
+    assert.equal(url.username, "user");
+    assert.equal(url.password, "p%25ss");
+    assert.equal(url.searchParams.get("application_name"), "stateql");
+    assert.deepEqual(url.searchParams.getAll("sslmode"), ["verify-full"]);
+  }
+  assert.match(
+    normalizePostgresConnectionString("postgres://localhost/app?sslmode=%72equire"),
+    /sslmode=verify-full$/,
+  );
+  assert.match(
+    normalizePostgresConnectionString("postgres://localhost/app?sslmode=disable&sslmode=require"),
+    /sslmode=verify-full$/,
+  );
+  for (const source of [
+    "postgres://localhost/app",
+    "postgres://localhost/app?sslmode=verify-full",
+    "postgres://localhost/app?sslmode=no-verify",
+    "postgres://localhost/app?sslmode=require&uselibpqcompat=true",
+    "postgres://localhost/app?sslmode=require&sslmode=disable",
+    "postgres://localhost/app?SSLMODE=require",
+    "not a database URL",
+  ]) {
+    assert.equal(normalizePostgresConnectionString(source), source);
+  }
+});
 
 test("PostgreSQL detection and SQL parsing stay explicit", () => {
   assert.equal(detectDriver("postgres://localhost/app"), "postgres");
