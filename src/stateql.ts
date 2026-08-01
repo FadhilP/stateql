@@ -2600,7 +2600,6 @@ async function resolveCredentialBeforeDeadline(
       () => finish(() => reject(new CredentialResolutionError("timeout"))),
       remaining,
     );
-    timer.unref?.();
     context.signal?.addEventListener("abort", abort, { once: true });
 
     Promise.resolve()

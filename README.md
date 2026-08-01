@@ -12,7 +12,7 @@ StateQL is built around durable handles:
    rerunning the original SQL.
 3. Use operation, plan, and transaction handles to inspect and control writes.
 
-Requires Node.js 22.5 or newer.
+Requires Node.js 22.16 or newer for the required `node:sqlite` APIs.
 
 ## Quick start
 

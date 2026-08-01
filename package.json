@@ -39,7 +39,7 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.16"
   },
   "dependencies": {
     "mysql2": "^3.23.1",
