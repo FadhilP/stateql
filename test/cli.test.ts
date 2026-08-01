@@ -327,6 +327,30 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   assert.equal(failure.error.retryable, false);
 });
 
+test("CLI exposes doctor and purge state maintenance commands", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.query("SELECT 1 AS value"));
+  fixture.stateql.close();
+
+  const doctor = spawnSync(process.execPath, ["dist/src/cli.js", "doctor"], {
+    cwd: process.cwd(),
+    env: { ...process.env, STQL_HOME: fixture.home },
+    encoding: "utf8",
+  });
+  assert.equal(doctor.status, 0, doctor.stderr);
+  assert.equal((JSON.parse(doctor.stdout) as Record<string, any>).integrity, "ok");
+
+  const purge = spawnSync(process.execPath, ["dist/src/cli.js", "purge", "results"], {
+    cwd: process.cwd(),
+    env: { ...process.env, STQL_HOME: fixture.home },
+    encoding: "utf8",
+  });
+  assert.equal(purge.status, 0, purge.stderr);
+  const output = JSON.parse(purge.stdout) as Record<string, any>;
+  assert.equal(output.scope, "results");
+  assert.ok(output.deleted >= 1);
+});
+
 test("batch and pipe execute sequential JSON commands with safe failure control", async () => {
   const fixture = await createFixture();
   await succeed(

@@ -143,6 +143,24 @@ test("plans reject stale state and valid plans apply once", async () => {
 });
 
 
+test("corrupt plan parameters fail before a durable claim", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE planned_rows (id INTEGER)"));
+  const plan = await succeed(fixture.stateql.plan("INSERT INTO planned_rows (id) VALUES (?)", {
+    params: [1],
+  }));
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db.prepare("UPDATE plans SET parameters = ? WHERE id = ?")
+    .run("not-json", plan.plan_id);
+
+  assertFailure(await fixture.stateql.apply(String(plan.plan_id)), "STATE_CORRUPTED");
+  assert.equal(
+    (store.db.prepare("SELECT claim_token FROM plans WHERE id = ?").get(plan.plan_id) as { claim_token: string | null }).claim_token,
+    null,
+  );
+  fixture.stateql.close();
+});
+
 test("concurrent equivalent writes execute once", async () => {
   const fixture = await createFixture();
   await succeed(
@@ -237,6 +255,40 @@ test("SQL safety fails closed and plans require explicit overrides", async () =>
   assert.equal(allowed.requires_confirmation, false);
   await succeed(fixture.stateql.apply(String(allowed.plan_id)));
   fixture.stateql.close();
+});
+
+test("SQL analysis rejects multi-statement and hidden-write forms and classifies dialect mutations", () => {
+  for (const [sql, driver] of [
+    ["SELECT 1; SELECT 2", "sqlite"],
+    ["SELECT 1; DELETE FROM policy_rows", "postgres"],
+    ["/* a comment */ SELECT 1; /* another */ SELECT 2", "mysql"],
+    ["SELECT * INTO copied_rows FROM policy_rows", "postgres"],
+    ["WITH changed AS (UPDATE policy_rows SET id = 2 RETURNING *) SELECT * FROM changed", "postgres"],
+  ] as const) {
+    assert.throws(
+      () => analyzeSql(sql, driver),
+      (error: unknown) =>
+        error instanceof StateQLError && error.details.code === "INVALID_SQL",
+      sql,
+    );
+  }
+
+  assert.equal(
+    analyzeSql("/* harmless */ SELECT value FROM items -- trailing\n", "sqlite").read,
+    true,
+  );
+  const unboundedUpdate = analyzeSql("UPDATE items SET value = 1", "sqlite");
+  assert.equal(unboundedUpdate.unboundedMutation, true);
+  assert.equal(unboundedUpdate.destructive, false);
+  const boundedDelete = analyzeSql("DELETE FROM items WHERE id = 1", "postgres");
+  assert.equal(boundedDelete.unboundedMutation, false);
+  assert.equal(boundedDelete.destructive, true);
+  assert.equal(analyzeSql("TRUNCATE TABLE items", "mysql").unboundedMutation, true);
+  assert.equal(analyzeSql("REPLACE INTO items (id) VALUES (1)", "mysql").destructive, true);
+  assert.equal(
+    analyzeSql("INSERT OR REPLACE INTO items (id) VALUES (1)", "sqlite").destructive,
+    true,
+  );
 });
 
 test("idempotency conflicts are rejected while the first write is pending", async () => {

@@ -157,6 +157,10 @@ test(
       if (!cancelled.ok) {
         assert.equal(cancelled.error.code, "OPERATION_CANCELLED");
       }
+      assert.equal(
+        (await succeed(stateql.query("SELECT 1 AS healthy"))).preview[0].healthy,
+        1,
+      );
     } finally {
       await stateql.disconnect();
       const reconnected = await stateql.connect(undefined, {

@@ -12,7 +12,7 @@ import type { Connection as MySqlConnection } from "mysql2/promise";
 import { Client, types as pgTypes, type QueryResult } from "pg";
 import type { Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
-import { parseJson, toJsonSafe } from "./util.js";
+import { isSqlParameters, parseJson, toJsonSafe } from "./util.js";
 
 export interface ReadResult {
   rows: Row[];
@@ -389,7 +389,11 @@ class PostgresAdapter implements Adapter {
         await this.setLocalDeadline();
         const result = await this.query(
           operation.sql,
-          postgresParams(parseJson<SqlParameters>(operation.parameters, [])),
+          postgresParams(parseJson<SqlParameters>(
+            operation.parameters,
+            `operation "${operation.id}" parameters`,
+            isSqlParameters,
+          )),
           true,
         );
         results.push({ affectedRows: result.rowCount ?? 0 });
@@ -655,7 +659,11 @@ class MySqlAdapter implements Adapter {
       for (const operation of operations) {
         const [result] = await this.query(
           operation.sql,
-          mysqlParams(parseJson<SqlParameters>(operation.parameters, [])),
+          mysqlParams(parseJson<SqlParameters>(
+            operation.parameters,
+            `operation "${operation.id}" parameters`,
+            isSqlParameters,
+          )),
           true,
           true,
         );

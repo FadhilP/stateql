@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
@@ -402,6 +403,162 @@ test("plans and transactions remain actor-owned across concurrent clients", asyn
   ownerClone.close();
   actor.close();
   owner.close();
+});
+
+test("StateQL validates durable-state options and closes idempotently", () => {
+  const home = createTemporaryDirectory("stateql-options-test-");
+  for (const [name, value] of [
+    ["previewRows", -1],
+    ["previewRows", 1.5],
+    ["previewRows", Number.NaN],
+    ["cacheTtlSeconds", -1],
+    ["cacheTtlSeconds", 1.5],
+    ["cacheTtlSeconds", Number.NaN],
+    ["resultTtlSeconds", -1],
+    ["resultTtlSeconds", 1.5],
+    ["resultTtlSeconds", Number.NaN],
+    ["maxCellCharacters", -1],
+    ["maxCellCharacters", 1.5],
+    ["maxCellCharacters", Number.NaN],
+    ["maxStateBytes", -1],
+    ["maxStateBytes", 1.5],
+    ["maxStateBytes", Number.NaN],
+  ] as const) {
+    assert.throws(
+      () => new StateQL({ home, [name]: value }),
+      /positive integer|non-negative integer/,
+      `${name}=${value}`,
+    );
+  }
+
+  const stateql = new StateQL({ home });
+  stateql.close();
+  stateql.close();
+  stateql[Symbol.dispose]();
+});
+
+test("migrations retain their registry and repair a migration/schema mismatch", () => {
+  const home = createTemporaryDirectory("stateql-migration-test-");
+  const initial = new StateQL({ home });
+  initial.close();
+
+  const database = new DatabaseSync(join(home, "state.sqlite"));
+  assert.deepEqual(
+    (database.prepare("SELECT name FROM schema_migrations ORDER BY rowid").all() as Array<{ name: string }>).map((row) => row.name),
+    ["initial_schema_v1", "shared_session_actors_v1"],
+  );
+  database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
+  database.exec("ALTER TABLE plans DROP COLUMN claim_token");
+  database.close();
+
+  const repaired = new StateQL({ home });
+  const store = (repaired as unknown as { store: StateStore }).store;
+  assert.ok(
+    (store.db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?").get("initial_schema_v1")),
+  );
+  assert.ok(
+    (store.db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?").get("shared_session_actors_v1")),
+  );
+  assert.ok(
+    (store.db.prepare("SELECT 1 FROM pragma_table_info('plans') WHERE name = 'claim_token'").get()),
+  );
+  repaired.close();
+});
+
+test("stored result JSON corruption is contained and diagnosed without payload leakage", async () => {
+  const fixture = await createFixture();
+  const result = await succeed(fixture.stateql.query("SELECT 1 AS value"));
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db.prepare("UPDATE results SET rows_json = ? WHERE id = ?")
+    .run("not-json-secret-payload", result.result_id);
+  assertFailure(await fixture.stateql.show(String(result.result_id)), "STATE_CORRUPTED");
+
+  const doctor = await succeed(fixture.stateql.doctor());
+  assert.equal(doctor.integrity, "issues");
+  assert.ok(doctor.issues.some((issue: { code: string }) => issue.code === "CORRUPTED_RESULT"));
+  assert.equal(JSON.stringify(doctor).includes("secret-payload"), false);
+
+  store.db.prepare("UPDATE results SET rows_json = ?, columns_json = ? WHERE id = ?")
+    .run(JSON.stringify([{ value: 1 }]), JSON.stringify([{ name: 1 }]), result.result_id);
+  assertFailure(await fixture.stateql.show(String(result.result_id)), "STATE_CORRUPTED");
+  fixture.stateql.close();
+});
+
+test("doctor and purge cover expired, result, history, and all scopes", async () => {
+  let clock = new Date("2026-07-25T00:00:00.000Z");
+  const root = createTemporaryDirectory("stateql-purge-test-");
+  const stateql = new StateQL({
+    home: join(root, "state"),
+    now: () => clock,
+    resultTtlSeconds: 1,
+  });
+  await succeed(stateql.connect(join(root, "target.sqlite"), { readOnly: false }));
+  const expired = await succeed(stateql.query("SELECT 1 AS value"));
+  clock = new Date(clock.getTime() + 2_000);
+  assert.equal((await succeed(stateql.purge("expired"))).scope, "expired");
+  assertFailure(await stateql.show(String(expired.result_id)), "RESULT_NOT_FOUND");
+
+  const retained = await succeed(stateql.query("SELECT 2 AS value", { cache: "bypass" }));
+  await succeed(stateql.setAlias("retained", String(retained.result_id)));
+  assert.ok((await succeed(stateql.purge("results"))).deleted >= 1);
+  assertFailure(await stateql.show("retained"), "RESULT_NOT_FOUND");
+  assert.ok((await succeed(stateql.history(100))).history.length > 0);
+  assert.ok((await succeed(stateql.purge("history"))).deleted > 0);
+  assert.equal((await succeed(stateql.history(100))).history.length, 1);
+
+  await succeed(stateql.exec("CREATE TABLE purge_rows (id INTEGER)"));
+  await succeed(stateql.plan("INSERT INTO purge_rows (id) VALUES (1)"));
+  assert.ok((await succeed(stateql.purge("all"))).deleted >= 2);
+  const store = (stateql as unknown as { store: StateStore }).store;
+  for (const table of ["results", "plans", "operations", "transactions"]) {
+    assert.equal(
+      (store.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count,
+      0,
+      table,
+    );
+  }
+  assert.equal(
+    (store.db.prepare("SELECT COUNT(*) AS count FROM history").get() as { count: number }).count,
+    1,
+    "the successful purge itself is retained as audit history",
+  );
+  stateql.close();
+});
+
+test("result state quota protects the new result, evicts old unaliased results, and preserves aliases", async () => {
+  const tooSmallRoot = createTemporaryDirectory("stateql-quota-reject-test-");
+  const tooSmall = new StateQL({
+    home: join(tooSmallRoot, "state"),
+    maxStateBytes: 100,
+  });
+  await succeed(tooSmall.connect(join(tooSmallRoot, "target.sqlite"), { readOnly: false }));
+  assertFailure(
+    await tooSmall.query(`SELECT '${"x".repeat(300)}' AS value`),
+    "STATE_QUOTA_EXCEEDED",
+  );
+  tooSmall.close();
+
+  const root = createTemporaryDirectory("stateql-quota-evict-test-");
+  const stateql = new StateQL({ home: join(root, "state"), maxStateBytes: 1_200 });
+  await succeed(stateql.connect(join(root, "target.sqlite"), { readOnly: false }));
+  const first = await succeed(stateql.query(`SELECT '${"a".repeat(250)}' AS value`));
+  await succeed(stateql.setAlias("first", String(first.result_id)));
+  const second = await succeed(stateql.query(`SELECT '${"b".repeat(250)}' AS value`));
+  const third = await succeed(stateql.query(`SELECT '${"c".repeat(250)}' AS value`));
+  assert.equal((await succeed(stateql.show("first"))).result_id, first.result_id);
+  assertFailure(await stateql.show(String(second.result_id)), "RESULT_NOT_FOUND");
+  assert.equal((await succeed(stateql.show(String(third.result_id)))).result_id, third.result_id);
+  stateql.close();
+});
+
+test("POSIX state directories and databases are private", {
+  skip: process.platform === "win32" ? "Windows does not expose POSIX modes." : false,
+}, () => {
+  const home = createTemporaryDirectory("stateql-permissions-test-");
+  const stateql = new StateQL({ home });
+  stateql.close();
+  assert.equal(statSync(home).mode & 0o777, 0o700);
+  assert.equal(statSync(join(home, "state.sqlite")).mode & 0o777, 0o600);
 });
 
 test("legacy sessions migrate actor attribution without losing artifacts", async () => {

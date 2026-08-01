@@ -160,6 +160,8 @@ stql plan <sql> [--allow-unbounded] [--allow-destructive]
 stql apply <plan-handle>
 stql history [--limit N]
 stql receipt <operation-handle>
+stql doctor
+stql purge [expired|results|history|all]
 stql capabilities
 stql batch [commands.json|commands.jsonl|-] [--continue-on-error]
 stql pipe [--continue-on-error]
@@ -243,6 +245,20 @@ execution time.
 Command history keeps the latest 10,000 entries per session. SQLite cache reuse
 also checks the database file signature. PostgreSQL and MySQL cache reuse is
 labeled `ttl_based` and is never authoritative.
+
+StateQL limits persisted result payloads to 256 MiB by default. When that quota
+is reached it removes the oldest unaliased results; aliases remain protected. A
+single result that cannot fit fails with `STATE_QUOTA_EXCEEDED`. Configure the
+limit with `maxStateBytes` in the library or `--max-state-bytes` in the CLI.
+Cache and result retention can be configured with `cacheTtlSeconds` and
+`resultTtlSeconds`, or their `--cache-ttl-seconds` and
+`--result-ttl-seconds` CLI equivalents.
+
+`stql doctor` checks SQLite integrity and stored payload shapes without printing
+SQL, parameters, or result values. `stql purge` removes expired data by default;
+use `results`, `history`, or `all` for explicit session cleanup. On POSIX
+systems, StateQL removes group and world access from its state directory,
+database, and SQLite sidecar files.
 
 ### Local filtering
 
@@ -347,6 +363,7 @@ const stateql = StateQL.forActor({
   actor: "pi-session-id",
   timeoutMs: 30_000,
   maxResultBytes: 16 * 1024 * 1024,
+  maxStateBytes: 256 * 1024 * 1024,
 });
 
 const controller = new AbortController();

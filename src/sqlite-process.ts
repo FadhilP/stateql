@@ -2,7 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type { OperationRecord } from "./store.js";
 import type { Column, Row, SqlParameters } from "./types.js";
-import { hash, parseJson, toJsonSafe } from "./util.js";
+import { hash, isSqlParameters, parseJson, toJsonSafe } from "./util.js";
 
 interface Request {
   id: number;
@@ -116,7 +116,11 @@ function execute(request: Request): unknown {
         for (const operation of operations) {
           const result = bindRun(
             database.prepare(operation.sql),
-            parseJson<SqlParameters>(operation.parameters, []),
+            parseJson<SqlParameters>(
+              operation.parameters,
+              `operation "${operation.id}" parameters`,
+              isSqlParameters,
+            ),
           );
           results.push({ affectedRows: Number(result.changes) });
         }

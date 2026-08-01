@@ -48,35 +48,67 @@ import {
   type SessionRecord,
 } from "./store.js";
 import type {
+  ActorLinkData,
+  ActorResolutionData,
+  ActorsData,
+  ActorUnlinkData,
+  AliasData,
+  ApplyData,
   BatchCommand,
   BatchOptions,
+  CapabilitiesData,
+  CloseSessionData,
+  ColumnsData,
+  CommitTransactionData,
   ConnectOptions,
+  ConnectionData,
+  CountData,
   CredentialAccess,
   CredentialOperation,
   CredentialRequest,
   CredentialResolver,
+  DisconnectData,
+  DoctorData,
+  ExecData,
   ExecOptions,
   ExecutionOptions,
+  ExportData,
   Failure,
   FilterOptions,
+  HistoryData,
   HistoryEntry,
+  OperationData,
+  PlanData,
   PlanOptions,
+  ProfileData,
+  ProfilesData,
   ProfileOptions,
+  PurgeData,
   QueryOptions,
+  RemovedProfileData,
   Response,
+  ResultData,
+  RollbackTransactionData,
+  RowsData,
   RowsOptions,
   SqlParameters,
   StateConfidence,
   StateQLActorOptions,
   StateQLOptions,
   StateQLSnapshot,
+  StatusData,
   Success,
+  SessionData,
+  SessionsData,
+  SessionSummaryData,
+  TransactionData,
   Warning,
 } from "./types.js";
 import {
   compactRows,
   defaultHome,
   hash,
+  isSqlParameters,
   parseJson,
   redact,
 } from "./util.js";
@@ -125,6 +157,7 @@ export class StateQL {
   private readonly signal?: AbortSignal;
   private readonly credentialResolver?: CredentialResolver;
   private readonly now: () => Date;
+  private closed = false;
 
   constructor(options: StateQLOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -133,10 +166,22 @@ export class StateQL {
     if (!this.actorId.trim()) {
       throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
     }
-    this.previewRows = options.previewRows ?? 5;
-    this.cacheTtlSeconds = options.cacheTtlSeconds ?? 300;
-    this.resultTtlSeconds = options.resultTtlSeconds ?? 86_400;
-    this.maxCellCharacters = options.maxCellCharacters ?? 200;
+    this.previewRows = nonNegativeInteger(
+      options.previewRows ?? 5,
+      "previewRows",
+    );
+    this.cacheTtlSeconds = nonNegativeInteger(
+      options.cacheTtlSeconds ?? 300,
+      "cacheTtlSeconds",
+    );
+    this.resultTtlSeconds = positiveInteger(
+      options.resultTtlSeconds ?? 86_400,
+      "resultTtlSeconds",
+    );
+    this.maxCellCharacters = positiveInteger(
+      options.maxCellCharacters ?? 200,
+      "maxCellCharacters",
+    );
     this.maxResultRows = positiveInteger(
       options.maxResultRows ?? 10_000,
       "maxResultRows",
@@ -146,6 +191,10 @@ export class StateQL {
       "maxResultBytes",
     );
     this.timeoutMs = executionTimeout(options.timeoutMs ?? 30_000);
+    const maxStateBytes = positiveInteger(
+      options.maxStateBytes ?? 256 * 1024 * 1024,
+      "maxStateBytes",
+    );
     this.signal = options.signal;
     this.credentialResolver = options.credentialResolver;
     if (this.maxResultRows >= Number.MAX_SAFE_INTEGER) {
@@ -154,22 +203,38 @@ export class StateQL {
         "maxResultRows is too large.",
       );
     }
-    this.store = new StateStore(options.home ?? defaultHome(), this.now);
-    this.store.bootstrapSession(
-      this.sessionName,
-      this.actorId,
-      options.actor === undefined,
+    const store = new StateStore(
+      options.home ?? defaultHome(),
+      this.now,
+      maxStateBytes,
     );
+    try {
+      store.bootstrapSession(
+        this.sessionName,
+        this.actorId,
+        options.actor === undefined,
+      );
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+    this.store = store;
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.store.close();
+  }
+
+  [Symbol.dispose](): void {
+    this.close();
   }
 
   async connect(
     target?: string,
     options: ConnectOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ConnectionData>> {
     return this.run("connect", async (session) => {
       if (session.active_transaction_id) {
         throw new StateQLError(
@@ -329,7 +394,7 @@ export class StateQL {
     name: string,
     target?: string,
     options: ProfileOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ProfileData>> {
     return this.run("profile.add", async () => {
       validateProfileName(name);
       if (Boolean(target) === Boolean(options.secretEnv)) {
@@ -377,13 +442,13 @@ export class StateQL {
     });
   }
 
-  async listProfiles(): Promise<Response<unknown>> {
+  async listProfiles(): Promise<Response<ProfilesData>> {
     return this.run("profile.list", async () => ({
       data: { profiles: this.store.listProfiles().map(profileData) },
     }));
   }
 
-  async showProfile(name: string): Promise<Response<unknown>> {
+  async showProfile(name: string): Promise<Response<ProfileData>> {
     return this.run("profile.show", async () => {
       const profile = this.store.getProfile(name);
       if (!profile) {
@@ -399,7 +464,7 @@ export class StateQL {
     });
   }
 
-  async removeProfile(name: string): Promise<Response<unknown>> {
+  async removeProfile(name: string): Promise<Response<RemovedProfileData>> {
     return this.run("profile.remove", async () => {
       if (!this.store.removeProfile(name)) {
         throw new StateQLError(
@@ -415,7 +480,7 @@ export class StateQL {
     });
   }
 
-  async disconnect(): Promise<Response<unknown>> {
+  async disconnect(): Promise<Response<DisconnectData>> {
     return this.run("disconnect", async (session) => {
       if (session.active_transaction_id) {
         throw new StateQLError(
@@ -505,7 +570,7 @@ export class StateQL {
     };
   }
 
-  async status(): Promise<Response<unknown>> {
+  async status(): Promise<Response<StatusData>> {
     return this.run("status", async (session) => {
       const connection = this.store.activeConnection(session);
       const transaction = session.active_transaction_id
@@ -543,7 +608,7 @@ export class StateQL {
   async linkActor(
     session: string,
     actorId: string,
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ActorLinkData>> {
     return this.run("actor.link", async (current) => {
       this.requireSelectedSession(current, session);
       this.validateActorId(actorId);
@@ -569,7 +634,7 @@ export class StateQL {
   async unlinkActor(
     session: string,
     actorId: string,
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ActorUnlinkData>> {
     return this.run("actor.unlink", async (current) => {
       this.requireSelectedSession(current, session);
       this.validateActorId(actorId);
@@ -592,7 +657,7 @@ export class StateQL {
     });
   }
 
-  async listActors(session: string): Promise<Response<unknown>> {
+  async listActors(session: string): Promise<Response<ActorsData>> {
     return this.run("actor.list", async (current) => {
       this.requireSelectedSession(current, session);
       return {
@@ -607,7 +672,7 @@ export class StateQL {
     });
   }
 
-  async resolveActor(actorId: string): Promise<Response<unknown>> {
+  async resolveActor(actorId: string): Promise<Response<ActorResolutionData>> {
     return this.run("actor.resolve", async () => {
       this.validateActorId(actorId);
       const session = this.store.resolveActor(actorId);
@@ -626,7 +691,7 @@ export class StateQL {
     });
   }
 
-  async startSession(name: string): Promise<Response<unknown>> {
+  async startSession(name: string): Promise<Response<SessionData>> {
     return this.run("session.start", async () => {
       if (!name.trim()) {
         throw new StateQLError("INVALID_COMMAND", "Session name is required.");
@@ -647,7 +712,7 @@ export class StateQL {
     });
   }
 
-  async listSessions(): Promise<Response<unknown>> {
+  async listSessions(): Promise<Response<SessionsData>> {
     return this.run("session.list", async () => ({
       data: {
         sessions: this.store.listSessions().map((session) => ({
@@ -661,7 +726,7 @@ export class StateQL {
     }));
   }
 
-  async showSession(idOrName = this.sessionName): Promise<Response<unknown>> {
+  async showSession(idOrName = this.sessionName): Promise<Response<SessionData>> {
     return this.run("session.show", async () => {
       const session = this.store.getSession(idOrName);
       if (!session) {
@@ -674,7 +739,7 @@ export class StateQL {
     });
   }
 
-  async sessionSummary(): Promise<Response<unknown>> {
+  async sessionSummary(): Promise<Response<SessionSummaryData>> {
     return this.run("session.summary", async (session) => {
       const connection = this.store.activeConnection(session);
       return {
@@ -705,7 +770,7 @@ export class StateQL {
     });
   }
 
-  async closeSession(): Promise<Response<unknown>> {
+  async closeSession(): Promise<Response<CloseSessionData>> {
     return this.run("session.close", async (session) => {
       if (session.active_transaction_id) {
         throw new StateQLError(
@@ -727,7 +792,7 @@ export class StateQL {
     });
   }
 
-  async query(sql: string, options: QueryOptions = {}): Promise<Response<unknown>> {
+  async query(sql: string, options: QueryOptions = {}): Promise<Response<ResultData>> {
     return this.run("query", async (session) => {
       const connection = this.requireConnection(session);
       this.rejectDuringStagedTransaction(session, "Queries");
@@ -853,7 +918,7 @@ export class StateQL {
     });
   }
 
-  async show(idOrAlias: string): Promise<Response<unknown>> {
+  async show(idOrAlias: string): Promise<Response<ResultData>> {
     return this.withResult("show", idOrAlias, async (result) => ({
       data: this.resultData(result, true),
       handle: result.id,
@@ -867,7 +932,7 @@ export class StateQL {
     idOrAlias: string,
     predicate: string,
     options: FilterOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ResultData>> {
     return this.withResult("filter", idOrAlias, async (source) => {
       const columns = this.store.resultColumns(source);
       const filter = prepareFilterStatement(columns, predicate);
@@ -926,7 +991,7 @@ export class StateQL {
   async rows(
     idOrAlias: string,
     options: RowsOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<RowsData>> {
     return this.withResult("rows", idOrAlias, async (result) => {
       const offset = nonNegativeInteger(options.offset ?? 0, "offset");
       const limit = positiveInteger(options.limit ?? 20, "limit");
@@ -959,7 +1024,7 @@ export class StateQL {
     });
   }
 
-  async count(idOrAlias: string): Promise<Response<unknown>> {
+  async count(idOrAlias: string): Promise<Response<CountData>> {
     return this.withResult("count", idOrAlias, async (result) => ({
       data: { result_id: result.id, rows: result.row_count },
       handle: result.id,
@@ -969,7 +1034,7 @@ export class StateQL {
     }));
   }
 
-  async columns(idOrAlias: string): Promise<Response<unknown>> {
+  async columns(idOrAlias: string): Promise<Response<ColumnsData>> {
     return this.withResult("columns", idOrAlias, async (result) => ({
       data: {
         result_id: result.id,
@@ -982,7 +1047,7 @@ export class StateQL {
     }));
   }
 
-  async setAlias(name: string, id: string): Promise<Response<unknown>> {
+  async setAlias(name: string, id: string): Promise<Response<AliasData>> {
     return this.run("alias.set", async (session) => {
       const result = this.requireResult(id, session);
       this.store.setAlias(session.id, name, result.id);
@@ -998,7 +1063,7 @@ export class StateQL {
     idOrAlias: string,
     output: string,
     format: "json" | "jsonl" | "csv" = "csv",
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ExportData>> {
     return this.withResult("export", idOrAlias, async (result) => {
       const rows = this.store.resultRows(result);
       const content =
@@ -1021,7 +1086,7 @@ export class StateQL {
     });
   }
 
-  async exec(sql: string, options: ExecOptions = {}): Promise<Response<unknown>> {
+  async exec(sql: string, options: ExecOptions = {}): Promise<Response<ExecData>> {
     return this.run("exec", async (session) => {
       const connection = this.requireConnection(session);
       return this.performExec(
@@ -1034,7 +1099,7 @@ export class StateQL {
     });
   }
 
-  async receipt(id: string): Promise<Response<unknown>> {
+  async receipt(id: string): Promise<Response<OperationData>> {
     return this.run("receipt", async (session) => {
       const operation = this.store.getOperation(id);
       if (!operation || operation.session_id !== session.id) {
@@ -1054,7 +1119,7 @@ export class StateQL {
 
   async beginTransaction(
     isolation = "serializable",
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<TransactionData>> {
     return this.run("transaction.begin", async (session) => {
       const connection = this.requireConnection(session);
       if (connection.read_only) {
@@ -1094,7 +1159,7 @@ export class StateQL {
     });
   }
 
-  async transactionStatus(id?: string): Promise<Response<unknown>> {
+  async transactionStatus(id?: string): Promise<Response<TransactionData>> {
     return this.run("transaction.status", async (session) => {
       const transactionId = id ?? session.active_transaction_id;
       if (!transactionId) {
@@ -1122,7 +1187,7 @@ export class StateQL {
   async commitTransaction(
     id?: string,
     options: ExecutionOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<CommitTransactionData>> {
     return this.run("transaction.commit", async (session) => {
       const transaction = this.requireActiveTransaction(session, id);
       const connection = this.store.getConnection(transaction.connection_id);
@@ -1139,6 +1204,9 @@ export class StateQL {
           { suggestedAction: "Roll back and begin a new transaction." },
         );
       }
+      // Validate durable payloads before opening a database adapter or changing
+      // the transaction state.
+      const operations = this.store.validatedTransactionOperations(transaction.id);
       const context = this.executionContext(options);
       const adapterSource = await this.resolveConnectionSource(
         connection,
@@ -1154,10 +1222,11 @@ export class StateQL {
       );
       try {
         if (
-          !this.store.markTransactionCommitting(
+          !this.store.claimTransactionForCommit(
             transaction.id,
             session.id,
             this.actorId,
+            operations,
           )
         ) {
           throw new StateQLError(
@@ -1165,7 +1234,6 @@ export class StateQL {
             "Transaction is no longer active.",
           );
         }
-        const operations = this.store.transactionOperations(transaction.id);
         if (
           operations.some(
             (operation) => operation.connection_id !== connection.id,
@@ -1300,7 +1368,7 @@ export class StateQL {
     });
   }
 
-  async rollbackTransaction(id?: string): Promise<Response<unknown>> {
+  async rollbackTransaction(id?: string): Promise<Response<RollbackTransactionData>> {
     return this.run("transaction.rollback", async (session) => {
       const transaction = this.requireActiveTransaction(session, id);
       const count = this.store.transactionOperations(transaction.id).length;
@@ -1377,7 +1445,7 @@ export class StateQL {
     });
   }
 
-  async plan(sql: string, options: PlanOptions = {}): Promise<Response<unknown>> {
+  async plan(sql: string, options: PlanOptions = {}): Promise<Response<PlanData>> {
     return this.run("plan", async (session) => {
       const connection = this.requireConnection(session);
       this.rejectDuringStagedTransaction(session, "Plans");
@@ -1462,7 +1530,7 @@ export class StateQL {
   async apply(
     planId: string,
     options: ExecutionOptions = {},
-  ): Promise<Response<unknown>> {
+  ): Promise<Response<ApplyData>> {
     return this.run("apply", async (session) => {
       this.rejectDuringStagedTransaction(session, "Plans");
       const plan = this.store.getPlan(planId);
@@ -1483,6 +1551,11 @@ export class StateQL {
       if (Date.parse(plan.expires_at) <= this.now().getTime()) {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
+      const planParameters = parseJson<SqlParameters>(
+        plan.parameters,
+        `plan "${plan.id}" parameters`,
+        isSqlParameters,
+      );
       const claimToken = this.store.nextId("claim");
       const claimed = this.store.claimPlan(
         plan.id,
@@ -1544,7 +1617,7 @@ export class StateQL {
           connection,
           claimed.sql,
           {
-            params: parseJson<SqlParameters>(claimed.parameters, []),
+            params: planParameters,
             allowUnbounded: Boolean(claimed.allow_unbounded),
             allowDestructive: Boolean(claimed.allow_destructive),
           },
@@ -1554,7 +1627,7 @@ export class StateQL {
         );
         return {
           ...result,
-          data: { plan_id: claimed.id, ...(result.data as object) },
+          data: { plan_id: claimed.id, ...result.data },
         };
       } catch (error) {
         if (
@@ -1570,7 +1643,7 @@ export class StateQL {
     });
   }
 
-  async history(limit = 20): Promise<Response<{ history: HistoryEntry[] }>> {
+  async history(limit = 20): Promise<Response<HistoryData>> {
     return this.run("history", async (session) => ({
       data: {
         history: this.store
@@ -1580,7 +1653,33 @@ export class StateQL {
     }));
   }
 
-  async capabilities(): Promise<Response<unknown>> {
+  async doctor(): Promise<Response<DoctorData>> {
+    return this.run("doctor", async (session) => ({
+      data: this.store.diagnostics(session.id),
+    }));
+  }
+
+  async purge(
+    scope: "expired" | "results" | "history" | "all" = "expired",
+  ): Promise<Response<PurgeData>> {
+    return this.run("purge", async (session) => {
+      if (!["expired", "results", "history", "all"].includes(scope)) {
+        throw new StateQLError("INVALID_COMMAND", `Unknown purge scope "${scope}".`);
+      }
+      if (scope === "all" && session.active_transaction_id) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Commit or roll back the active transaction before purging all data.",
+        );
+      }
+      return {
+        data: { scope, deleted: this.store.purge(session.id, scope) },
+        executed: true,
+      };
+    });
+  }
+
+  async capabilities(): Promise<Response<CapabilitiesData>> {
     return this.run("capabilities", async () => ({
       data: {
         drivers: ["mysql", "postgres", "sqlite"],
@@ -1595,6 +1694,9 @@ export class StateQL {
           credential_resolver: true,
           deadlines: true,
           cancellation: true,
+          state_diagnostics: true,
+          state_purge: true,
+          state_quota: true,
         },
       },
     }));
@@ -1651,12 +1753,12 @@ export class StateQL {
             timeoutMs: command.timeout_ms,
           });
           if (!response.ok || !command.as) return response;
-          const resultId = (response.data as Record<string, unknown>).result_id;
+          const resultId = response.data.result_id;
           if (typeof resultId !== "string") return response;
           this.store.setAlias(response.session_id, command.as, resultId);
           return {
             ...response,
-            data: { ...(response.data as object), alias: command.as },
+            data: { ...response.data, alias: command.as },
           };
         }
         case "filter": {
@@ -1666,12 +1768,12 @@ export class StateQL {
             { params: command.params ?? [] },
           );
           if (!response.ok || !command.as) return response;
-          const resultId = (response.data as Record<string, unknown>).result_id;
+          const resultId = response.data.result_id;
           if (typeof resultId !== "string") return response;
           this.store.setAlias(response.session_id, command.as, resultId);
           return {
             ...response,
-            data: { ...(response.data as object), alias: command.as },
+            data: { ...response.data, alias: command.as },
           };
         }
         case "exec":
@@ -1728,6 +1830,10 @@ export class StateQL {
           return this.history(command.limit ?? 20);
         case "receipt":
           return this.receipt(batchString(command.handle, "handle"));
+        case "doctor":
+          return this.doctor();
+        case "purge":
+          return this.purge(command.scope ?? "expired");
         case "capabilities":
           return this.capabilities();
         default:
@@ -1773,7 +1879,7 @@ export class StateQL {
     context: AdapterContext,
     planClaim?: { planId: string; claimToken: string },
     resolvedSource?: string,
-  ): Promise<ActionResult<unknown>> {
+  ): Promise<ActionResult<ExecData>> {
     if (connection.read_only) {
       throw new StateQLError(
         "READ_ONLY_CONNECTION",
@@ -2041,11 +2147,11 @@ export class StateQL {
     });
   }
 
-  private async withResult(
+  private async withResult<T>(
     command: string,
     idOrAlias: string,
-    action: (result: ResultRecord, session: SessionRecord) => Promise<ActionResult<unknown>>,
-  ): Promise<Response<unknown>> {
+    action: (result: ResultRecord, session: SessionRecord) => Promise<ActionResult<T>>,
+  ): Promise<Response<T>> {
     return this.run(command, async (session) => {
       const result = this.requireResult(idOrAlias, session);
       if (Date.parse(result.expires_at) <= this.now().getTime()) {
@@ -2257,7 +2363,7 @@ export class StateQL {
     );
   }
 
-  private resultData(result: ResultRecord, cached: boolean): unknown {
+  private resultData(result: ResultRecord, cached: boolean): ResultData {
     const rows = this.store.resultRows(result);
     const preview = compactRows(
       rows.slice(0, this.previewRows),

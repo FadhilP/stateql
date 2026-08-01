@@ -1,0 +1,95 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Core (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22.5.x, 24.x]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Smoke-test the packed artifact
+        shell: bash
+        run: |
+          TARBALL="$(npm pack --ignore-scripts)"
+          PROJECT="$(mktemp -d)"
+          cd "$PROJECT"
+          npm init --yes
+          npm install --ignore-scripts "$GITHUB_WORKSPACE/$TARBALL"
+          node --input-type=module -e "import '@fadhilp/stateql'"
+          ./node_modules/.bin/stql --version
+          ./node_modules/.bin/stql --help
+
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: stql_ci
+          POSTGRES_PASSWORD: stql_ci_password
+          POSTGRES_DB: stql_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stql_ci -d stql_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      STQL_POSTGRES_URL: postgresql://stql_ci:stql_ci_password@127.0.0.1:5432/stql_ci?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node --test dist/test/postgres.test.js
+
+  mysql:
+    name: MySQL integration
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: stql_ci
+          MYSQL_USER: stql_ci
+          MYSQL_PASSWORD: stql_ci_password
+          MYSQL_ROOT_PASSWORD: root_ci_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u stql_ci -pstql_ci_password"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      STQL_MYSQL_URL: mysql://stql_ci:stql_ci_password@127.0.0.1:3306/stql_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node --test dist/test/mysql.test.js

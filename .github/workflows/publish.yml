@@ -18,5 +18,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node -e 'const packageVersion = require("./package.json").version; if (process.env.RELEASE_TAG.replace(/^v/, "") !== packageVersion) throw new Error(`Release tag ${process.env.RELEASE_TAG} does not match package version ${packageVersion}`)'
       - run: npm ci
       - run: npm publish --access public

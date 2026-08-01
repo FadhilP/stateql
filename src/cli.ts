@@ -35,6 +35,9 @@ const parsed = parseArgs({
     offset: { type: "string" },
     limit: { type: "string" },
     "timeout-ms": { type: "string" },
+    "max-state-bytes": { type: "string" },
+    "cache-ttl-seconds": { type: "string" },
+    "result-ttl-seconds": { type: "string" },
     format: { type: "string" },
     output: { type: "string" },
     isolation: { type: "string" },
@@ -63,6 +66,15 @@ const stateql = new StateQL({
     ? {}
     : { timeoutMs: Number(values["timeout-ms"]) }),
   ...(process.env.STQL_ACTOR ? { actor: process.env.STQL_ACTOR } : {}),
+  ...(values["max-state-bytes"] === undefined
+    ? {}
+    : { maxStateBytes: Number(values["max-state-bytes"]) }),
+  ...(values["cache-ttl-seconds"] === undefined
+    ? {}
+    : { cacheTtlSeconds: Number(values["cache-ttl-seconds"]) }),
+  ...(values["result-ttl-seconds"] === undefined
+    ? {}
+    : { resultTtlSeconds: Number(values["result-ttl-seconds"]) }),
   signal: abortController.signal,
 });
 
@@ -220,6 +232,10 @@ async function dispatch(): Promise<Response<unknown>> {
       return stateql.history(numberOption(values.limit, 20));
     case "receipt":
       return stateql.receipt(requireValue(subcommand, "operation handle"));
+    case "doctor":
+      return stateql.doctor();
+    case "purge":
+      return stateql.purge(purgeScope(subcommand));
     case "capabilities":
       return stateql.capabilities();
     default:
@@ -391,6 +407,14 @@ function parseBatchJson(value: string, location: string): unknown {
 
 function numberOption(value: string | undefined, fallback: number): number {
   return value === undefined ? fallback : Number(value);
+}
+
+function purgeScope(
+  value: string | undefined,
+): "expired" | "results" | "history" | "all" {
+  if (!value || value === "expired") return "expired";
+  if (value === "results" || value === "history" || value === "all") return value;
+  throw new Error("purge scope must be expired, results, history, or all.");
 }
 
 function cacheMode(
@@ -613,12 +637,13 @@ Commands:
   alias set
   inspect schema|table|columns|indexes|constraints
   transaction begin|status|commit|rollback
-  plan, apply, history, receipt, capabilities
+  plan, apply, history, receipt, doctor, purge, capabilities
   batch [file.json|file.jsonl|-]
   pipe
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
+State: --max-state-bytes N, --cache-ttl-seconds N, --result-ttl-seconds N.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;
 }

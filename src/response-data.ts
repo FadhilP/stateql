@@ -4,9 +4,16 @@ import type {
   SessionRecord,
   TransactionRecord,
 } from "./store.js";
-import type { Row, Warning } from "./types.js";
+import type {
+  OperationData,
+  ProfileData,
+  Row,
+  SessionData,
+  TransactionData,
+  Warning,
+} from "./types.js";
 
-export function sessionData(session: SessionRecord): unknown {
+export function sessionData(session: SessionRecord): SessionData {
   return {
     session_id: session.id,
     name: session.name,
@@ -16,7 +23,7 @@ export function sessionData(session: SessionRecord): unknown {
   };
 }
 
-export function profileData(profile: ProfileRecord): Record<string, unknown> {
+export function profileData(profile: ProfileRecord): ProfileData {
   return {
     profile: profile.name,
     target: profile.target,
@@ -25,7 +32,7 @@ export function profileData(profile: ProfileRecord): Record<string, unknown> {
   };
 }
 
-export function operationData(operation: OperationRecord): Record<string, unknown> {
+export function operationData(operation: OperationRecord): OperationData {
   return {
     operation_id: operation.id,
     actor_id: operation.actor_id,
@@ -43,7 +50,7 @@ export function operationData(operation: OperationRecord): Record<string, unknow
 export function transactionData(
   transaction: TransactionRecord,
   statements: number,
-): unknown {
+): TransactionData {
   return {
     transaction_id: transaction.id,
     state: transaction.state,

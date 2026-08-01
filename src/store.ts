@@ -1,6 +1,9 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { platform } from "node:process";
+import { runMigrations } from "./migrations.js";
+import { StateQLError } from "./errors.js";
 import type {
   Column,
   Driver,
@@ -8,9 +11,16 @@ import type {
   SqlParameters,
   StateConfidence,
 } from "./types.js";
-import { parseJson, toJsonSafe } from "./util.js";
+import {
+  isColumns,
+  isRows,
+  isSqlParameters,
+  parseJson,
+  toJsonSafe,
+} from "./util.js";
 
 const HISTORY_LIMIT_PER_SESSION = 10_000;
+const DEFAULT_MAX_STATE_BYTES = 256 * 1024 * 1024;
 
 export interface SessionRecord {
   id: string;
@@ -132,23 +142,41 @@ export interface SessionMemberRecord {
 
 export class StateStore {
   readonly db: DatabaseSync;
+  private closed = false;
 
   constructor(
     home: string,
     private readonly now: () => Date,
+    private readonly maxStateBytes = DEFAULT_MAX_STATE_BYTES,
   ) {
     const path = join(home, "state.sqlite");
-    mkdirSync(home, { recursive: true });
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    if (platform !== "win32") restrictMode(home, 0o700);
     this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode = WAL");
-    this.db.exec("PRAGMA busy_timeout = 5000");
-    this.db.exec("PRAGMA foreign_keys = ON");
-    this.migrate();
-    this.recoverStaleCommittingTransactions();
-    this.deleteExpiredData();
+    try {
+      if (platform !== "win32") restrictMode(path, 0o600);
+      this.db.exec("PRAGMA journal_mode = WAL");
+      if (platform !== "win32") {
+        for (const suffix of ["-wal", "-shm"]) {
+          const sidecar = `${path}${suffix}`;
+          if (existsSync(sidecar)) restrictMode(sidecar, 0o600);
+        }
+      }
+      this.db.exec("PRAGMA busy_timeout = 5000");
+      this.db.exec("PRAGMA foreign_keys = ON");
+      runMigrations(this.db, this.now);
+      this.recoverStaleCommittingTransactions();
+      this.deleteExpiredData();
+    } catch (error) {
+      this.db.close();
+      this.closed = true;
+      throw error;
+    }
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 
@@ -543,31 +571,40 @@ export class StateStore {
     expiresAt: string;
   }): ResultRecord {
     const id = this.nextId("q");
-    this.db
-      .prepare(
-        `INSERT INTO results
-          (id, session_id, connection_id, fingerprint, sql, parameters,
-           rows_json, columns_json, row_count, state_version, state_signature,
-           state_confidence, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.sessionId,
-        input.connectionId,
-        input.fingerprint,
-        input.sql,
-        JSON.stringify(toJsonSafe(input.parameters)),
-        JSON.stringify(toJsonSafe(input.rows)),
-        JSON.stringify(input.columns),
-        input.rows.length,
-        input.stateVersion,
-        input.stateSignature,
-        input.stateConfidence,
-        input.expiresAt,
-        this.now().toISOString(),
-      );
-    return this.getResult(id)!;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO results
+            (id, session_id, connection_id, fingerprint, sql, parameters,
+             rows_json, columns_json, row_count, state_version, state_signature,
+             state_confidence, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.sessionId,
+          input.connectionId,
+          input.fingerprint,
+          input.sql,
+          JSON.stringify(toJsonSafe(input.parameters)),
+          JSON.stringify(toJsonSafe(input.rows)),
+          JSON.stringify(input.columns),
+          input.rows.length,
+          input.stateVersion,
+          input.stateSignature,
+          input.stateConfidence,
+          input.expiresAt,
+          this.now().toISOString(),
+        );
+      this.enforceResultQuota(id);
+      const result = this.getResult(id)!;
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   findResult(fingerprint: string): ResultRecord | undefined {
@@ -599,11 +636,19 @@ export class StateStore {
   }
 
   resultRows(result: ResultRecord): Row[] {
-    return parseJson<Row[]>(result.rows_json, []);
+    return parseJson<Row[]>(
+      result.rows_json,
+      `result "${result.id}" rows`,
+      isRows,
+    );
   }
 
   resultColumns(result: ResultRecord): Column[] {
-    return parseJson<Column[]>(result.columns_json, []);
+    return parseJson<Column[]>(
+      result.columns_json,
+      `result "${result.id}" columns`,
+      isColumns,
+    );
   }
 
   setAlias(sessionId: string, name: string, resultId: string): void {
@@ -890,6 +935,59 @@ export class StateStore {
         "SELECT * FROM operations WHERE transaction_id = ? ORDER BY created_at",
       )
       .all(transactionId) as unknown as OperationRecord[];
+  }
+
+  validatedTransactionOperations(transactionId: string): OperationRecord[] {
+    const operations = this.transactionOperations(transactionId);
+    for (const operation of operations) {
+      parseJson<SqlParameters>(
+        operation.parameters,
+        `operation "${operation.id}" parameters`,
+        isSqlParameters,
+      );
+    }
+    return operations;
+  }
+
+  claimTransactionForCommit(
+    transactionId: string,
+    sessionId: string,
+    actorId: string,
+    expectedOperations: OperationRecord[],
+  ): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.transactionOperations(transactionId);
+      const unchanged =
+        current.length === expectedOperations.length &&
+        current.every((operation, index) => {
+          const expected = expectedOperations[index];
+          return expected &&
+            operation.id === expected.id &&
+            operation.connection_id === expected.connection_id &&
+            operation.sql === expected.sql &&
+            operation.parameters === expected.parameters &&
+            operation.status === expected.status;
+        });
+      if (!unchanged) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      const result = this.db.prepare(
+        `UPDATE transactions SET state = 'committing', ended_at = ?
+         WHERE id = ? AND session_id = ? AND owner_actor_id = ?
+           AND state = 'active' AND EXISTS (
+             SELECT 1 FROM sessions
+             WHERE sessions.id = transactions.session_id
+               AND sessions.active_transaction_id = transactions.id
+           )`,
+      ).run(this.now().toISOString(), transactionId, sessionId, actorId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   markTransactionCommitting(
@@ -1288,6 +1386,175 @@ export class StateStore {
     >;
   }
 
+  diagnostics(sessionId: string): {
+    integrity: "ok" | "issues";
+    issues: Array<{ code: string; record?: string }>;
+    migrations: string[];
+    storage: { result_bytes: number; results: number; history: number };
+  } {
+    const issues: Array<{ code: string; record?: string }> = [];
+    const integrity = this.db.prepare("PRAGMA integrity_check").all() as Array<{
+      integrity_check: string;
+    }>;
+    if (integrity.some((row) => row.integrity_check !== "ok")) {
+      issues.push({ code: "SQLITE_INTEGRITY" });
+    }
+    if (this.db.prepare("PRAGMA foreign_key_check").all().length) {
+      issues.push({ code: "FOREIGN_KEY_INTEGRITY" });
+    }
+    const results = this.db.prepare(
+      "SELECT * FROM results WHERE session_id = ?",
+    ).all(sessionId) as unknown as ResultRecord[];
+    for (const result of results) {
+      try {
+        const rows = this.resultRows(result);
+        this.resultColumns(result);
+        parseJson<SqlParameters>(
+          result.parameters,
+          `result "${result.id}" parameters`,
+          isSqlParameters,
+        );
+        if (rows.length !== result.row_count) throw new Error("row count");
+      } catch {
+        issues.push({ code: "CORRUPTED_RESULT", record: result.id });
+      }
+    }
+    for (const table of ["operations", "plans"] as const) {
+      const records = this.db.prepare(
+        `SELECT id, parameters FROM ${table} WHERE session_id = ?`,
+      ).all(sessionId) as Array<{ id: string; parameters: string }>;
+      for (const record of records) {
+        try {
+          parseJson<SqlParameters>(
+            record.parameters,
+            `${table.slice(0, -1)} "${record.id}" parameters`,
+            isSqlParameters,
+          );
+        } catch {
+          issues.push({
+            code: table === "plans" ? "CORRUPTED_PLAN" : "CORRUPTED_OPERATION",
+            record: record.id,
+          });
+        }
+      }
+    }
+    const storage = this.db.prepare(
+      `SELECT
+         COUNT(*) AS results,
+         COALESCE(SUM(length(CAST(sql AS BLOB)) + length(CAST(parameters AS BLOB)) +
+           length(CAST(rows_json AS BLOB)) + length(CAST(columns_json AS BLOB))), 0)
+           AS result_bytes,
+         (SELECT COUNT(*) FROM history WHERE session_id = ?) AS history
+       FROM results WHERE session_id = ?`,
+    ).get(sessionId, sessionId) as {
+      result_bytes: number;
+      results: number;
+      history: number;
+    };
+    return {
+      integrity: issues.length ? "issues" : "ok",
+      issues,
+      migrations: (this.db.prepare(
+        "SELECT name FROM schema_migrations ORDER BY rowid",
+      ).all() as Array<{ name: string }>).map((row) => row.name),
+      storage,
+    };
+  }
+
+  purge(
+    sessionId: string,
+    scope: "expired" | "results" | "history" | "all",
+  ): number {
+    const before = this.db.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM results WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM plans WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM operations WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM transactions WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM history WHERE session_id = ?) AS count`,
+    ).get(sessionId, sessionId, sessionId, sessionId, sessionId) as { count: number };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (scope === "expired") {
+        this.db.prepare(
+          `DELETE FROM aliases WHERE session_id = ? AND result_id IN (
+             SELECT id FROM results WHERE session_id = ? AND expires_at <= ?
+           )`,
+        ).run(sessionId, sessionId, this.now().toISOString());
+        this.db.prepare(
+          "DELETE FROM results WHERE session_id = ? AND expires_at <= ?",
+        ).run(sessionId, this.now().toISOString());
+        this.db.prepare(
+          `DELETE FROM plans WHERE session_id = ? AND expires_at <= ?
+             AND claim_token IS NULL`,
+        ).run(sessionId, this.now().toISOString());
+      } else {
+        if (scope === "results" || scope === "all") {
+          this.db.prepare("DELETE FROM aliases WHERE session_id = ?").run(sessionId);
+          this.db.prepare("DELETE FROM results WHERE session_id = ?").run(sessionId);
+        }
+        if (scope === "history" || scope === "all") {
+          this.db.prepare("DELETE FROM history WHERE session_id = ?").run(sessionId);
+        }
+        if (scope === "all") {
+          this.db.prepare("DELETE FROM plans WHERE session_id = ?").run(sessionId);
+          this.db.prepare("DELETE FROM operations WHERE session_id = ?").run(sessionId);
+          this.db.prepare("DELETE FROM transactions WHERE session_id = ?").run(sessionId);
+        }
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    const after = this.db.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM results WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM plans WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM operations WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM transactions WHERE session_id = ?) +
+         (SELECT COUNT(*) FROM history WHERE session_id = ?) AS count`,
+    ).get(sessionId, sessionId, sessionId, sessionId, sessionId) as { count: number };
+    return before.count - after.count;
+  }
+
+  private enforceResultQuota(protectedId: string): void {
+    this.db.prepare(
+      `DELETE FROM aliases WHERE result_id IN (
+         SELECT id FROM results WHERE expires_at <= ?
+       )`,
+    ).run(this.now().toISOString());
+    this.db.prepare("DELETE FROM results WHERE expires_at <= ?")
+      .run(this.now().toISOString());
+    while (this.resultBytes() > this.maxStateBytes) {
+      const candidate = this.db.prepare(
+        `SELECT id FROM results
+         WHERE id <> ? AND NOT EXISTS (
+           SELECT 1 FROM aliases WHERE aliases.result_id = results.id
+         )
+         ORDER BY created_at, rowid LIMIT 1`,
+      ).get(protectedId) as { id: string } | undefined;
+      if (!candidate) {
+        throw new StateQLError(
+          "STATE_QUOTA_EXCEEDED",
+          `Stored results exceed the ${this.maxStateBytes}-byte state quota.`,
+          { suggestedAction: "Purge results or increase maxStateBytes." },
+        );
+      }
+      this.db.prepare("DELETE FROM results WHERE id = ?").run(candidate.id);
+    }
+  }
+
+  private resultBytes(): number {
+    const row = this.db.prepare(
+      `SELECT COALESCE(SUM(
+         length(CAST(sql AS BLOB)) + length(CAST(parameters AS BLOB)) +
+         length(CAST(rows_json AS BLOB)) + length(CAST(columns_json AS BLOB))
+       ), 0) AS bytes FROM results`,
+    ).get() as { bytes: number };
+    return row.bytes;
+  }
+
   private deleteExpiredData(): void {
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
@@ -1348,202 +1615,8 @@ export class StateStore {
       throw error;
     }
   }
+}
 
-  private migrate(): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        name TEXT PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-      `);
-      const actorMigrationApplied = Boolean(
-        this.db
-          .prepare(
-            "SELECT 1 FROM schema_migrations WHERE name = 'shared_session_actors_v1'",
-          )
-          .get(),
-      );
-      this.db.exec(`
-      CREATE TABLE IF NOT EXISTS counters (
-        prefix TEXT PRIMARY KEY,
-        value INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL,
-        active_connection_id TEXT,
-        active_transaction_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS session_members (
-        session_id TEXT NOT NULL,
-        actor_id TEXT NOT NULL UNIQUE,
-        attached_at TEXT NOT NULL,
-        PRIMARY KEY(session_id, actor_id),
-        FOREIGN KEY(session_id) REFERENCES sessions(id)
-      );
-      CREATE TABLE IF NOT EXISTS profiles (
-        name TEXT PRIMARY KEY,
-        target TEXT,
-        secret_env TEXT,
-        read_only INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        CHECK(target IS NOT NULL OR secret_env IS NOT NULL)
-      );
-      CREATE TABLE IF NOT EXISTS connections (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        driver TEXT NOT NULL,
-        database_name TEXT NOT NULL,
-        source TEXT NOT NULL,
-        secret_env TEXT,
-        read_only INTEGER NOT NULL,
-        version INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(session_id) REFERENCES sessions(id)
-      );
-      CREATE TABLE IF NOT EXISTS results (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        fingerprint TEXT NOT NULL,
-        sql TEXT NOT NULL,
-        parameters TEXT NOT NULL,
-        rows_json TEXT NOT NULL,
-        columns_json TEXT NOT NULL,
-        row_count INTEGER NOT NULL,
-        state_version TEXT NOT NULL,
-        state_signature TEXT NOT NULL,
-        state_confidence TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS results_fingerprint
-        ON results(fingerprint, created_at);
-      CREATE TABLE IF NOT EXISTS aliases (
-        session_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        result_id TEXT NOT NULL,
-        PRIMARY KEY(session_id, name),
-        FOREIGN KEY(result_id) REFERENCES results(id)
-      );
-      CREATE TABLE IF NOT EXISTS operations (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        actor_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        fingerprint TEXT NOT NULL,
-        sql TEXT NOT NULL,
-        parameters TEXT NOT NULL,
-        statement_type TEXT NOT NULL,
-        affected_rows INTEGER,
-        status TEXT NOT NULL,
-        transaction_id TEXT,
-        replay_of TEXT,
-        idempotency_key TEXT,
-        state_version_before TEXT NOT NULL,
-        state_version_after TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS operations_fingerprint
-        ON operations(connection_id, fingerprint, status);
-      CREATE UNIQUE INDEX IF NOT EXISTS operations_idempotency
-        ON operations(connection_id, idempotency_key)
-        WHERE idempotency_key IS NOT NULL AND status IN ('committed', 'pending');
-      CREATE TABLE IF NOT EXISTS transactions (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        owner_actor_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        isolation_level TEXT NOT NULL,
-        start_version TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        ended_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS plans (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        owner_actor_id TEXT NOT NULL,
-        connection_id TEXT NOT NULL,
-        sql TEXT NOT NULL,
-        parameters TEXT NOT NULL,
-        statement_type TEXT NOT NULL,
-        state_version TEXT NOT NULL,
-        state_signature TEXT NOT NULL,
-        destructive INTEGER NOT NULL,
-        allow_unbounded INTEGER NOT NULL,
-        allow_destructive INTEGER NOT NULL,
-        expires_at TEXT NOT NULL,
-        applied_operation_id TEXT,
-        claim_token TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS history (
-        id TEXT PRIMARY KEY,
-        timestamp TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        actor_id TEXT NOT NULL,
-        command TEXT NOT NULL,
-        handle TEXT,
-        executed INTEGER NOT NULL,
-        cached INTEGER NOT NULL,
-        success INTEGER NOT NULL,
-        error_code TEXT
-      );
-      CREATE INDEX IF NOT EXISTS history_session
-        ON history(session_id);
-      `);
-      this.addColumn("operations", "actor_id", "TEXT");
-      this.addColumn("transactions", "owner_actor_id", "TEXT");
-      this.addColumn("plans", "owner_actor_id", "TEXT");
-      this.addColumn("plans", "claim_token", "TEXT");
-      this.addColumn("history", "actor_id", "TEXT");
-      if (!actorMigrationApplied) {
-        this.db.exec(`
-          INSERT OR IGNORE INTO session_members(session_id, actor_id, attached_at)
-          SELECT id, name, created_at FROM sessions;
-        `);
-      }
-      this.db.exec(`
-        UPDATE operations SET actor_id = (
-          SELECT name FROM sessions WHERE sessions.id = operations.session_id
-        ) WHERE actor_id IS NULL;
-        UPDATE transactions SET owner_actor_id = (
-          SELECT name FROM sessions WHERE sessions.id = transactions.session_id
-        ) WHERE owner_actor_id IS NULL;
-        UPDATE plans SET owner_actor_id = (
-          SELECT name FROM sessions WHERE sessions.id = plans.session_id
-        ) WHERE owner_actor_id IS NULL;
-        UPDATE history SET actor_id = (
-          SELECT name FROM sessions WHERE sessions.id = history.session_id
-        ) WHERE actor_id IS NULL;
-      `);
-      this.db
-        .prepare(
-          `INSERT OR IGNORE INTO schema_migrations(name, applied_at)
-           VALUES ('shared_session_actors_v1', ?)`,
-        )
-        .run(this.now().toISOString());
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  private addColumn(table: string, column: string, definition: string): void {
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{
-      name: string;
-    }>;
-    if (!columns.some((candidate) => candidate.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-    }
-  }
+function restrictMode(path: string, allowed: number): void {
+  chmodSync(path, statSync(path).mode & allowed);
 }

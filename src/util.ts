@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { env, platform } from "node:process";
-import type { Row } from "./types.js";
+import { StateQLError } from "./errors.js";
+import type { Column, Row, SqlParameters } from "./types.js";
 
 export function defaultHome(): string {
   if (env.STQL_HOME) return resolve(env.STQL_HOME);
@@ -30,12 +31,47 @@ function sortValue(value: unknown): unknown {
   );
 }
 
-export function parseJson<T>(value: string, fallback: T): T {
+export function parseJson<T>(
+  value: string,
+  context: string,
+  validate?: (parsed: unknown) => parsed is T,
+): T {
+  let parsed: unknown;
   try {
-    return JSON.parse(value) as T;
+    parsed = JSON.parse(value) as unknown;
   } catch {
-    return fallback;
+    throw corruptedState(context);
   }
+  if (validate && !validate(parsed)) throw corruptedState(context);
+  return parsed as T;
+}
+
+export function isSqlParameters(value: unknown): value is SqlParameters {
+  return Array.isArray(value) || isRecord(value);
+}
+
+export function isRows(value: unknown): value is Row[] {
+  return Array.isArray(value) && value.every(isRecord);
+}
+
+export function isColumns(value: unknown): value is Column[] {
+  return Array.isArray(value) && value.every((column) =>
+    isRecord(column) &&
+    typeof column.name === "string" &&
+    typeof column.type === "string"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function corruptedState(context: string): StateQLError {
+  return new StateQLError(
+    "STATE_CORRUPTED",
+    `Stored ${context} is corrupted.`,
+    { suggestedAction: "Run stql doctor, then purge the affected data." },
+  );
 }
 
 export function redact(value: string): string {

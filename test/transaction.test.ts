@@ -138,6 +138,28 @@ test("transaction statement failures are known rollbacks", async () => {
   fixture.stateql.close();
 });
 
+test("corrupt staged transaction parameters fail while the transaction remains active", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE staged_rows (id INTEGER)"));
+  const transaction = await succeed(fixture.stateql.beginTransaction());
+  const operation = await succeed(
+    fixture.stateql.exec("INSERT INTO staged_rows (id) VALUES (?)", { params: [1] }),
+  );
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db.prepare("UPDATE operations SET parameters = ? WHERE id = ?")
+    .run("[] trailing-corruption", operation.operation_id);
+
+  assertFailure(
+    await fixture.stateql.commitTransaction(String(transaction.transaction_id)),
+    "STATE_CORRUPTED",
+  );
+  assert.equal(
+    (await succeed(fixture.stateql.transactionStatus(String(transaction.transaction_id)))).state,
+    "active",
+  );
+  fixture.stateql.close();
+});
+
 test("stale committing transactions recover as unknown", async () => {
   let clock = new Date("2026-07-25T00:00:00.000Z");
   const fixture = await createFixture(() => clock);
