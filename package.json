@@ -26,6 +26,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/cli.test.js dist/test/credential.test.js dist/test/mysql.test.js dist/test/postgres.test.js dist/test/query.test.js dist/test/sqlite.test.js dist/test/store.test.js dist/test/terminal.test.js dist/test/transaction.test.js dist/test/write.test.js",
+    "release": "npm version",
+    "version": "npm install",
     "prepack": "npm test"
   },
   "keywords": [

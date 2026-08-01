@@ -104,7 +104,7 @@ test("timed-out transaction commits retain unknown-outcome protection", async ()
   try {
     blocker.exec("BEGIN EXCLUSIVE");
     assertOutcomeUnknown(
-      await fixture.stateql.commitTransaction(undefined, { timeoutMs: 200 }),
+      await fixture.stateql.commitTransaction(undefined, { timeoutMs: 1_000 }),
     );
   } finally {
     blocker.exec("ROLLBACK");

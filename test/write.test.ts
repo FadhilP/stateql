@@ -369,7 +369,7 @@ test("timed-out SQLite writes retain unknown-outcome protection", async () => {
     assertOutcomeUnknown(
       await fixture.stateql.exec(
         "INSERT INTO deadline_rows (value) VALUES ('maybe')",
-        { timeoutMs: 200 },
+        { timeoutMs: 1_000 },
       ),
     );
   } finally {

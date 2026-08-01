@@ -118,6 +118,7 @@ class SQLiteAdapter implements Adapter {
   private readonly pending = new Map<number, PendingSQLiteCall>();
   private nextId = 1;
   private closed = false;
+  private closePromise?: Promise<void>;
 
   constructor(
     private readonly source: string,
@@ -191,10 +192,10 @@ class SQLiteAdapter implements Adapter {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    await new Promise<void>((resolve) => {
+    this.closePromise = new Promise<void>((resolve) => {
       const done = (): void => {
         clearTimeout(timer);
         resolve();
@@ -205,7 +206,6 @@ class SQLiteAdapter implements Adapter {
         } catch {
           // Process already exited.
         }
-        resolve();
       }, 1_000);
       timer.unref();
       this.child.once("exit", done);
@@ -219,6 +219,7 @@ class SQLiteAdapter implements Adapter {
         }
       }
     });
+    return this.closePromise;
   }
 
   private async call<T>(
@@ -240,7 +241,12 @@ class SQLiteAdapter implements Adapter {
             readOnly: this.readOnly,
             operation,
             args,
-            busyTimeoutMs: Math.min(5_000, remainingMilliseconds(this.context)),
+            // Let the client deadline terminate the worker before SQLite's
+            // lock timeout races it and reports a known, non-executed failure.
+            busyTimeoutMs: Math.min(
+              5_000,
+              remainingMilliseconds(this.context) + 250,
+            ),
           },
           (error) => {
             if (error) reject(error);
