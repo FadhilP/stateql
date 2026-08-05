@@ -171,7 +171,12 @@ test("snapshot is typed, bounded, safe, and does not record history", async () =
     ["actor_id", "affected_rows", "handle", "status", "type"],
   );
   assert.equal(JSON.stringify(snapshot).includes("snapshot-secret"), false);
-  assert.equal(JSON.stringify(snapshot).includes("SELECT ? AS value"), false);
+  assert.equal(JSON.stringify(snapshot).includes("SELECT ? AS value"), true);
+  assert.equal(
+    snapshot.history.find((entry) => entry.command === "query")?.sql,
+    "SELECT ? AS value",
+  );
+  assert.equal(historyEntry.sql, null);
   assert.deepEqual(fixture.stateql.snapshot({ historyLimit: 2 }), snapshot);
 
   const store = (fixture.stateql as unknown as { store: StateStore }).store;
@@ -202,6 +207,54 @@ test("snapshot is typed, bounded, safe, and does not record history", async () =
 function commandNumber(commandId: string): number {
   return Number(commandId.slice(commandId.indexOf("_") + 1));
 }
+
+test("history bounds SQL text by UTF-8 bytes", () => {
+  const root = createTemporaryDirectory();
+  const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
+  const session = store.ensureSession();
+  const entry = store.addHistory({
+    sessionId: session.id,
+    actorId: "default",
+    command: "query",
+    sql: "😀".repeat(3_000),
+    executed: false,
+    cached: false,
+    success: false,
+  });
+
+  assert.ok(entry.sql);
+  assert.ok(Buffer.byteLength(entry.sql, "utf8") <= 4_096);
+  assert.match(entry.sql, /…$/);
+  store.close();
+});
+
+test("history SQL migration preserves existing rows", () => {
+  const root = createTemporaryDirectory();
+  const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
+  const session = store.ensureSession();
+  store.addHistory({
+    id: "legacy_history",
+    sessionId: session.id,
+    actorId: "default",
+    command: "query",
+    executed: false,
+    cached: false,
+    success: true,
+  });
+  store.close();
+
+  const legacy = new DatabaseSync(join(root, "state.sqlite"));
+  legacy.exec("ALTER TABLE history DROP COLUMN sql");
+  legacy.close();
+
+  const reopened = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
+  assert.equal(reopened.history(session.id, 1)[0]?.sql, null);
+  const migration = reopened.db
+    .prepare("SELECT 1 FROM schema_migrations WHERE name = 'history_sql_v1'")
+    .get();
+  assert.ok(migration);
+  reopened.close();
+});
 
 test("history keeps the latest 10,000 entries per session", () => {
   const root = createTemporaryDirectory();
@@ -445,7 +498,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
   const database = new DatabaseSync(join(home, "state.sqlite"));
   assert.deepEqual(
     (database.prepare("SELECT name FROM schema_migrations ORDER BY rowid").all() as Array<{ name: string }>).map((row) => row.name),
-    ["initial_schema_v1", "shared_session_actors_v1"],
+    ["initial_schema_v1", "shared_session_actors_v1", "history_sql_v1"],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
   database.exec("ALTER TABLE plans DROP COLUMN claim_token");

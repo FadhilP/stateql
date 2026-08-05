@@ -20,6 +20,7 @@ import {
 } from "./util.js";
 
 const HISTORY_LIMIT_PER_SESSION = 10_000;
+const MAX_HISTORY_SQL_BYTES = 4_096;
 const DEFAULT_MAX_STATE_BYTES = 256 * 1024 * 1024;
 
 export interface SessionRecord {
@@ -127,6 +128,7 @@ export interface HistoryRecord {
   session_id: string;
   actor_id: string;
   command: string;
+  sql: string | null;
   handle: string | null;
   executed: number;
   cached: number;
@@ -1304,6 +1306,7 @@ export class StateStore {
     sessionId: string;
     actorId: string;
     command: string;
+    sql?: string;
     handle?: string;
     executed: boolean;
     cached: boolean;
@@ -1315,9 +1318,9 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO history
-          (id, timestamp, session_id, actor_id, command, handle, executed,
+          (id, timestamp, session_id, actor_id, command, sql, handle, executed,
            cached, success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1325,6 +1328,7 @@ export class StateStore {
         input.sessionId,
         input.actorId,
         input.command,
+        boundedHistorySql(input.sql),
         input.handle ?? null,
         input.executed ? 1 : 0,
         input.cached ? 1 : 0,
@@ -1615,6 +1619,24 @@ export class StateStore {
       throw error;
     }
   }
+}
+
+function boundedHistorySql(sql: string | undefined): string | null {
+  if (sql === undefined) return null;
+  if (Buffer.byteLength(sql, "utf8") <= MAX_HISTORY_SQL_BYTES) return sql;
+
+  const suffix = "…";
+  let prefix = "";
+  for (const character of sql) {
+    if (
+      Buffer.byteLength(`${prefix}${character}${suffix}`, "utf8") >
+      MAX_HISTORY_SQL_BYTES
+    ) {
+      break;
+    }
+    prefix += character;
+  }
+  return `${prefix}${suffix}`;
 }
 
 function restrictMode(path: string, allowed: number): void {

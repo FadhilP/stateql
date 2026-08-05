@@ -94,6 +94,81 @@ test("durable handles, normalized cache reuse, parameters, and compact rows", as
   fixture.stateql.close();
 });
 
+test("history records bounded SQL for query, exec, plan, apply, and batch", async () => {
+  const fixture = await createFixture();
+  const querySql = "SELECT ? AS value";
+  await succeed(fixture.stateql.query(querySql, { params: ["query-secret"] }));
+  assertFailure(
+    await fixture.stateql.query("INSERT INTO missing_table VALUES (1)"),
+    "INVALID_SQL",
+  );
+
+  const execSql = "CREATE TABLE history_sql_rows (value TEXT)";
+  await succeed(fixture.stateql.exec(execSql));
+  assertFailure(await fixture.stateql.exec("SELECT 1"), "INVALID_SQL");
+
+  const planFailureSql = "SELECT 1";
+  assertFailure(await fixture.stateql.plan(planFailureSql), "INVALID_SQL");
+
+  const planSql = "INSERT INTO history_sql_rows (value) VALUES (?)";
+  const plan = await succeed(
+    fixture.stateql.plan(planSql, {
+      params: ["plan-secret"],
+      allowUnbounded: true,
+    }),
+  );
+  await succeed(fixture.stateql.apply(String(plan.plan_id)));
+
+  const batchSql = "SELECT 2";
+  const batchResponses = [];
+  for await (const response of fixture.stateql.batch(
+    [
+      { command: "query", sql: batchSql },
+      { command: "exec", sql: "SELECT 1" },
+    ],
+    { continueOnError: true },
+  )) {
+    batchResponses.push(response);
+  }
+  assert.equal(batchResponses.length, 2);
+  assert.equal(batchResponses[0]?.ok, true);
+  assert.equal(batchResponses[1]?.ok, false);
+
+  const history = await succeed(fixture.stateql.history(50));
+  const entry = (command: string, sql: string) =>
+    history.history.find(
+      (candidate: { command: string; sql: string | null }) =>
+        candidate.command === command && candidate.sql === sql,
+    );
+  assert.ok(entry("query", querySql));
+  assert.ok(entry("query", "INSERT INTO missing_table VALUES (1)"));
+  assert.ok(entry("exec", execSql));
+  assert.ok(entry("exec", "SELECT 1"));
+  assert.ok(entry("plan", planSql));
+  assert.ok(entry("plan", planFailureSql));
+  assert.ok(entry("apply", planSql));
+  assert.ok(entry("query", batchSql));
+  assert.equal(JSON.stringify(history).includes("query-secret"), false);
+  assert.equal(JSON.stringify(history).includes("plan-secret"), false);
+
+  fixture.stateql.close();
+  const reopened = new StateQL({ home: fixture.home });
+  const persistedHistory = await succeed(reopened.history(50));
+  assert.ok(
+    persistedHistory.history.some(
+      (candidate: { command: string; sql: string | null }) =>
+        candidate.command === "query" && candidate.sql === batchSql,
+    ),
+  );
+  assert.ok(
+    persistedHistory.history.some(
+      (candidate: { command: string; sql: string | null }) =>
+        candidate.command === "apply" && candidate.sql === planSql,
+    ),
+  );
+  reopened.close();
+});
+
 test("filters materialized handles locally into durable derived results", async () => {
   const fixture = await createFixture();
   await succeed(

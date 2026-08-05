@@ -56,6 +56,15 @@ const MIGRATIONS: Migration[] = [
     apply: migrateSharedSessionActors,
     validate: validateSharedSessionActors,
   },
+  {
+    name: "history_sql_v1",
+    apply(db) {
+      addColumn(db, "history", "sql", "TEXT");
+    },
+    validate(db) {
+      requireColumns(db, "history", ["sql"]);
+    },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -217,6 +226,7 @@ function createInitialSchema(db: DatabaseSync): void {
       session_id TEXT NOT NULL,
       actor_id TEXT NOT NULL,
       command TEXT NOT NULL,
+      sql TEXT,
       handle TEXT,
       executed INTEGER NOT NULL,
       cached INTEGER NOT NULL,

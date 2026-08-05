@@ -915,7 +915,7 @@ export class StateQL {
       } finally {
         await closeAdapterQuietly(adapter);
       }
-    });
+    }, sql);
   }
 
   async show(idOrAlias: string): Promise<Response<ResultData>> {
@@ -1096,7 +1096,7 @@ export class StateQL {
         options,
         this.executionContext(options),
       );
-    });
+    }, sql);
   }
 
   async receipt(id: string): Promise<Response<OperationData>> {
@@ -1524,13 +1524,14 @@ export class StateQL {
       } finally {
         await closeAdapterQuietly(adapter);
       }
-    });
+    }, sql);
   }
 
   async apply(
     planId: string,
     options: ExecutionOptions = {},
   ): Promise<Response<ApplyData>> {
+    let historySql: string | undefined;
     return this.run("apply", async (session) => {
       this.rejectDuringStagedTransaction(session, "Plans");
       const plan = this.store.getPlan(planId);
@@ -1551,6 +1552,7 @@ export class StateQL {
       if (Date.parse(plan.expires_at) <= this.now().getTime()) {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
+      historySql = plan.sql;
       const planParameters = parseJson<SqlParameters>(
         plan.parameters,
         `plan "${plan.id}" parameters`,
@@ -1640,7 +1642,7 @@ export class StateQL {
       } finally {
         if (!retainClaim) this.store.releasePlanClaim(plan.id, claimToken);
       }
-    });
+    }, () => historySql);
   }
 
   async history(limit = 20): Promise<Response<HistoryData>> {
@@ -2403,6 +2405,7 @@ export class StateQL {
   private async run<T>(
     command: string,
     action: (session: SessionRecord) => Promise<ActionResult<T>>,
+    historySql?: string | (() => string | undefined),
   ): Promise<Response<T>> {
     const started = performance.now();
     let session = this.store.ensureSession(this.sessionName);
@@ -2425,12 +2428,14 @@ export class StateQL {
     try {
       const result = await action(session);
       const responseSession = result.session ?? session;
+      const sqlText = resolveHistorySql(historySql);
       this.store.addHistory({
         id: commandId,
         sessionId: session.id,
         actorId: this.actorId,
         command,
         ...(result.handle ? { handle: result.handle } : {}),
+        ...(sqlText !== undefined ? { sql: sqlText } : {}),
         executed: result.executed ?? false,
         cached: result.cached ?? false,
         success: true,
@@ -2453,11 +2458,13 @@ export class StateQL {
       } satisfies Success<T>;
     } catch (error) {
       const stateqlError = asStateQLError(error);
+      const sqlText = resolveHistorySql(historySql);
       this.store.addHistory({
         id: commandId,
         sessionId: session.id,
         actorId: this.actorId,
         command,
+        ...(sqlText !== undefined ? { sql: sqlText } : {}),
         executed: stateqlError.details.executed,
         cached: false,
         success: false,
@@ -2476,6 +2483,12 @@ export class StateQL {
   }
 }
 
+function resolveHistorySql(
+  sql?: string | (() => string | undefined),
+): string | undefined {
+  return typeof sql === "function" ? sql() : sql;
+}
+
 function historyEntry(item: HistoryRecord): HistoryEntry {
   return {
     command_id: item.id,
@@ -2483,6 +2496,7 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     session_id: item.session_id,
     actor_id: item.actor_id,
     command: item.command,
+    sql: item.sql,
     handle: item.handle,
     executed: Boolean(item.executed),
     cached: Boolean(item.cached),

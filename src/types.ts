@@ -90,6 +90,7 @@ export interface HistoryEntry {
   session_id: string;
   actor_id: string;
   command: string;
+  sql: string | null;
   handle: string | null;
   executed: boolean;
   cached: boolean;
