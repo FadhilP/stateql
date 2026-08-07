@@ -261,6 +261,7 @@ test("SQL analysis rejects multi-statement and hidden-write forms and classifies
   for (const [sql, driver] of [
     ["SELECT 1; SELECT 2", "sqlite"],
     ["SELECT 1; DELETE FROM policy_rows", "postgres"],
+    ["SELECT 1 ORDER BY 1 NULLS FIRST; DELETE FROM policy_rows", "postgres"],
     ["/* a comment */ SELECT 1; /* another */ SELECT 2", "mysql"],
     ["SELECT * INTO copied_rows FROM policy_rows", "postgres"],
     ["WITH changed AS (UPDATE policy_rows SET id = 2 RETURNING *) SELECT * FROM changed", "postgres"],

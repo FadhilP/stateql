@@ -46,6 +46,37 @@ test("PostgreSQL strict SSL aliases normalize without opting out of libpq compat
   }
 });
 
+test("PostgreSQL analysis accepts explicit null ordering without changing its fingerprint", () => {
+  const first = analyzeSql(
+    "SELECT value FROM items ORDER BY value NULLS FIRST",
+    "postgres",
+  );
+  const last = analyzeSql(
+    "SELECT value FROM items ORDER BY value NULLS /* keep */ LAST",
+    "postgres",
+  );
+  const quoted = analyzeSql(
+    "SELECT 'NULLS FIRST' AS value ORDER BY value nulls last",
+    "postgres",
+  );
+  const multiple = analyzeSql(
+    "SELECT value FROM items ORDER /* clause */ BY value DESC NULLS FIRST, id NULLS LAST",
+    "postgres",
+  );
+
+  assert.equal(first.read, true);
+  assert.equal(first.ordered, true);
+  assert.match(first.normalized, /NULLS FIRST/);
+  assert.match(last.normalized, /NULLS \/\* keep \*\/ LAST/);
+  assert.match(quoted.normalized, /'NULLS FIRST'/);
+  assert.match(multiple.normalized, /NULLS FIRST, id NULLS LAST/);
+  assert.notEqual(first.normalized, last.normalized);
+  assert.throws(
+    () => analyzeSql("SELECT 1 NULLS FIRST", "postgres"),
+    (error: unknown) => error instanceof StateQLError && error.details.code === "INVALID_SQL",
+  );
+});
+
 test("PostgreSQL detection and SQL parsing stay explicit", () => {
   assert.equal(detectDriver("postgres://localhost/app"), "postgres");
   assert.equal(credentialSource("postgres:///app").driver, "postgres");
