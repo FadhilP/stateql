@@ -4,11 +4,14 @@ import { createReadStream, readFileSync } from "node:fs";
 import { extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { BSON } from "mongodb";
 import { exitCodeFor } from "./errors.js";
 import { StateQL } from "./stateql.js";
 import type {
   BatchCommand,
   Failure,
+  MongoReadCommand,
+  MongoWriteCommand,
   Response,
   SqlParameters,
 } from "./types.js";
@@ -97,7 +100,10 @@ async function runSingle(): Promise<void> {
   } catch (error) {
     response = cliFailure(error);
   }
-  print(response, mode, command ?? "");
+  const responseCommand = command === "mongo" && subcommand
+    ? `mongo.${subcommand}`
+    : command ?? "";
+  print(response, mode, responseCommand);
   if (!response.ok) process.exitCode = exitCodeFor(response.error.code);
 }
 
@@ -167,6 +173,8 @@ async function dispatch(): Promise<Response<unknown>> {
       return dispatchProfile(subcommand, rest);
     case "session":
       return dispatchSession(subcommand, rest);
+    case "mongo":
+      return dispatchMongo(subcommand, rest);
     case "query":
       return stateql.query(sql, {
         params,
@@ -243,6 +251,44 @@ async function dispatch(): Promise<Response<unknown>> {
   }
 }
 
+async function dispatchMongo(
+  action: string | undefined,
+  args: string[],
+): Promise<Response<unknown>> {
+  const payload = requireValue(args.join(" ").trim(), "MongoDB EJSON command");
+  switch (action) {
+    case "query":
+      return stateql.mongoQuery(parseMongoCommand(payload) as MongoReadCommand, {
+        cache: cacheMode(values.cache),
+      });
+    case "exec":
+      return stateql.mongoExec(parseMongoCommand(payload) as MongoWriteCommand, {
+        replay: values.replay ?? false,
+        ...(values["idempotency-key"]
+          ? { idempotencyKey: values["idempotency-key"] }
+          : {}),
+        allowUnbounded: values["allow-unbounded"] ?? false,
+        allowDestructive: values["allow-destructive"] ?? false,
+      });
+    case "plan":
+      return stateql.mongoPlan(parseMongoCommand(payload) as MongoWriteCommand, {
+        allowUnbounded: values["allow-unbounded"] ?? false,
+        ...(values["allow-destructive"]
+          ? { allowDestructive: true }
+          : {}),
+      });
+    default:
+      throw new Error(`Unknown MongoDB command "${action ?? ""}".`);
+  }
+}
+
+function parseMongoCommand(value: string): unknown {
+  try {
+    return BSON.EJSON.parse(value, { relaxed: false }) as unknown;
+  } catch {
+    throw new Error("Invalid MongoDB EJSON command.");
+  }
+}
 async function dispatchSession(
   action: string | undefined,
   args: string[],
@@ -524,6 +570,7 @@ function toAgentResponse(
 
   if (
     (currentCommand === "query" ||
+      currentCommand === "mongo.query" ||
       currentCommand === "filter" ||
       currentCommand === "show") &&
     typeof data.rows === "number" &&
@@ -567,6 +614,7 @@ function toAgentResponse(
 function primaryHandleKey(currentCommand: string): string | undefined {
   const keys: Record<string, string> = {
     query: "result_id",
+    "mongo.query": "result_id",
     filter: "result_id",
     show: "result_id",
     rows: "result_id",
@@ -576,9 +624,11 @@ function primaryHandleKey(currentCommand: string): string | undefined {
     alias: "result_id",
     "alias.set": "result_id",
     exec: "operation_id",
+    "mongo.exec": "operation_id",
     receipt: "operation_id",
     apply: "operation_id",
     plan: "plan_id",
+    "mongo.plan": "plan_id",
     connect: "connection_id",
     transaction: "transaction_id",
     "transaction.begin": "transaction_id",
@@ -634,8 +684,9 @@ Commands:
   profile add|list|show|remove
   session start|list|show|summary|close
   query, filter, exec, show, rows, count, columns, export
+  mongo query|exec|plan '<EJSON command>'
   alias set
-  inspect schema|table|columns|indexes|constraints
+  inspect schema|table|collection|collections|columns|indexes|constraints
   transaction begin|status|commit|rollback
   plan, apply, history, receipt, doctor, purge, capabilities
   batch [file.json|file.jsonl|-]

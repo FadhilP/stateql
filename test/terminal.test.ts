@@ -10,9 +10,19 @@ import { randomUUID } from "node:crypto";
 import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
 import { StateQL } from "../src/stateql.js";
+import { serializeMongoCommand } from "../src/mongodb.js";
+import { StateStore } from "../src/store.js";
+import type { MongoReadCommand } from "../src/types.js";
+import { hash } from "../src/util.js";
 import { createTemporaryDirectory, succeed } from "./helpers.js";
 
 const windows = process.platform === "win32";
+const mongoQuery = {
+  operation: "find",
+  collection: "terminal_items",
+  filter: { status: "ready" },
+  options: { sort: { name: 1 } },
+} satisfies MongoReadCommand;
 const availableCommands = [
   "--help",
   "alias.set",
@@ -33,6 +43,9 @@ const availableCommands = [
   "inspect.schema",
   "inspect.table",
   "pipe",
+  "mongo.exec",
+  "mongo.plan",
+  "mongo.query",
   "plan",
   "profile.add",
   "profile.list",
@@ -113,6 +126,12 @@ function scenario(): TerminalStep[] {
     ? 'set "STQL_SESSION=terminal-next" & set "STQL_ACTOR=" & ver >nul'
     : "export STQL_SESSION=terminal-next; unset STQL_ACTOR";
 
+  const switchToMongo = windows
+    ? 'set "STQL_SESSION=terminal-mongo" & set "STQL_ACTOR=terminal-mongo" & ver >nul'
+    : "export STQL_SESSION=terminal-mongo STQL_ACTOR=terminal-mongo";
+  const switchToSql = windows
+    ? 'set "STQL_SESSION=pty-test" & set "STQL_ACTOR=terminal-actor" & ver >nul'
+    : "export STQL_SESSION=pty-test STQL_ACTOR=terminal-actor";
   const steps: TerminalStep[] = [
     {
       label: "help",
@@ -443,6 +462,72 @@ function scenario(): TerminalStep[] {
       expect: /"sqlite"/,
     },
     {
+      label: "switch to MongoDB session",
+      command: switchToMongo,
+      machineOutput: false,
+    },
+    {
+      label: "verify MongoDB session",
+      command: stql("status"),
+      expect: /"driver":"mongodb"/,
+    },
+    {
+      label: "query MongoDB in terminal",
+      command: stql("mongo", "query", JSON.stringify(mongoQuery)),
+      commandId: "mongo.query",
+      expect: /"name":"Mongo Ada"/,
+    },
+    {
+      label: "plan MongoDB write in terminal",
+      command: stql(
+        "mongo",
+        "plan",
+        JSON.stringify({
+          operation: "insertOne",
+          collection: "terminal_items",
+          document: { name: "Mongo Grace" },
+        }),
+      ),
+      commandId: "mongo.plan",
+      expect: /"statement_type":"mongo.insertOne"/,
+    },
+    {
+      label: "begin MongoDB transaction",
+      command: stql("transaction", "begin"),
+      capture: "mongoTransaction",
+      expect: /"isolation_level":"snapshot"/,
+    },
+    {
+      label: "stage MongoDB write in terminal",
+      command: stql(
+        "mongo",
+        "exec",
+        JSON.stringify({
+          operation: "insertOne",
+          collection: "terminal_items",
+          document: { name: "Mongo Linus" },
+        }),
+      ),
+      commandId: "mongo.exec",
+      expect: /"committed":false/,
+    },
+    {
+      label: "roll back MongoDB transaction",
+      command: (state) =>
+        stql("transaction", "rollback", required(state, "mongoTransaction")),
+      expect: /"state":"rolled_back"/,
+    },
+    {
+      label: "restore SQLite session",
+      command: switchToSql,
+      machineOutput: false,
+    },
+    {
+      label: "verify SQLite session restored",
+      command: stql("status"),
+      expect: /"driver":"sqlite"/,
+    },
+    {
       label: "run batch sequence",
       command: stql("batch", batchFile),
       commandId: "batch",
@@ -706,6 +791,44 @@ if (process.env.STQL_PTY_DRIVER === "1") {
     const owner = new StateQL({ home, session: "pty-test" });
     await succeed(owner.linkActor("pty-test", "terminal-actor"));
     owner.close();
+    const mongo = new StateQL({ home, session: "terminal-mongo" });
+    const mongoStore = (mongo as unknown as { store: StateStore }).store;
+    const mongoSnapshot = mongo.snapshot();
+    const mongoConnection = mongoStore.addConnection({
+      sessionId: mongoSnapshot.session.session_id,
+      actorId: mongoSnapshot.actor_id,
+      name: "terminal-mongo",
+      driver: "mongodb",
+      databaseName: "terminal",
+      source: "mongodb://localhost:27017/terminal",
+      readOnly: false,
+    });
+    assert.ok(mongoConnection);
+    const serializedMongoQuery = serializeMongoCommand(mongoQuery);
+    mongoStore.saveResult({
+      sessionId: mongoSnapshot.session.session_id,
+      connectionId: mongoConnection.id,
+      fingerprint: hash({
+        command: serializedMongoQuery,
+        driver: "mongodb",
+        connection: mongoConnection.id,
+        database: "terminal",
+        transaction: null,
+        stateVersion: "sv_0",
+      }),
+      sql: "MongoDB native find",
+      parameters: [serializedMongoQuery],
+      rows: [{ name: "Mongo Ada", status: "ready" }],
+      columns: [
+        { name: "name", type: "string" },
+        { name: "status", type: "string" },
+      ],
+      stateVersion: "sv_0",
+      stateSignature: "mongodb:ttl",
+      stateConfidence: "ttl_based",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    mongo.close();
     writeFileSync(
       batchFile,
       JSON.stringify([

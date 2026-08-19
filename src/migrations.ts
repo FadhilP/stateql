@@ -65,6 +65,15 @@ const MIGRATIONS: Migration[] = [
       requireColumns(db, "history", ["sql"]);
     },
   },
+  {
+    name: "operation_outcomes_v1",
+    apply(db) {
+      addColumn(db, "operations", "outcome_json", "TEXT");
+    },
+    validate(db) {
+      requireColumns(db, "operations", ["outcome_json"]);
+    },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -184,6 +193,7 @@ function createInitialSchema(db: DatabaseSync): void {
       idempotency_key TEXT,
       state_version_before TEXT NOT NULL,
       state_version_after TEXT,
+      outcome_json TEXT,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS operations_fingerprint

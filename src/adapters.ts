@@ -10,6 +10,7 @@ import {
 } from "mysql2";
 import type { Connection as MySqlConnection } from "mysql2/promise";
 import { Client, types as pgTypes, type QueryResult } from "pg";
+import { StateQLError } from "./errors.js";
 import type { Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
 import { isSqlParameters, parseJson, toJsonSafe } from "./util.js";
@@ -61,6 +62,7 @@ export class AdapterWriteError extends Error {
 
 export interface Adapter {
   readonly confidence: StateConfidence;
+  ping(): Promise<void>;
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
   write(sql: string, params: SqlParameters): Promise<WriteResult>;
   writeBatch(
@@ -88,13 +90,19 @@ export async function createAdapter(
   input: { source: string },
 ): Promise<Adapter> {
   const { source } = input;
-  if (connection.driver === "sqlite") {
-    return new SQLiteAdapter(source, Boolean(connection.read_only), context);
+  switch (connection.driver) {
+    case "sqlite":
+      return new SQLiteAdapter(source, Boolean(connection.read_only), context);
+    case "postgres":
+      return new PostgresAdapter(source, Boolean(connection.read_only), context);
+    case "mysql":
+      return new MySqlAdapter(source, Boolean(connection.read_only), context);
+    case "mongodb":
+      throw new StateQLError(
+        "UNSUPPORTED_DRIVER",
+        "MongoDB uses the native MongoDB adapter.",
+      );
   }
-  if (connection.driver === "postgres") {
-    return new PostgresAdapter(source, Boolean(connection.read_only), context);
-  }
-  return new MySqlAdapter(source, Boolean(connection.read_only), context);
 }
 
 interface SQLiteResponse {
@@ -161,6 +169,10 @@ class SQLiteAdapter implements Adapter {
         );
       }
     });
+  }
+
+  async ping(): Promise<void> {
+    await this.read("SELECT 1", []);
   }
 
   async read(sql: string, params: SqlParameters): Promise<ReadResult> {
@@ -321,6 +333,10 @@ class PostgresAdapter implements Adapter {
       connectionTimeoutMillis: timeout,
       statement_timeout: timeout,
     });
+  }
+
+  async ping(): Promise<void> {
+    await this.read("SELECT 1", []);
   }
 
   async read(sql: string, params: SqlParameters): Promise<ReadResult> {
@@ -581,6 +597,10 @@ class MySqlAdapter implements Adapter {
     private readonly readOnly: boolean,
     private readonly context: AdapterContext,
   ) {}
+
+  async ping(): Promise<void> {
+    await this.read("SELECT 1", []);
+  }
 
   async read(sql: string, params: SqlParameters): Promise<ReadResult> {
     await this.query("START TRANSACTION READ ONLY", [], false, false);

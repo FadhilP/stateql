@@ -15,13 +15,41 @@ export function databaseIdentity(connection: ConnectionRecord): unknown {
 export function detectDriver(target: string): Driver {
   if (/^postgres(?:ql)?:\/\//i.test(target)) return "postgres";
   if (/^mysql:\/\//i.test(target)) return "mysql";
+  if (/^mongodb(?:\+srv)?:\/\//i.test(target)) return "mongodb";
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(target)) {
     throw new StateQLError(
       "UNSUPPORTED_DRIVER",
-      "Only MySQL, PostgreSQL, and SQLite are supported.",
+      "Only MongoDB, MySQL, PostgreSQL, and SQLite are supported.",
     );
   }
   return "sqlite";
+}
+
+export function mongoDatabaseName(target: string): string {
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    throw new StateQLError("INVALID_COMMAND", "Invalid MongoDB URL.");
+  }
+  if (
+    !["mongodb:", "mongodb+srv:"].includes(url.protocol.toLowerCase()) ||
+    !url.hostname
+  ) {
+    throw new StateQLError("INVALID_COMMAND", "Invalid MongoDB URL.");
+  }
+  try {
+    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+    if (database && !database.includes("/") && !database.includes("\0")) {
+      return database;
+    }
+  } catch {
+    // Report malformed escaping as an invalid explicit database name.
+  }
+  throw new StateQLError(
+    "INVALID_COMMAND",
+    "MongoDB URL must include an explicit database name.",
+  );
 }
 
 export function credentialSource(
@@ -33,7 +61,7 @@ export function credentialSource(
   if (driver === "sqlite" && (!explicitSqlite || value.length === 7)) {
     throw new StateQLError(
       "INVALID_COMMAND",
-      "Secret environment variable must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source.",
+      "Secret environment variable must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source; MongoDB URLs are also supported.",
       {
         suggestedAction:
           "Store the full database URL, or prefix an SQLite path with sqlite:.",
@@ -78,6 +106,7 @@ export function databaseUrlHasSecret(target: string): boolean {
   try {
     const url = new URL(target);
     return (
+      Boolean(url.username) ||
       Boolean(url.password) ||
       [...url.searchParams.keys()].some((key) =>
         /pass|token|secret|private[_-]?key|api[_-]?key/i.test(key),

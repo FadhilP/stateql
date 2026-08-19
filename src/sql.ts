@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import type { AST } from "node-sql-parser";
 import { StateQLError } from "./errors.js";
-import type { Driver } from "./types.js";
+import type { Driver, SqlDriver } from "./types.js";
 
 const { Parser } = createRequire(import.meta.url)(
   "node-sql-parser",
@@ -41,7 +41,13 @@ export interface SqlAnalysis {
   ordered: boolean;
 }
 
+export function analyzeSql(sql: string, driver: SqlDriver): SqlAnalysis;
+/** @internal Compatibility for existing connection records during Mongo rollout. */
+export function analyzeSql(sql: string, driver: Driver): SqlAnalysis;
 export function analyzeSql(sql: string, driver: Driver): SqlAnalysis {
+  if (driver === "mongodb") {
+    throw new StateQLError("INVALID_SQL", "SQL is not supported for MongoDB connections.");
+  }
   const trimmed = sql.trim();
   if (!trimmed) throw new StateQLError("INVALID_SQL", "SQL is empty.");
 

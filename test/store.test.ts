@@ -498,7 +498,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
   const database = new DatabaseSync(join(home, "state.sqlite"));
   assert.deepEqual(
     (database.prepare("SELECT name FROM schema_migrations ORDER BY rowid").all() as Array<{ name: string }>).map((row) => row.name),
-    ["initial_schema_v1", "shared_session_actors_v1", "history_sql_v1"],
+    ["initial_schema_v1", "shared_session_actors_v1", "history_sql_v1", "operation_outcomes_v1"],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
   database.exec("ALTER TABLE plans DROP COLUMN claim_token");

@@ -366,7 +366,7 @@ test("schema inspection and secret handling stay machine-safe", async () => {
   assert.equal(inspected.columns[0].nullable, false);
   assert.deepEqual(
     (await succeed(fixture.stateql.capabilities())).drivers,
-    ["mysql", "postgres", "sqlite"],
+    ["mongodb", "mysql", "postgres", "sqlite"],
   );
 
   for (const target of [

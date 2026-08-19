@@ -7,6 +7,7 @@ import { StateQLError } from "./errors.js";
 import type {
   Column,
   Driver,
+  MongoWriteOutcome,
   Row,
   SqlParameters,
   StateConfidence,
@@ -88,6 +89,7 @@ export interface OperationRecord {
   idempotency_key: string | null;
   state_version_before: string;
   state_version_after: string | null;
+  outcome_json: string | null;
   created_at: string;
 }
 
@@ -841,14 +843,16 @@ export class StateStore {
     operationId: string,
     affectedRows: number,
     stateVersion: string,
+    outcome?: MongoWriteOutcome,
   ): OperationRecord {
     this.db
       .prepare(
         `UPDATE operations
-         SET status = 'committed', affected_rows = ?, state_version_after = ?
+         SET status = 'committed', affected_rows = ?, state_version_after = ?,
+             outcome_json = ?
          WHERE id = ?`,
       )
-      .run(affectedRows, stateVersion, operationId);
+      .run(affectedRows, stateVersion, outcomeJson(outcome), operationId);
     return this.getOperation(operationId)!;
   }
 
@@ -1105,7 +1109,11 @@ export class StateStore {
     sessionId: string;
     actorId: string;
     connectionId: string;
-    operations: Array<{ id: string; affectedRows: number }>;
+    operations: Array<{
+      id: string;
+      affectedRows: number;
+      outcome?: MongoWriteOutcome;
+    }>;
   }): string {
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
@@ -1143,10 +1151,16 @@ export class StateStore {
         this.db
           .prepare(
             `UPDATE operations
-             SET status = 'committed', affected_rows = ?, state_version_after = ?
+             SET status = 'committed', affected_rows = ?, state_version_after = ?,
+                 outcome_json = ?
              WHERE id = ?`,
           )
-          .run(operation.affectedRows, stateVersion, operation.id);
+          .run(
+            operation.affectedRows,
+            stateVersion,
+            outcomeJson(operation.outcome),
+            operation.id,
+          );
       }
       this.db
         .prepare(
@@ -1252,6 +1266,7 @@ export class StateStore {
     operationId: string;
     connectionId: string;
     affectedRows: number;
+    outcome?: MongoWriteOutcome;
   }): { operation: OperationRecord; stateVersion: string } {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1283,10 +1298,16 @@ export class StateStore {
       this.db
         .prepare(
           `UPDATE operations
-           SET status = 'committed', affected_rows = ?, state_version_after = ?
+           SET status = 'committed', affected_rows = ?, state_version_after = ?,
+               outcome_json = ?
            WHERE id = ?`,
         )
-        .run(input.affectedRows, stateVersion, input.operationId);
+        .run(
+          input.affectedRows,
+          stateVersion,
+          outcomeJson(input.outcome),
+          input.operationId,
+        );
       this.db
         .prepare(
           `UPDATE plans SET applied_operation_id = ?, claim_token = NULL
@@ -1619,6 +1640,10 @@ export class StateStore {
       throw error;
     }
   }
+}
+
+function outcomeJson(outcome: MongoWriteOutcome | undefined): string | null {
+  return outcome === undefined ? null : JSON.stringify(toJsonSafe(outcome));
 }
 
 function boundedHistorySql(sql: string | undefined): string | null {

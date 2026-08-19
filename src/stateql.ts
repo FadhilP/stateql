@@ -17,6 +17,7 @@ import {
   databaseUrlHasSecret,
   detectDriver,
   isEnvironmentName,
+  mongoDatabaseName,
   normalizeSqliteSource,
   validateProfileName,
   version,
@@ -26,6 +27,14 @@ import {
   CredentialResolutionError,
   StateQLError,
 } from "./errors.js";
+import {
+  analyzeMongoWriteSafety,
+  deserializeMongoWriteCommand,
+  serializeMongoCommand,
+  validateMongoReadCommand,
+  validateMongoWriteCommand,
+  MongoAdapter,
+} from "./mongodb.js";
 import {
   filterMaterializedRows,
   prepareFilterStatement,
@@ -44,6 +53,7 @@ import {
   StateStore,
   type ConnectionRecord,
   type HistoryRecord,
+  type OperationRecord,
   type ResultRecord,
   type SessionRecord,
 } from "./store.js";
@@ -83,6 +93,12 @@ import type {
   ProfileData,
   ProfilesData,
   ProfileOptions,
+  MongoExecOptions,
+  MongoPlanOptions,
+  MongoQueryOptions,
+  MongoReadCommand,
+  MongoWriteCommand,
+  MongoWriteOutcome,
   PurgeData,
   QueryOptions,
   RemovedProfileData,
@@ -324,7 +340,9 @@ export class StateQL {
       const databaseName =
         driver === "sqlite"
           ? basename(adapterSource)
-          : new URL(secret).pathname.replace(/^\//, "") || driver;
+          : driver === "mongodb"
+            ? mongoDatabaseName(adapterSource)
+            : new URL(secret).pathname.replace(/^\//, "") || driver;
       const draft: ConnectionRecord = {
         id: "pending",
         session_id: session.id,
@@ -338,9 +356,11 @@ export class StateQL {
         created_at: this.now().toISOString(),
       };
 
-      const adapter = await this.openAdapter(draft, context, adapterSource);
+      const adapter = driver === "mongodb"
+        ? await this.openMongoAdapter(draft, context, adapterSource)
+        : await this.openAdapter(draft, context, adapterSource);
       try {
-        await adapter.read("SELECT 1", []);
+        await adapter.ping();
       } catch (error) {
         if (error instanceof AdapterExecutionError) {
           throw stoppedStateQLError(error, false);
@@ -795,6 +815,7 @@ export class StateQL {
   async query(sql: string, options: QueryOptions = {}): Promise<Response<ResultData>> {
     return this.run("query", async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectMongoSql(connection, "mongoQuery");
       this.rejectDuringStagedTransaction(session, "Queries");
       const analysis = analyzeSql(sql, connection.driver);
       if (!analysis.read) {
@@ -916,6 +937,124 @@ export class StateQL {
         await closeAdapterQuietly(adapter);
       }
     }, sql);
+  }
+
+  async mongoQuery(
+    command: MongoReadCommand,
+    options: MongoQueryOptions = {},
+  ): Promise<Response<ResultData>> {
+    return this.run("mongo.query", async (session) => {
+      const value = validatedMongoRead(command);
+      const serializedCommand = serializeMongoCommand(value);
+      const connection = this.requireMongoConnection(session, "mongoQuery");
+      this.rejectDuringStagedTransaction(session, "MongoDB queries");
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
+        connection,
+        session,
+        "query",
+        "read",
+        context,
+      );
+      const adapter = await this.openMongoAdapter(
+        connection,
+        context,
+        adapterSource,
+      );
+      try {
+        const stateVersion = version(connection);
+        const stateSignature = await adapter.signature();
+        const fingerprint = hash({
+          command: serializedCommand,
+          driver: connection.driver,
+          connection: connection.id,
+          database: connection.database_name,
+          transaction: session.active_transaction_id,
+          stateVersion,
+        });
+        const cached = this.store.findResult(fingerprint);
+        const cacheMode = options.cache ?? "auto";
+        const warnings = mongoPaginationWarnings(value);
+        if (
+          cacheMode !== "bypass" &&
+          cached &&
+          cached.row_count <= this.maxResultRows &&
+          this.cacheValid(cached, stateVersion, stateSignature)
+        ) {
+          return {
+            data: this.resultData(cached, true),
+            handle: cached.id,
+            cached: true,
+            warnings,
+            stateVersion,
+            confidence: cached.state_confidence,
+          };
+        }
+        if (cacheMode === "require") {
+          throw new StateQLError("CACHE_MISS", "No valid cached result exists.", {
+            retryable: true,
+            suggestedAction: "Run with cache auto or cache bypass.",
+          });
+        }
+
+        const result = await adapter.read(value, this.maxResultRows + 1);
+        if (result.rows.length > this.maxResultRows) {
+          throw new StateQLError(
+            "OUTPUT_LIMIT_EXCEEDED",
+            `Query exceeds the ${this.maxResultRows}-row materialization limit.`,
+            { suggestedAction: "Use a narrower filter or limit." },
+          );
+        }
+        const parameters: SqlParameters = [serializedCommand];
+        const resultBytes =
+          Buffer.byteLength(JSON.stringify(parameters), "utf8") +
+          Buffer.byteLength(JSON.stringify(result.rows), "utf8") +
+          Buffer.byteLength(JSON.stringify(result.columns), "utf8");
+        if (resultBytes > this.maxResultBytes) {
+          throw new StateQLError(
+            "OUTPUT_LIMIT_EXCEEDED",
+            `Query exceeds the ${this.maxResultBytes}-byte materialization limit.`,
+            { suggestedAction: "Return fewer or smaller documents." },
+          );
+        }
+        const expiresAt = new Date(
+          this.now().getTime() + this.resultTtlSeconds * 1000,
+        ).toISOString();
+        const saved = this.store.saveResult({
+          sessionId: session.id,
+          connectionId: connection.id,
+          fingerprint,
+          sql: mongoDescriptor(value.operation),
+          parameters,
+          rows: result.rows,
+          columns: result.columns,
+          stateVersion,
+          stateSignature,
+          stateConfidence: adapter.confidence,
+          expiresAt,
+        });
+        return {
+          data: this.resultData(saved, false),
+          handle: saved.id,
+          executed: true,
+          warnings,
+          stateVersion,
+          confidence: adapter.confidence,
+        };
+      } catch (error) {
+        if (error instanceof StateQLError) throw error;
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          { retryable: true, executed: true },
+        );
+      } finally {
+        await closeAdapterQuietly(adapter);
+      }
+    });
   }
 
   async show(idOrAlias: string): Promise<Response<ResultData>> {
@@ -1089,6 +1228,7 @@ export class StateQL {
   async exec(sql: string, options: ExecOptions = {}): Promise<Response<ExecData>> {
     return this.run("exec", async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectMongoSql(connection, "mongoExec");
       return this.performExec(
         session,
         connection,
@@ -1097,6 +1237,23 @@ export class StateQL {
         this.executionContext(options),
       );
     }, sql);
+  }
+
+  async mongoExec(
+    command: MongoWriteCommand,
+    options: MongoExecOptions = {},
+  ): Promise<Response<ExecData>> {
+    return this.run("mongo.exec", async (session) => {
+      const value = validatedMongoWrite(command);
+      const connection = this.requireMongoConnection(session, "mongoExec");
+      return this.performMongoExec(
+        session,
+        connection,
+        value,
+        options,
+        this.executionContext(options),
+      );
+    });
   }
 
   async receipt(id: string): Promise<Response<OperationData>> {
@@ -1118,7 +1275,7 @@ export class StateQL {
   }
 
   async beginTransaction(
-    isolation = "serializable",
+    isolation?: string,
   ): Promise<Response<TransactionData>> {
     return this.run("transaction.begin", async (session) => {
       const connection = this.requireConnection(session);
@@ -1135,7 +1292,7 @@ export class StateQL {
         );
       }
       const normalizedIsolation = normalizeIsolation(
-        isolation,
+        isolation ?? (connection.driver === "mongodb" ? "snapshot" : "serializable"),
         connection.driver,
       );
       const transaction = this.store.createTransaction({
@@ -1207,6 +1364,24 @@ export class StateQL {
       // Validate durable payloads before opening a database adapter or changing
       // the transaction state.
       const operations = this.store.validatedTransactionOperations(transaction.id);
+      if (operations.some((operation) => operation.connection_id !== connection.id)) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Transaction contains writes staged for another connection.",
+        );
+      }
+      const mongoCommands = connection.driver === "mongodb"
+        ? operations.map(storedMongoOperation)
+        : undefined;
+      if (
+        connection.driver !== "mongodb" &&
+        operations.some((operation) => operation.statement_type.startsWith("mongo."))
+      ) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Transaction contains native MongoDB writes for a SQL connection.",
+        );
+      }
       const context = this.executionContext(options);
       const adapterSource = await this.resolveConnectionSource(
         connection,
@@ -1215,11 +1390,9 @@ export class StateQL {
         "write",
         context,
       );
-      const adapter = await this.openAdapter(
-        connection,
-        context,
-        adapterSource,
-      );
+      const adapter = connection.driver === "mongodb"
+        ? await this.openMongoAdapter(connection, context, adapterSource)
+        : await this.openAdapter(connection, context, adapterSource);
       try {
         if (
           !this.store.claimTransactionForCommit(
@@ -1234,29 +1407,21 @@ export class StateQL {
             "Transaction is no longer active.",
           );
         }
-        if (
-          operations.some(
-            (operation) => operation.connection_id !== connection.id,
-          )
-        ) {
-          this.store.finishTransaction(
-            transaction.id,
-            session.id,
-            this.actorId,
-            "failed",
-          );
-          throw new StateQLError(
-            "TRANSACTION_FAILED",
-            "Transaction contains writes staged for another connection.",
-          );
-        }
 
-        let results;
+        let results: Array<{
+          affectedRows: number;
+          outcome?: MongoWriteOutcome;
+        }>;
         try {
-          results = await adapter.writeBatch(
-            operations,
-            transaction.isolation_level,
-          );
+          results = mongoCommands
+            ? await (adapter as MongoAdapter).writeBatch(
+                mongoCommands,
+                transaction.isolation_level,
+              )
+            : await (adapter as Adapter).writeBatch(
+                operations,
+                transaction.isolation_level,
+              );
         } catch (error) {
           if (
             (error instanceof BatchWriteError && !error.outcomeUnknown) ||
@@ -1322,6 +1487,9 @@ export class StateQL {
             operations: operations.map((operation, index) => ({
               id: operation.id,
               affectedRows: results[index]!.affectedRows,
+              ...(results[index]!.outcome
+                ? { outcome: results[index]!.outcome }
+                : {}),
             })),
           });
         } catch (error) {
@@ -1414,11 +1582,9 @@ export class StateQL {
         "read",
         context,
       );
-      const adapter = await this.openAdapter(
-        connection,
-        context,
-        adapterSource,
-      );
+      const adapter = connection.driver === "mongodb"
+        ? await this.openMongoAdapter(connection, context, adapterSource)
+        : await this.openAdapter(connection, context, adapterSource);
       try {
         const data = await adapter.inspect(kind, table);
         return {
@@ -1448,6 +1614,7 @@ export class StateQL {
   async plan(sql: string, options: PlanOptions = {}): Promise<Response<PlanData>> {
     return this.run("plan", async (session) => {
       const connection = this.requireConnection(session);
+      this.rejectMongoSql(connection, "mongoPlan");
       this.rejectDuringStagedTransaction(session, "Plans");
       const analysis = analyzeSql(sql, connection.driver);
       if (analysis.read) {
@@ -1527,6 +1694,87 @@ export class StateQL {
     }, sql);
   }
 
+  async mongoPlan(
+    command: MongoWriteCommand,
+    options: MongoPlanOptions = {},
+  ): Promise<Response<PlanData>> {
+    return this.run("mongo.plan", async (session) => {
+      const value = validatedMongoWrite(command);
+      const serializedCommand = serializeMongoCommand(value);
+      const connection = this.requireMongoConnection(session, "mongoPlan");
+      this.rejectDuringStagedTransaction(session, "Plans");
+      const safety = analyzeMongoWriteSafety(value);
+      const context = this.executionContext(options);
+      const adapterSource = await this.resolveConnectionSource(
+        connection,
+        session,
+        "plan",
+        "read",
+        context,
+      );
+      const adapter = await this.openMongoAdapter(
+        connection,
+        context,
+        adapterSource,
+      );
+      try {
+        const stateSignature = await adapter.signature();
+        const expiresAt = new Date(this.now().getTime() + 10 * 60_000).toISOString();
+        const plan = this.store.savePlan({
+          sessionId: session.id,
+          ownerActorId: this.actorId,
+          connectionId: connection.id,
+          sql: mongoDescriptor(value.operation),
+          parameters: [serializedCommand],
+          statementType: `mongo.${value.operation}`,
+          stateVersion: version(connection),
+          stateSignature,
+          destructive: safety.destructive || safety.unbounded,
+          allowUnbounded: options.allowUnbounded ?? false,
+          allowDestructive: options.allowDestructive ?? false,
+          expiresAt,
+        });
+        return {
+          data: {
+            plan_id: plan.id,
+            statement_type: plan.statement_type,
+            destructive: Boolean(plan.destructive),
+            requires_confirmation:
+              (safety.unbounded && !Boolean(plan.allow_unbounded)) ||
+              (safety.destructive && !Boolean(plan.allow_destructive)),
+            required_overrides: [
+              ...(safety.unbounded && !Boolean(plan.allow_unbounded)
+                ? ["--allow-unbounded"]
+                : []),
+              ...(safety.destructive && !Boolean(plan.allow_destructive)
+                ? ["--allow-destructive"]
+                : []),
+            ],
+            state_version: plan.state_version,
+            owner_actor_id: plan.owner_actor_id,
+            expires_at: plan.expires_at,
+          },
+          handle: plan.id,
+          executed: true,
+          stateVersion: plan.state_version,
+          confidence: adapter.confidence,
+        };
+      } catch (error) {
+        if (error instanceof StateQLError) throw error;
+        if (error instanceof AdapterExecutionError) {
+          throw stoppedStateQLError(error, true);
+        }
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          { retryable: true, executed: true },
+        );
+      } finally {
+        await closeAdapterQuietly(adapter);
+      }
+    });
+  }
+
   async apply(
     planId: string,
     options: ExecutionOptions = {},
@@ -1552,12 +1800,18 @@ export class StateQL {
       if (Date.parse(plan.expires_at) <= this.now().getTime()) {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
-      historySql = plan.sql;
-      const planParameters = parseJson<SqlParameters>(
-        plan.parameters,
-        `plan "${plan.id}" parameters`,
-        isSqlParameters,
-      );
+      const nativePlan = plan.statement_type.startsWith("mongo.");
+      historySql = nativePlan ? undefined : plan.sql;
+      const mongoCommand = nativePlan
+        ? storedMongoPlan(plan.parameters, plan.statement_type, plan.id)
+        : undefined;
+      const planParameters = nativePlan
+        ? undefined
+        : parseJson<SqlParameters>(
+            plan.parameters,
+            `plan "${plan.id}" parameters`,
+            isSqlParameters,
+          );
       const claimToken = this.store.nextId("claim");
       const claimed = this.store.claimPlan(
         plan.id,
@@ -1581,6 +1835,15 @@ export class StateQL {
             "Database state changed after this plan was created.",
           );
         }
+        if (nativePlan && connection.driver !== "mongodb") {
+          throw new StateQLError(
+            "STALE_PLAN",
+            "MongoDB plan is not attached to a MongoDB connection.",
+          );
+        }
+        if (!nativePlan && connection.driver === "mongodb") {
+          this.rejectMongoSql(connection, "mongoPlan");
+        }
         const context = this.executionContext(options);
         const adapterSource = await this.resolveConnectionSource(
           connection,
@@ -1589,11 +1852,9 @@ export class StateQL {
           "write",
           context,
         );
-        const adapter = await this.openAdapter(
-          connection,
-          context,
-          adapterSource,
-        );
+        const adapter = nativePlan
+          ? await this.openMongoAdapter(connection, context, adapterSource)
+          : await this.openAdapter(connection, context, adapterSource);
         try {
           if ((await adapter.signature()) !== claimed.state_signature) {
             throw new StateQLError(
@@ -1614,19 +1875,32 @@ export class StateQL {
         } finally {
           await closeAdapterQuietly(adapter);
         }
-        const result = await this.performExec(
-          session,
-          connection,
-          claimed.sql,
-          {
-            params: planParameters,
-            allowUnbounded: Boolean(claimed.allow_unbounded),
-            allowDestructive: Boolean(claimed.allow_destructive),
-          },
-          context,
-          { planId: claimed.id, claimToken },
-          adapterSource,
-        );
+        const result = mongoCommand
+          ? await this.performMongoExec(
+              session,
+              connection,
+              mongoCommand,
+              {
+                allowUnbounded: Boolean(claimed.allow_unbounded),
+                allowDestructive: Boolean(claimed.allow_destructive),
+              },
+              context,
+              { planId: claimed.id, claimToken },
+              adapterSource,
+            )
+          : await this.performExec(
+              session,
+              connection,
+              claimed.sql,
+              {
+                params: planParameters,
+                allowUnbounded: Boolean(claimed.allow_unbounded),
+                allowDestructive: Boolean(claimed.allow_destructive),
+              },
+              context,
+              { planId: claimed.id, claimToken },
+              adapterSource,
+            );
         return {
           ...result,
           data: { plan_id: claimed.id, ...result.data },
@@ -1684,7 +1958,7 @@ export class StateQL {
   async capabilities(): Promise<Response<CapabilitiesData>> {
     return this.run("capabilities", async () => ({
       data: {
-        drivers: ["mysql", "postgres", "sqlite"],
+        drivers: ["mongodb", "mysql", "postgres", "sqlite"],
         features: {
           result_handles: true,
           write_deduplication: true,
@@ -1699,6 +1973,17 @@ export class StateQL {
           state_diagnostics: true,
           state_purge: true,
           state_quota: true,
+        },
+        driver_features: {
+          mongodb: {
+            sql: false,
+            native_read: true,
+            native_write: true,
+            plans: true,
+            transactions: true,
+            transactions_require_replica_set: true,
+            inspection: true,
+          },
         },
       },
     }));
@@ -1763,6 +2048,23 @@ export class StateQL {
             data: { ...response.data, alias: command.as },
           };
         }
+        case "mongo.query": {
+          const response = await this.mongoQuery(
+            command.mongo as MongoReadCommand,
+            {
+              cache: command.cache ?? "auto",
+              timeoutMs: command.timeout_ms,
+            },
+          );
+          if (!response.ok || !command.as) return response;
+          const resultId = response.data.result_id;
+          if (typeof resultId !== "string") return response;
+          this.store.setAlias(response.session_id, command.as, resultId);
+          return {
+            ...response,
+            data: { ...response.data, alias: command.as },
+          };
+        }
         case "filter": {
           const response = await this.filter(
             batchString(command.handle, "handle"),
@@ -1781,6 +2083,14 @@ export class StateQL {
         case "exec":
           return this.exec(batchString(command.sql, "sql"), {
             params: command.params ?? [],
+            replay: command.replay ?? false,
+            idempotencyKey: command.idempotency_key,
+            allowUnbounded: command.allow_unbounded ?? false,
+            allowDestructive: command.allow_destructive ?? false,
+            timeoutMs: command.timeout_ms,
+          });
+        case "mongo.exec":
+          return this.mongoExec(command.mongo as MongoWriteCommand, {
             replay: command.replay ?? false,
             idempotencyKey: command.idempotency_key,
             allowUnbounded: command.allow_unbounded ?? false,
@@ -1820,6 +2130,12 @@ export class StateQL {
         case "plan":
           return this.plan(batchString(command.sql, "sql"), {
             params: command.params ?? [],
+            allowUnbounded: command.allow_unbounded ?? false,
+            allowDestructive: command.allow_destructive,
+            timeoutMs: command.timeout_ms,
+          });
+        case "mongo.plan":
+          return this.mongoPlan(command.mongo as MongoWriteCommand, {
             allowUnbounded: command.allow_unbounded ?? false,
             allowDestructive: command.allow_destructive,
             timeoutMs: command.timeout_ms,
@@ -1882,6 +2198,7 @@ export class StateQL {
     planClaim?: { planId: string; claimToken: string },
     resolvedSource?: string,
   ): Promise<ActionResult<ExecData>> {
+    this.rejectMongoSql(connection, "mongoExec");
     if (connection.read_only) {
       throw new StateQLError(
         "READ_ONLY_CONNECTION",
@@ -2143,6 +2460,279 @@ export class StateQL {
     }
   }
 
+  private async performMongoExec(
+    session: SessionRecord,
+    connection: ConnectionRecord,
+    command: MongoWriteCommand,
+    options: MongoExecOptions,
+    context: AdapterContext,
+    planClaim?: { planId: string; claimToken: string },
+    resolvedSource?: string,
+  ): Promise<ActionResult<ExecData>> {
+    const value = validatedMongoWrite(command);
+    if (connection.driver !== "mongodb") {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        "mongoExec requires an active MongoDB connection.",
+      );
+    }
+    if (connection.read_only) {
+      throw new StateQLError(
+        "READ_ONLY_CONNECTION",
+        "Connection is read-only.",
+        { suggestedAction: "Reconnect with --read-write." },
+      );
+    }
+    const safety = analyzeMongoWriteSafety(value);
+    if (safety.unbounded && !options.allowUnbounded) {
+      throw new StateQLError(
+        "UNBOUNDED_MUTATION",
+        "MongoDB mutation has an empty filter.",
+        { extra: { override_flag: "--allow-unbounded" } },
+      );
+    }
+    if (safety.destructive && !options.allowDestructive) {
+      throw new StateQLError(
+        "DESTRUCTIVE_OPERATION_BLOCKED",
+        "Destructive MongoDB operation requires an explicit override.",
+        { extra: { override_flag: "--allow-destructive" } },
+      );
+    }
+    if (
+      options.idempotencyKey !== undefined &&
+      !options.idempotencyKey.trim()
+    ) {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        "Idempotency key cannot be empty.",
+      );
+    }
+
+    const serializedCommand = serializeMongoCommand(value);
+    const parameters: SqlParameters = [serializedCommand];
+    const fingerprint = hash({
+      command: serializedCommand,
+      database: databaseIdentity(connection),
+    });
+    const transactionId = session.active_transaction_id ?? undefined;
+    if (transactionId) {
+      const transaction = this.store.getTransaction(transactionId);
+      if (
+        !transaction ||
+        transaction.session_id !== session.id ||
+        transaction.state !== "active" ||
+        transaction.connection_id !== connection.id
+      ) {
+        throw new StateQLError(
+          "TRANSACTION_FAILED",
+          "Active transaction does not match the active connection.",
+        );
+      }
+      if (transaction.owner_actor_id !== this.actorId) {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          "Only the transaction owner may stage writes.",
+        );
+      }
+    }
+    const reservation = this.store.reserveOperation({
+      sessionId: session.id,
+      actorId: this.actorId,
+      connectionId: connection.id,
+      fingerprint,
+      sql: mongoDescriptor(value.operation),
+      parameters,
+      statementType: `mongo.${value.operation}`,
+      status: transactionId ? "pending" : "executing",
+      transactionId,
+      replay: options.replay ?? false,
+      idempotencyKey: options.idempotencyKey,
+      stateVersionBefore: version(connection),
+    });
+    if (reservation.denied === "membership") {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        "Actor membership changed before the write was reserved.",
+      );
+    }
+    if (reservation.denied === "transaction") {
+      const active = this.store.getSession(session.id)?.active_transaction_id;
+      const transaction = active ? this.store.getTransaction(active) : undefined;
+      if (transaction && transaction.owner_actor_id !== this.actorId) {
+        throw new StateQLError(
+          "PERMISSION_DENIED",
+          "Only the transaction owner may stage writes.",
+        );
+      }
+      throw new StateQLError(
+        "TRANSACTION_FAILED",
+        "The active transaction changed before the write was reserved.",
+      );
+    }
+    const previous = reservation.previous;
+    if (
+      previous &&
+      options.idempotencyKey &&
+      !options.replay &&
+      previous.fingerprint !== fingerprint
+    ) {
+      throw new StateQLError(
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency key was already used for a different write.",
+        { extra: { previous_operation_id: previous.id } },
+      );
+    }
+    if (previous && !reservation.operation) {
+      if (
+        previous.status === "executing" ||
+        previous.status === "outcome_unknown"
+      ) {
+        throw new StateQLError(
+          "OUTCOME_UNKNOWN",
+          "A matching write has an unknown outcome.",
+          {
+            executed: true,
+            suggestedAction:
+              "Inspect database state, then use --replay only if another execution is safe.",
+            extra: { previous_operation_id: previous.id },
+          },
+        );
+      }
+      if (options.idempotencyKey) {
+        return {
+          data: {
+            ...operationData(previous),
+            duplicate: true,
+            duplicate_of: previous.id,
+            idempotency_key: options.idempotencyKey,
+          },
+          handle: previous.id,
+          cached: true,
+          stateVersion:
+            previous.state_version_after ?? previous.state_version_before,
+        };
+      }
+      throw new StateQLError(
+        "POTENTIAL_DUPLICATE_WRITE",
+        "An equivalent operation was previously applied.",
+        {
+          extra: {
+            previous_operation_id: previous.id,
+            replay_required: true,
+          },
+        },
+      );
+    }
+
+    const operation = reservation.operation!;
+    if (transactionId) {
+      return {
+        data: operationData(operation),
+        handle: operation.id,
+        executed: false,
+        stateVersion: version(connection),
+      };
+    }
+
+    let adapter: MongoAdapter;
+    let adapterSource: string;
+    try {
+      adapterSource =
+        resolvedSource ??
+        (await this.resolveConnectionSource(
+          connection,
+          session,
+          "exec",
+          "write",
+          context,
+        ));
+      adapter = await this.openMongoAdapter(connection, context, adapterSource);
+    } catch (error) {
+      this.store.failOperation(operation.id);
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError("CONNECTION_FAILED", "Database connection failed.", {
+        retryable: true,
+      });
+    }
+
+    try {
+      const write = await adapter.write(value);
+      try {
+        const finalized = planClaim
+          ? this.store.finishPlannedOperation({
+              planId: planClaim.planId,
+              claimToken: planClaim.claimToken,
+              operationId: operation.id,
+              connectionId: connection.id,
+              affectedRows: write.affectedRows,
+              outcome: write.outcome,
+            })
+          : (() => {
+              const stateVersion = this.store.bumpVersion(connection.id);
+              return {
+                operation: this.store.finishOperation(
+                  operation.id,
+                  write.affectedRows,
+                  stateVersion,
+                  write.outcome,
+                ),
+                stateVersion,
+              };
+            })();
+        const committed = finalized.operation;
+        const after = finalized.stateVersion;
+        return {
+          data: {
+            ...operationData(committed),
+            duplicate: Boolean(previous),
+            duplicate_override: Boolean(previous),
+          },
+          handle: committed.id,
+          executed: true,
+          stateVersion: after,
+          confidence: adapter.confidence,
+        };
+      } catch (error) {
+        this.store.markOperationOutcomeUnknown(operation.id);
+        throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), {
+          executed: true,
+          suggestedAction:
+            "Inspect database state before issuing any replacement write.",
+        });
+      }
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      if (error instanceof AdapterExecutionError && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        throw stoppedStateQLError(error, false);
+      }
+      if (error instanceof AdapterWriteError && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        throw new StateQLError(
+          "QUERY_FAILED",
+          safeCredentialErrorMessage(error, adapterSource),
+          { executed: true },
+        );
+      }
+      this.store.markOperationOutcomeUnknown(operation.id);
+      throw new StateQLError(
+        "OUTCOME_UNKNOWN",
+        safeCredentialErrorMessage(error, adapterSource),
+        {
+          executed: true,
+          suggestedAction:
+            "Inspect database state, then use --replay only if another execution is safe.",
+        },
+      );
+    } finally {
+      try {
+        await adapter.close();
+      } catch {
+        // Write outcome and metadata are already recorded.
+      }
+    }
+  }
+
   private batchFailure(message: string): Promise<Response<unknown>> {
     return this.run("batch", async () => {
       throw new StateQLError("INVALID_COMMAND", message);
@@ -2206,6 +2796,32 @@ export class StateQL {
       );
     }
     return connection;
+  }
+
+  private requireMongoConnection(
+    session: SessionRecord,
+    method: "mongoQuery" | "mongoExec" | "mongoPlan",
+  ): ConnectionRecord {
+    const connection = this.requireConnection(session);
+    if (connection.driver !== "mongodb") {
+      throw new StateQLError(
+        "INVALID_COMMAND",
+        `${method} requires an active MongoDB connection.`,
+      );
+    }
+    return connection;
+  }
+
+  private rejectMongoSql(
+    connection: ConnectionRecord,
+    nativeMethod: "mongoQuery" | "mongoExec" | "mongoPlan",
+  ): void {
+    if (connection.driver !== "mongodb") return;
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      `SQL is not supported for MongoDB connections; use ${nativeMethod} instead.`,
+      { suggestedAction: `Use ${nativeMethod} with a native MongoDB command.` },
+    );
   }
 
   private requireActiveTransaction(
@@ -2348,6 +2964,23 @@ export class StateQL {
   ): Promise<Adapter> {
     try {
       return await createAdapter(connection, context, { source });
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError(
+        "CONNECTION_FAILED",
+        safeCredentialErrorMessage(error, source),
+        { retryable: true },
+      );
+    }
+  }
+
+  private async openMongoAdapter(
+    connection: ConnectionRecord,
+    context: AdapterContext,
+    source: string,
+  ): Promise<MongoAdapter> {
+    try {
+      return new MongoAdapter(connection, context, { source });
     } catch (error) {
       if (error instanceof StateQLError) throw error;
       throw new StateQLError(
@@ -2523,9 +3156,101 @@ function boundedReadSql(sql: string, limit: number): string {
   return `SELECT * FROM (${statement}) AS _stateql_bounded LIMIT ${limit}`;
 }
 
+function validatedMongoRead(command: unknown): MongoReadCommand {
+  try {
+    return validateMongoReadCommand(command);
+  } catch (error) {
+    throw new StateQLError("INVALID_COMMAND", errorMessage(error));
+  }
+}
+
+function validatedMongoWrite(command: unknown): MongoWriteCommand {
+  try {
+    return validateMongoWriteCommand(command);
+  } catch (error) {
+    throw new StateQLError("INVALID_COMMAND", errorMessage(error));
+  }
+}
+
+
+function mongoDescriptor(operation: string): string {
+  return `MongoDB native ${operation}`;
+}
+
+function mongoPaginationWarnings(command: MongoReadCommand): Warning[] {
+  const ordered = command.operation === "find"
+    ? command.options?.sort !== undefined
+    : command.pipeline.some((stage) =>
+        Object.prototype.hasOwnProperty.call(stage, "$sort")
+      );
+  return ordered
+    ? []
+    : [{
+        code: "NON_DETERMINISTIC_PAGINATION",
+        message: "MongoDB result has no explicit sort.",
+      }];
+}
+
+function storedMongoOperation(operation: OperationRecord): MongoWriteCommand {
+  if (!operation.statement_type.startsWith("mongo.")) {
+    throw new StateQLError(
+      "TRANSACTION_FAILED",
+      "MongoDB transaction contains a mixed or corrupt native payload.",
+    );
+  }
+  return storedMongoWrite(
+    operation.parameters,
+    operation.statement_type,
+    `operation "${operation.id}"`,
+    "TRANSACTION_FAILED",
+  );
+}
+
+function storedMongoPlan(
+  parameters: string,
+  statementType: string,
+  planId: string,
+): MongoWriteCommand {
+  return storedMongoWrite(
+    parameters,
+    statementType,
+    `plan "${planId}"`,
+    "STALE_PLAN",
+  );
+}
+
+function storedMongoWrite(
+  parameters: string,
+  statementType: string,
+  label: string,
+  errorCode: string,
+): MongoWriteCommand {
+  try {
+    const payload = JSON.parse(parameters) as unknown;
+    if (
+      !Array.isArray(payload) ||
+      payload.length !== 1 ||
+      typeof payload[0] !== "string"
+    ) {
+      throw new Error("payload must contain one EJSON command string");
+    }
+    const command = deserializeMongoWriteCommand(payload[0]);
+    if (statementType !== `mongo.${command.operation}`) {
+      throw new Error("operation does not match its statement type");
+    }
+    return command;
+  } catch {
+    throw new StateQLError(
+      errorCode,
+      `Stored MongoDB ${label} payload is invalid.`,
+    );
+  }
+}
+
 function databaseDisplayName(
   driver: Exclude<ConnectionRecord["driver"], "sqlite">,
 ): string {
+  if (driver === "mongodb") return "MongoDB";
   return driver === "postgres" ? "PostgreSQL" : "MySQL";
 }
 
@@ -2535,6 +3260,13 @@ function normalizeIsolation(
 ): string {
   const normalized = isolation.trim().toLowerCase().replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ");
+  if (driver === "mongodb") {
+    if (normalized === "snapshot") return normalized;
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      `MongoDB does not support isolation level "${normalized}".`,
+    );
+  }
   const supported = new Set([
     "serializable",
     "repeatable read",
@@ -2577,7 +3309,7 @@ function positiveInteger(value: number, name: string): number {
   throw new StateQLError("INVALID_COMMAND", `${name} must be a positive integer.`);
 }
 
-async function closeAdapterQuietly(adapter: Adapter): Promise<void> {
+async function closeAdapterQuietly(adapter: Adapter | MongoAdapter): Promise<void> {
   try {
     await adapter.close();
   } catch {

@@ -1,4 +1,5 @@
-export type Driver = "sqlite" | "postgres" | "mysql";
+export type SqlDriver = "sqlite" | "postgres" | "mysql";
+export type Driver = SqlDriver | "mongodb";
 
 export type CredentialAccess = "read" | "write";
 export type CredentialOperation =
@@ -137,6 +138,90 @@ export interface StateQLSnapshot {
 
 export type SqlParameters = unknown[] | Record<string, unknown>;
 
+export type MongoDocument = Record<string, unknown>;
+
+export interface MongoFindOptions {
+  projection?: MongoDocument;
+  sort?: MongoDocument | Array<[string, 1 | -1]>;
+  skip?: number;
+  limit?: number;
+  hint?: string | MongoDocument;
+  collation?: MongoDocument;
+}
+
+export interface MongoAggregateOptions {
+  allowDiskUse?: boolean;
+  hint?: string | MongoDocument;
+  collation?: MongoDocument;
+}
+
+export interface MongoMutationOptions {
+  upsert?: boolean;
+  collation?: MongoDocument;
+  hint?: string | MongoDocument;
+}
+
+
+export type MongoReadCommand =
+  | {
+      operation: "find";
+      collection: string;
+      filter?: MongoDocument;
+      options?: MongoFindOptions;
+    }
+  | {
+      operation: "aggregate";
+      collection: string;
+      pipeline: MongoDocument[];
+      options?: MongoAggregateOptions;
+    };
+
+export type MongoWriteCommand =
+  | {
+      operation: "insertOne";
+      collection: string;
+      document: MongoDocument;
+      options?: Record<string, never>;
+    }
+  | {
+      operation: "insertMany";
+      collection: string;
+      documents: MongoDocument[];
+      options?: { ordered?: boolean };
+    }
+  | {
+      operation: "updateOne" | "updateMany";
+      collection: string;
+      filter: MongoDocument;
+      update: MongoDocument | MongoDocument[];
+      options?: MongoMutationOptions;
+    }
+  | {
+      operation: "replaceOne";
+      collection: string;
+      filter: MongoDocument;
+      replacement: MongoDocument;
+      options?: MongoMutationOptions;
+    }
+  | {
+      operation: "deleteOne" | "deleteMany";
+      collection: string;
+      filter: MongoDocument;
+      options?: Omit<MongoMutationOptions, "upsert">;
+    };
+
+export interface MongoWriteOutcome {
+  acknowledged: boolean;
+  inserted_id?: unknown;
+  inserted_ids?: unknown[];
+  inserted_count?: number;
+  matched_count?: number;
+  modified_count?: number;
+  upserted_count?: number;
+  upserted_id?: unknown;
+  deleted_count?: number;
+}
+
 export interface ExecutionOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -166,12 +251,23 @@ export interface QueryOptions extends ExecutionOptions {
   cache?: "auto" | "bypass" | "require";
 }
 
+export interface MongoQueryOptions extends ExecutionOptions {
+  cache?: "auto" | "bypass" | "require";
+}
+
 export interface FilterOptions {
   params?: SqlParameters;
 }
 
 export interface ExecOptions extends ExecutionOptions {
   params?: SqlParameters;
+  replay?: boolean;
+  idempotencyKey?: string;
+  allowUnbounded?: boolean;
+  allowDestructive?: boolean;
+}
+
+export interface MongoExecOptions extends ExecutionOptions {
   replay?: boolean;
   idempotencyKey?: string;
   allowUnbounded?: boolean;
@@ -197,6 +293,11 @@ export interface RowsOptions {
 
 export interface PlanOptions extends ExecutionOptions {
   params?: SqlParameters;
+  allowUnbounded?: boolean;
+  allowDestructive?: boolean;
+}
+
+export interface MongoPlanOptions extends ExecutionOptions {
   allowUnbounded?: boolean;
   allowDestructive?: boolean;
 }
@@ -228,6 +329,9 @@ export type BatchCommandName =
   | "transaction.commit"
   | "transaction.rollback"
   | "plan"
+  | "mongo.query"
+  | "mongo.exec"
+  | "mongo.plan"
   | "apply"
   | "history"
   | "receipt"
@@ -246,6 +350,7 @@ export interface BatchCommand {
   kind?: string;
   table?: string;
   params?: SqlParameters;
+  mongo?: MongoReadCommand | MongoWriteCommand;
   cache?: "auto" | "bypass" | "require";
   read_only?: boolean;
   secret_env?: string;
@@ -447,6 +552,7 @@ export interface OperationData {
   state_version_before: string;
   state_version_after: string | null;
   replay_of?: string;
+  outcome?: MongoWriteOutcome;
 }
 
 export interface ExecData extends OperationData {
@@ -516,6 +622,7 @@ export interface PurgeData {
 export interface CapabilitiesData {
   drivers: Driver[];
   features: Record<string, boolean>;
+  driver_features?: Partial<Record<Driver, Record<string, boolean>>>;
 }
 
 export interface RemovedProfileData {

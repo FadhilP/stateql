@@ -5,6 +5,7 @@ import type {
   TransactionRecord,
 } from "./store.js";
 import type {
+  MongoWriteOutcome,
   OperationData,
   ProfileData,
   Row,
@@ -12,7 +13,7 @@ import type {
   TransactionData,
   Warning,
 } from "./types.js";
-
+import { parseJson } from "./util.js";
 export function sessionData(session: SessionRecord): SessionData {
   return {
     session_id: session.id,
@@ -44,7 +45,23 @@ export function operationData(operation: OperationRecord): OperationData {
     state_version_before: operation.state_version_before,
     state_version_after: operation.state_version_after,
     ...(operation.replay_of ? { replay_of: operation.replay_of } : {}),
+    ...(operation.outcome_json === null
+      ? {}
+      : {
+          outcome: parseJson<MongoWriteOutcome>(
+            operation.outcome_json,
+            `operation "${operation.id}" outcome`,
+            isMongoWriteOutcome,
+          ),
+        }),
   };
+}
+
+function isMongoWriteOutcome(value: unknown): value is MongoWriteOutcome {
+  return Boolean(value) &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof (value as { acknowledged?: unknown }).acknowledged === "boolean";
 }
 
 export function transactionData(

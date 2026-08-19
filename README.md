@@ -2,8 +2,8 @@
 
 StateQL is a stateful database CLI and TypeScript library for AI agents and
 automation. It provides a safe interface for querying, changing, and inspecting
-SQLite, PostgreSQL, and MySQL databases while keeping results reusable and
-operations traceable across commands.
+SQLite, PostgreSQL, MySQL, and MongoDB databases while keeping results reusable
+and operations traceable across commands.
 
 StateQL is built around durable handles:
 
@@ -80,7 +80,7 @@ A connection accepts exactly one source: a direct target, `--env`, or
 `--profile`.
 
 ```bash
-stql connect <sqlite-path|postgres-url|mysql-url> [--name NAME] [--read-write]
+stql connect <sqlite-path|postgres-url|mysql-url|mongodb-url> [--name NAME] [--read-write]
 stql connect --env ENV [--name NAME] [--read-write]
 stql connect --profile NAME
 stql disconnect
@@ -89,9 +89,9 @@ stql status
 
 ### Environment-backed credentials
 
-PostgreSQL and MySQL credentials should come from environment variables. The
-variable must contain the complete connection URL, not only its password.
-Environment-backed SQLite paths require an explicit `sqlite:` prefix.
+PostgreSQL, MySQL, and MongoDB credentials should come from environment
+variables. The variable must contain the complete connection URL, not only its
+password. Environment-backed SQLite paths require an explicit `sqlite:` prefix.
 
 ```bash
 export APP_DATABASE_URL='postgres://user:password@host/app'
@@ -100,12 +100,16 @@ stql connect --env APP_DATABASE_URL --name app --read-only
 export MYSQL_DATABASE_URL='mysql://user:password@host/app'
 stql connect --env MYSQL_DATABASE_URL --name mysql-app --read-only
 
+export MONGODB_URL='mongodb://user:password@host/app'
+stql connect --env MONGODB_URL --name mongo-app --read-only
+
 export SQLITE_DATABASE='sqlite:./app.sqlite'
 stql connect --env SQLITE_DATABASE --name local --read-only
 ```
 
-StateQL stores no PostgreSQL or MySQL password. Credential-bearing URLs must be
-supplied through `--env`. SQLite paths remain persisted as connection metadata.
+StateQL stores no PostgreSQL, MySQL, or MongoDB password. Credential-bearing
+URLs must be supplied through `--env`. SQLite paths remain persisted as
+connection metadata.
 
 ### Local profiles
 
@@ -135,11 +139,13 @@ otherwise it remains a path or database URL.
   `uselibpqcompat=true` opts out and keeps libpq-compatible SSL semantics.
 - **MySQL:** uses positional `?` parameters. MariaDB compatibility is not
   currently claimed.
+- **MongoDB:** supports `mongodb://` and `mongodb+srv://` URLs with an explicit
+  database path. SQL methods are rejected; use the native MongoDB methods below.
 
 ## CLI reference
 
 ```text
-stql connect <sqlite-path|postgres-url|mysql-url> [--name NAME] [--read-write]
+stql connect <sqlite-path|postgres-url|mysql-url|mongodb-url> [--name NAME] [--read-write]
 stql connect --env ENV [--name NAME] [--read-write]
 stql connect --profile NAME
 stql disconnect
@@ -150,11 +156,13 @@ stql query <sql> [--params JSON | --param VALUE...] [--cache auto|bypass|require
 stql filter <result-handle> <predicate> [--params JSON | --param VALUE...]
 stql exec <sql> [--params JSON | --param VALUE...] [--idempotency-key KEY] [--replay]
               [--allow-unbounded] [--allow-destructive]
+stql mongo query|exec|plan '<EJSON command>' [--cache MODE] [--idempotency-key KEY]
+                                  [--replay] [--allow-unbounded] [--allow-destructive]
 stql show|count|columns <result-handle>
 stql rows <result-handle> [--offset N] [--limit N]
 stql alias set <name> <result-handle>
 stql export <result-handle> --output FILE [--format json|jsonl|csv]
-stql inspect schema|table|columns|indexes|constraints [table]
+stql inspect schema|table|collection|collections|columns|indexes|constraints [name]
 stql transaction begin|status|commit|rollback [--isolation LEVEL]
 stql plan <sql> [--allow-unbounded] [--allow-destructive]
 stql apply <plan-handle>
@@ -181,6 +189,38 @@ Use `--params JSON` for a JSON array or named parameters. Use
 `--params-file FILE` when JSON is awkward to quote; `--params-file -` reads
 JSON from standard input.
 
+### Native MongoDB
+
+MongoDB commands use official Extended JSON (EJSON), so BSON values survive the
+CLI boundary:
+
+```bash
+stql mongo query '{"operation":"find","collection":"users","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}}}'
+stql mongo exec '{"operation":"updateOne","collection":"users","filter":{"_id":{"$oid":"507f1f77bcf86cd799439011"}},"update":{"$set":{"seen_at":{"$date":"2026-01-01T00:00:00Z"}}}}'
+stql mongo plan '{"operation":"deleteMany","collection":"users","filter":{"disabled":true}}' --allow-destructive
+```
+
+The TypeScript equivalents are `mongoQuery(command)`, `mongoExec(command)`, and
+`mongoPlan(command)`. Supported reads are `find` and `aggregate`; writes are
+`insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`,
+and `deleteMany`. Result documents are JSON-safe, order-preserving EJSON: for example,
+ObjectIds and dates appear as `{ "$oid": "..." }` and
+`{ "$date": { "$numberLong": "..." } }`.
+
+Empty update, replacement, or delete filters require `--allow-unbounded`;
+deletes and replacements also require `--allow-destructive`. Mongo inspection accepts `collections`,
+`collection`, `columns`, `indexes`, and `constraints` (`schema` and `table`
+remain aliases shared with SQL drivers). MongoDB cache confidence is TTL-based:
+external writes are not detected, so use `--cache bypass` for a fresh read.
+
+```ts
+const result = await stateql.mongoQuery({
+  operation: "find",
+  collection: "users",
+  filter: { active: true },
+  options: { sort: { _id: 1 }, limit: 50 },
+});
+```
 ### Output modes
 
 CLI output defaults to compact, one-line `agent` JSON. Successful responses
@@ -211,6 +251,7 @@ cancels active work.
   block StateQL's event loop.
 - PostgreSQL combines server-side `statement_timeout` with client deadlines.
 - MySQL deadlines destroy the active connection.
+- MongoDB uses driver deadlines and closes stopped operations.
 
 A timed-out write may return `OUTCOME_UNKNOWN` when its commit status cannot be
 proven.
@@ -243,8 +284,8 @@ These caps bound persisted materialization; the independent deadline bounds
 execution time.
 
 Command history keeps the latest 10,000 entries per session. SQLite cache reuse
-also checks the database file signature. PostgreSQL and MySQL cache reuse is
-labeled `ttl_based` and is never authoritative.
+also checks the database file signature. PostgreSQL, MySQL, and MongoDB cache
+reuse is labeled `ttl_based` and is never authoritative.
 
 StateQL limits persisted result payloads to 256 MiB by default. When that quota
 is reached it removes the oldest unaliased results; aliases remain protected. A
@@ -303,6 +344,8 @@ SQLite supports `serializable`. PostgreSQL and MySQL also support
 `repeatable read`, `read committed`, and `read uncommitted`. Server reads run
 inside database-enforced read-only transactions. MySQL staged transactions
 reject DDL because MySQL implicitly commits those statements.
+MongoDB transactions use `snapshot` isolation and require a replica set or
+sharded deployment; standalone servers do not support them.
 
 ## Batch and pipes
 
@@ -345,9 +388,10 @@ stql batch commands.json
 
 Batch fields use snake case. Supported command names match CLI paths, such as
 `filter`, `transaction.begin`, `session.summary`, `alias.set`, `plan`, and
-`apply`. Batch filters use `where` for the predicate and may assign the derived
-result with `as`. Database commands may set `timeout_ms`; otherwise they use the
-30-second default.
+`apply`. Native MongoDB batches use `mongo.query`, `mongo.exec`, or `mongo.plan`
+with the command object in `mongo`; the same cache, replay, idempotency, safety,
+and timeout fields apply. Database commands may set `timeout_ms`; otherwise they
+use the 30-second default.
 
 ## TypeScript library
 
@@ -440,13 +484,12 @@ safety and duplicate checks. Requests contain actor and session identity, the
 operation's effective read/write access, an abort signal, and sanitized
 connection metadata.
 
-Returned values must be complete PostgreSQL or MySQL URLs, or explicit
+Returned values must be complete PostgreSQL, MySQL, or MongoDB URLs, or explicit
 `sqlite:` sources. StateQL validates the source and its stored driver before
-adapter construction and normalizes SQLite paths. Credential-bearing
-PostgreSQL and MySQL URLs are redacted before connection metadata is persisted
-and never enter history, snapshots, cache keys, or responses. SQLite paths
-remain persisted connection metadata, as they are for direct SQLite
-connections.
+adapter construction and normalizes SQLite paths. Credential-bearing database
+URLs are redacted before connection metadata is persisted and never enter
+history, snapshots, cache keys, or responses. SQLite paths remain persisted
+connection metadata, as they are for direct SQLite connections.
 
 Harnesses remain responsible for approval policy, binding lifetime, revocation,
 and keeping values out of their own logs and model-visible data.
