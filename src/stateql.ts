@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
@@ -65,6 +66,8 @@ import type {
   AliasData,
   ApplyData,
   BatchCommand,
+  CommandExecutionContext,
+  CommandOrigin,
   BatchOptions,
   CapabilitiesData,
   CloseSessionData,
@@ -87,6 +90,7 @@ import type {
   FilterOptions,
   HistoryData,
   HistoryEntry,
+  HistoryOptions,
   OperationData,
   PlanData,
   PlanOptions,
@@ -171,6 +175,7 @@ export class StateQL {
   private readonly maxResultBytes: number;
   private readonly timeoutMs: number;
   private readonly signal?: AbortSignal;
+  private readonly commandContexts = new AsyncLocalStorage<CommandExecutionContext>();
   private readonly credentialResolver?: CredentialResolver;
   private readonly now: () => Date;
   private closed = false;
@@ -1919,11 +1924,20 @@ export class StateQL {
     }, () => historySql);
   }
 
-  async history(limit = 20): Promise<Response<HistoryData>> {
+  async history(
+    limit = 20,
+    options: HistoryOptions = {},
+  ): Promise<Response<HistoryData>> {
     return this.run("history", async (session) => ({
       data: {
         history: this.store
-          .history(session.id, positiveInteger(limit, "limit"))
+          .history(
+            session.id,
+            positiveInteger(limit, "limit"),
+            options.origin === undefined
+              ? undefined
+              : parseCommandOrigin(options.origin),
+          )
           .map(historyEntry),
       },
     }));
@@ -1989,7 +2003,21 @@ export class StateQL {
     }));
   }
 
-  async executeCommand(command: BatchCommand): Promise<Response<unknown>> {
+  async executeCommand(
+    command: BatchCommand,
+    context: CommandExecutionContext = {},
+  ): Promise<Response<unknown>> {
+    let activeContext: CommandExecutionContext;
+    try {
+      activeContext = mergeCommandExecutionContext(
+        this.commandContexts.getStore(),
+        context,
+      );
+    } catch (error) {
+      return this.batchFailure(errorMessage(error));
+    }
+
+    return this.commandContexts.run(activeContext, async () => {
     if (!command || typeof command !== "object") {
       return this.batchFailure("Batch command must be an object.");
     }
@@ -2145,7 +2173,9 @@ export class StateQL {
             timeoutMs: command.timeout_ms,
           });
         case "history":
-          return this.history(command.limit ?? 20);
+          return this.history(command.limit ?? 20, {
+            origin: command.history_origin,
+          });
         case "receipt":
           return this.receipt(batchString(command.handle, "handle"));
         case "doctor":
@@ -2162,6 +2192,7 @@ export class StateQL {
     } catch (error) {
       return this.batchFailure(errorMessage(error));
     }
+    });
   }
 
   async *batch(
@@ -2183,7 +2214,10 @@ export class StateQL {
         );
         return;
       }
-      const response = await this.executeCommand(command);
+      const response = await this.executeCommand(
+        command,
+        options.executionContext,
+      );
       yield response;
       if (!response.ok && !options.continueOnError) return;
     }
@@ -2994,7 +3028,11 @@ export class StateQL {
   private executionContext(options: ExecutionOptions): AdapterContext {
     return createAdapterContext(
       executionTimeout(options.timeoutMs ?? this.timeoutMs),
-      options.signal ?? this.signal,
+      combineAbortSignals(
+        options.signal,
+        this.commandContexts.getStore()?.signal,
+        this.signal,
+      ),
     );
   }
 
@@ -3041,6 +3079,7 @@ export class StateQL {
     historySql?: string | (() => string | undefined),
   ): Promise<Response<T>> {
     const started = performance.now();
+    const origin = this.commandContexts.getStore()?.origin ?? "legacy";
     let session = this.store.ensureSession(this.sessionName);
     const commandId = this.store.nextId("cmd");
     if (!this.store.isSessionMember(session.id, this.actorId)) {
@@ -3066,6 +3105,7 @@ export class StateQL {
         id: commandId,
         sessionId: session.id,
         actorId: this.actorId,
+        origin,
         command,
         ...(result.handle ? { handle: result.handle } : {}),
         ...(sqlText !== undefined ? { sql: sqlText } : {}),
@@ -3096,6 +3136,7 @@ export class StateQL {
         id: commandId,
         sessionId: session.id,
         actorId: this.actorId,
+        origin,
         command,
         ...(sqlText !== undefined ? { sql: sqlText } : {}),
         executed: stateqlError.details.executed,
@@ -3128,6 +3169,7 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     timestamp: item.timestamp,
     session_id: item.session_id,
     actor_id: item.actor_id,
+    origin: item.origin,
     command: item.command,
     sql: item.sql,
     handle: item.handle,
@@ -3136,6 +3178,60 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     success: Boolean(item.success),
     error_code: item.error_code,
   };
+}
+
+const COMMAND_ORIGINS = new Set<CommandOrigin>([
+  "legacy",
+  "user",
+  "model",
+  "system",
+  "api",
+]);
+
+function parseCommandOrigin(value: unknown): CommandOrigin {
+  if (typeof value === "string" && COMMAND_ORIGINS.has(value as CommandOrigin)) {
+    return value as CommandOrigin;
+  }
+  throw new StateQLError(
+    "INVALID_COMMAND",
+    `Unknown command origin "${String(value)}".`,
+  );
+}
+
+function mergeCommandExecutionContext(
+  inherited: CommandExecutionContext | undefined,
+  supplied: CommandExecutionContext,
+): CommandExecutionContext {
+  if (!supplied || typeof supplied !== "object") {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "Command execution context must be an object.",
+    );
+  }
+  if (supplied.signal !== undefined && !(supplied.signal instanceof AbortSignal)) {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      "Command execution context signal must be an AbortSignal.",
+    );
+  }
+  return {
+    signal: combineAbortSignals(inherited?.signal, supplied.signal),
+    origin:
+      supplied.origin === undefined
+        ? inherited?.origin
+        : parseCommandOrigin(supplied.origin),
+  };
+}
+
+function combineAbortSignals(
+  ...signals: Array<AbortSignal | undefined>
+): AbortSignal | undefined {
+  const present = signals.filter(
+    (signal): signal is AbortSignal => signal !== undefined,
+  );
+  if (present.length === 0) return undefined;
+  if (present.length === 1) return present[0];
+  return AbortSignal.any(present);
 }
 
 function markTransactionOutcomeUnknown(

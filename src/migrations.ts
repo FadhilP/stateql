@@ -74,6 +74,19 @@ const MIGRATIONS: Migration[] = [
       requireColumns(db, "operations", ["outcome_json"]);
     },
   },
+  {
+    name: "history_origin_v1",
+    apply(db) {
+      addColumn(db, "history", "origin", "TEXT NOT NULL DEFAULT 'legacy'");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS history_session_origin ON history(session_id, origin)",
+      );
+    },
+    validate(db) {
+      requireColumns(db, "history", ["origin"]);
+      requireIndexes(db, ["history_session_origin"]);
+    },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -236,6 +249,7 @@ function createInitialSchema(db: DatabaseSync): void {
       session_id TEXT NOT NULL,
       actor_id TEXT NOT NULL,
       command TEXT NOT NULL,
+      origin TEXT NOT NULL DEFAULT 'legacy',
       sql TEXT,
       handle TEXT,
       executed INTEGER NOT NULL,

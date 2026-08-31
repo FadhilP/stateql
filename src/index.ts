@@ -17,6 +17,8 @@ export type {
   BatchCommandName,
   BatchOptions,
   CapabilitiesData,
+  CommandExecutionContext,
+  CommandOrigin,
   CloseSessionData,
   Column,
   ColumnsData,
@@ -39,6 +41,7 @@ export type {
   FilterOptions,
   HistoryData,
   HistoryEntry,
+  HistoryOptions,
   MongoAggregateOptions,
 
   MongoDocument,

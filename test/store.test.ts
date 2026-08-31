@@ -256,6 +256,57 @@ test("history SQL migration preserves existing rows", () => {
   reopened.close();
 });
 
+test("history origin migration attributes legacy rows and restores filtering", () => {
+  const root = createTemporaryDirectory();
+  const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
+  const session = store.ensureSession();
+  store.addHistory({
+    id: "pre_origin_history",
+    sessionId: session.id,
+    actorId: "default",
+    command: "query",
+    executed: true,
+    cached: false,
+    success: true,
+  });
+  store.close();
+
+  const legacy = new DatabaseSync(join(root, "state.sqlite"));
+  legacy.exec("DROP INDEX history_session_origin");
+  legacy.exec("DELETE FROM schema_migrations WHERE name = 'history_origin_v1'");
+  legacy.exec("ALTER TABLE history DROP COLUMN origin");
+  legacy.close();
+
+  const reopened = new StateStore(root, () => new Date("2026-01-01T00:00:01Z"));
+  assert.equal(reopened.history(session.id, 1)[0]?.origin, "legacy");
+  assert.equal(reopened.history(session.id, 10, "user").length, 0);
+  reopened.addHistory({
+    sessionId: session.id,
+    actorId: "default",
+    origin: "user",
+    command: "query",
+    executed: true,
+    cached: false,
+    success: true,
+  });
+  assert.equal(reopened.history(session.id, 10, "user").length, 1);
+  assert.ok(
+    reopened.db
+      .prepare(
+        "SELECT 1 FROM schema_migrations WHERE name = 'history_origin_v1'",
+      )
+      .get(),
+  );
+  assert.ok(
+    reopened.db
+      .prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = 'history_session_origin'",
+      )
+      .get(),
+  );
+  reopened.close();
+});
+
 test("history keeps the latest 10,000 entries per session", () => {
   const root = createTemporaryDirectory();
   const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
@@ -498,7 +549,13 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
   const database = new DatabaseSync(join(home, "state.sqlite"));
   assert.deepEqual(
     (database.prepare("SELECT name FROM schema_migrations ORDER BY rowid").all() as Array<{ name: string }>).map((row) => row.name),
-    ["initial_schema_v1", "shared_session_actors_v1", "history_sql_v1", "operation_outcomes_v1"],
+    [
+      "initial_schema_v1",
+      "shared_session_actors_v1",
+      "history_sql_v1",
+      "operation_outcomes_v1",
+      "history_origin_v1",
+    ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
   database.exec("ALTER TABLE plans DROP COLUMN claim_token");

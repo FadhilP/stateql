@@ -253,8 +253,9 @@ cancels active work.
 - MySQL deadlines destroy the active connection.
 - MongoDB uses driver deadlines and closes stopped operations.
 
-A timed-out write may return `OUTCOME_UNKNOWN` when its commit status cannot be
-proven.
+A timed-out or cancelled write may return `OUTCOME_UNKNOWN` when its commit
+status cannot be proven. Cancellation stops that command's driver work; it does
+not close the `StateQL` actor, and later commands remain usable.
 
 ## Durable state and result reuse
 
@@ -423,6 +424,30 @@ if (response.ok) {
   });
 }
 ```
+
+Hosts that dispatch batch-shaped commands can attach trusted metadata out of
+band. `origin` is audit/source metadata only; it never changes actor membership,
+workspace access, or write authorization.
+
+```ts
+const controller = new AbortController();
+await stateql.executeCommand(
+  { command: "query", sql: "SELECT * FROM users", cache: "bypass" },
+  { origin: "user", signal: controller.signal },
+);
+
+const userHistory = await stateql.history(50, { origin: "user" });
+await stateql.executeCommand(
+  { command: "history", limit: 50, history_origin: "user" },
+  { origin: "model" },
+);
+```
+
+Supported origins are `legacy`, `user`, `model`, `system`, and `api`. Existing
+direct calls and `executeCommand(command)` calls are recorded as `legacy`.
+`history_origin` is only a retrieval filter; putting an `origin` field in a
+`BatchCommand` cannot attribute the command. `batch` accepts the same trusted
+context as `options.executionContext` for all commands in that batch.
 
 ### Actor workspaces
 

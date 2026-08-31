@@ -1,6 +1,14 @@
 export type SqlDriver = "sqlite" | "postgres" | "mysql";
 export type Driver = SqlDriver | "mongodb";
 
+export type CommandOrigin = "legacy" | "user" | "model" | "system" | "api";
+
+/** Trusted host metadata for one executeCommand call; never part of BatchCommand input. */
+export interface CommandExecutionContext {
+  signal?: AbortSignal;
+  origin?: CommandOrigin;
+}
+
 export type CredentialAccess = "read" | "write";
 export type CredentialOperation =
   | "connect"
@@ -90,6 +98,7 @@ export interface HistoryEntry {
   timestamp: string;
   session_id: string;
   actor_id: string;
+  origin: CommandOrigin;
   command: string;
   sql: string | null;
   handle: string | null;
@@ -225,6 +234,10 @@ export interface MongoWriteOutcome {
 export interface ExecutionOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+}
+
+export interface HistoryOptions {
+  origin?: CommandOrigin;
 }
 
 export interface StateQLOptions extends ExecutionOptions {
@@ -363,12 +376,15 @@ export interface BatchCommand {
   limit?: number;
   isolation?: string;
   timeout_ms?: number;
+  /** Retrieval filter for the history command; does not attribute this command. */
+  history_origin?: CommandOrigin;
   scope?: "expired" | "results" | "history" | "all";
 }
 
 export interface BatchOptions {
   continueOnError?: boolean;
   maxCommands?: number;
+  executionContext?: CommandExecutionContext;
 }
 
 export interface Column {

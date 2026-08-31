@@ -54,18 +54,56 @@ test("SQLite deadlines and AbortSignal cancellation stay off the event loop", as
   assert.ok(Date.now() - started < 3_000);
 
   const controller = new AbortController();
+  const cancelledPromise = fixture.stateql.executeCommand(
+    {
+      command: "query",
+      sql: slowSql,
+      cache: "bypass",
+      timeout_ms: 5_000,
+    },
+    { signal: controller.signal, origin: "user" },
+  );
+  const isolatedPromise = fixture.stateql.executeCommand(
+    { command: "query", sql: "SELECT 2 AS healthy", cache: "bypass" },
+    { origin: "model" },
+  );
   setTimeout(() => controller.abort(), 100);
-  const cancelled = await fixture.stateql.query(slowSql, {
-    cache: "bypass",
-    signal: controller.signal,
-    timeoutMs: 5_000,
-  });
+  const [cancelled, isolated] = await Promise.all([
+    cancelledPromise,
+    isolatedPromise,
+  ]);
   assert.equal(cancelled.ok, false);
   if (!cancelled.ok) {
     assert.equal(cancelled.error.code, "OPERATION_CANCELLED");
     assert.equal(cancelled.error.executed, true);
   }
+  assert.equal(isolated.ok, true);
+  if (isolated.ok) {
+    assert.equal(
+      (isolated.data as { preview: Array<{ healthy: number }> }).preview[0]
+        ?.healthy,
+      2,
+    );
+  }
 
+  const userHistory = await succeed(
+    fixture.stateql.history(20, { origin: "user" }),
+  );
+  assert.ok(
+    userHistory.history.some(
+      (entry: { command: string; success: boolean }) =>
+        entry.command === "query" && !entry.success,
+    ),
+  );
+  const modelHistory = await succeed(
+    fixture.stateql.history(20, { origin: "model" }),
+  );
+  assert.ok(
+    modelHistory.history.some(
+      (entry: { sql: string | null; success: boolean }) =>
+        entry.sql === "SELECT 2 AS healthy" && entry.success,
+    ),
+  );
   assert.equal(
     (await succeed(fixture.stateql.query("SELECT 1 AS healthy"))).preview[0]
       .healthy,

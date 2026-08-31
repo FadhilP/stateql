@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { StateQL } from "../src/stateql.js";
 import { StateStore } from "../src/store.js";
+import type { BatchCommand } from "../src/types.js";
 import {
   assertFailure,
   createFixture,
@@ -167,6 +168,74 @@ test("history records bounded SQL for query, exec, plan, apply, and batch", asyn
     ),
   );
   reopened.close();
+});
+
+test("trusted command origins are attributed, filtered, and backward compatible", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.status());
+  await succeed(
+    fixture.stateql.executeCommand(
+      {
+        command: "query",
+        sql: "SELECT ? AS value",
+        params: ["panel-only-parameter"],
+        cache: "bypass",
+      },
+      { origin: "user" },
+    ),
+  );
+
+  const spoofedOrigin = {
+    command: "status",
+    origin: "user",
+  } as unknown as BatchCommand;
+  await succeed(
+    fixture.stateql.executeCommand(spoofedOrigin, { origin: "model" }),
+  );
+
+  const all = await succeed(fixture.stateql.history(100));
+  const userQuery = all.history.find(
+    (entry: { command: string; origin: string }) =>
+      entry.command === "query" && entry.origin === "user",
+  );
+  const modelStatus = all.history.find(
+    (entry: { command: string; origin: string }) =>
+      entry.command === "status" && entry.origin === "model",
+  );
+  assert.ok(userQuery);
+  assert.ok(modelStatus);
+  assert.equal(userQuery.actor_id, modelStatus.actor_id);
+  assert.equal(JSON.stringify(all).includes("panel-only-parameter"), false);
+  assert.ok(
+    all.history.some(
+      (entry: { command: string; origin: string }) =>
+        entry.command === "status" && entry.origin === "legacy",
+    ),
+  );
+
+  const userOnly = await succeed(
+    fixture.stateql.history(100, { origin: "user" }),
+  );
+  assert.ok(userOnly.history.length > 0);
+  assert.ok(
+    userOnly.history.every(
+      (entry: { origin: string }) => entry.origin === "user",
+    ),
+  );
+
+  const filtered = await fixture.stateql.executeCommand(
+    { command: "history", limit: 100, history_origin: "user" },
+    { origin: "model" },
+  );
+  assert.equal(filtered.ok, true);
+  if (filtered.ok) {
+    const entries = (filtered.data as { history: Array<{ origin: string }> })
+      .history;
+    assert.ok(entries.length > 0);
+    assert.ok(entries.every((entry) => entry.origin === "user"));
+  }
+
+  fixture.stateql.close();
 });
 
 test("filters materialized handles locally into durable derived results", async () => {

@@ -424,6 +424,31 @@ test(
         assert.ok((found.data.preview[0]?._id as { $oid?: string }).$oid);
       }
 
+      const controller = new AbortController();
+      controller.abort();
+      const cancelled = await stateql.executeCommand(
+        {
+          command: "mongo.query",
+          mongo: {
+            operation: "find",
+            collection,
+            filter: { test_run: run },
+          },
+          cache: "bypass",
+        },
+        { signal: controller.signal, origin: "api" },
+      );
+      assertFailure(cancelled, "OPERATION_CANCELLED");
+      const healthyAfterCancellation = await stateql.mongoQuery(
+        {
+          operation: "find",
+          collection,
+          filter: { test_run: run },
+        },
+        { cache: "bypass" },
+      );
+      assert.equal(healthyAfterCancellation.ok, true);
+
       const updated = await stateql.mongoExec({
         operation: "updateOne",
         collection,

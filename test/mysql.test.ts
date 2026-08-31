@@ -149,10 +149,10 @@ test(
 
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 50).unref();
-      const cancelled = await stateql.query("SELECT SLEEP(1)", {
-        cache: "bypass",
-        signal: controller.signal,
-      });
+      const cancelled = await stateql.executeCommand(
+        { command: "query", sql: "SELECT SLEEP(1)", cache: "bypass" },
+        { signal: controller.signal, origin: "api" },
+      );
       assert.equal(cancelled.ok, false);
       if (!cancelled.ok) {
         assert.equal(cancelled.error.code, "OPERATION_CANCELLED");

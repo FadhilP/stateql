@@ -6,6 +6,7 @@ import { runMigrations } from "./migrations.js";
 import { StateQLError } from "./errors.js";
 import type {
   Column,
+  CommandOrigin,
   Driver,
   MongoWriteOutcome,
   Row,
@@ -129,6 +130,7 @@ export interface HistoryRecord {
   timestamp: string;
   session_id: string;
   actor_id: string;
+  origin: CommandOrigin;
   command: string;
   sql: string | null;
   handle: string | null;
@@ -1326,6 +1328,7 @@ export class StateStore {
   addHistory(input: {
     sessionId: string;
     actorId: string;
+    origin?: CommandOrigin;
     command: string;
     sql?: string;
     handle?: string;
@@ -1339,15 +1342,16 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO history
-          (id, timestamp, session_id, actor_id, command, sql, handle, executed,
-           cached, success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, timestamp, session_id, actor_id, origin, command, sql, handle,
+           executed, cached, success, error_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
         this.now().toISOString(),
         input.sessionId,
         input.actorId,
+        input.origin ?? "legacy",
         input.command,
         boundedHistorySql(input.sql),
         input.handle ?? null,
@@ -1372,15 +1376,21 @@ export class StateStore {
       .get(id) as unknown as HistoryRecord;
   }
 
-  history(sessionId: string, limit: number): HistoryRecord[] {
+  history(
+    sessionId: string,
+    limit: number,
+    origin?: CommandOrigin,
+  ): HistoryRecord[] {
     return this.db
       .prepare(
         `SELECT * FROM history
-         WHERE session_id = ?
+         WHERE session_id = ?${origin === undefined ? "" : " AND origin = ?"}
          ORDER BY rowid DESC
          LIMIT ?`,
       )
-      .all(sessionId, limit) as unknown as HistoryRecord[];
+      .all(
+        ...(origin === undefined ? [sessionId, limit] : [sessionId, origin, limit]),
+      ) as unknown as HistoryRecord[];
   }
 
   recentOperations(sessionId: string, limit: number): OperationRecord[] {
