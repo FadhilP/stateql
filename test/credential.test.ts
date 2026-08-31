@@ -10,6 +10,7 @@ import {
 import {
   assertFailure,
   createTemporaryDirectory,
+  collect,
   succeed,
 } from "./helpers.js";
 
@@ -200,6 +201,89 @@ test("the default resolver remains compatible with process environment credentia
   }
 });
 
+test("opaque credential refs require a trusted resolver and flow through profiles and batch commands", async () => {
+  const root = createTemporaryDirectory("stateql-opaque-credential-test-");
+  const home = join(root, "state");
+  const database = join(root, "opaque.sqlite");
+  const envReference = "STQL_OPAQUE_CREDENTIAL_REF";
+  const previous = process.env[envReference];
+  process.env[envReference] = `sqlite:${database}`;
+
+  const withoutResolver = new StateQL({ home });
+  try {
+    assertFailure(
+      await withoutResolver.connect(undefined, { credentialRef: envReference }),
+      "CREDENTIAL_UNAVAILABLE",
+    );
+  } finally {
+    withoutResolver.close();
+  }
+
+  const reference = "  vault://team/app database  ";
+  const requests: CredentialRequest[] = [];
+  const stateql = new StateQL({
+    home,
+    credentialResolver(request) {
+      requests.push(structuredClone(request));
+      return `sqlite:${database}`;
+    },
+  });
+  try {
+    const responses = await collect(stateql.batch([
+      {
+        command: "profile.add",
+        name: "hosted",
+        credential_ref: reference,
+        read_only: false,
+      },
+      { command: "connect", profile: "hosted" },
+    ]));
+    assert.equal(responses.length, 2);
+    assert.ok(responses.every((response) => response.ok));
+
+    const profile = await succeed(stateql.showProfile("hosted"));
+    assert.equal(profile.target, null);
+    assert.equal(profile.secret_env, null);
+    assert.equal(profile.credential_ref, reference);
+    assert.equal(JSON.stringify(profile).includes(database), false);
+
+    await succeed(stateql.exec("CREATE TABLE opaque_ref_test (id INTEGER PRIMARY KEY)"));
+    assert.deepEqual(requests.map((request) => request.source), [
+      "credential_ref",
+      "credential_ref",
+    ]);
+    assert.ok(requests.every((request) => request.reference === reference));
+    assert.ok(requests.every((request) => !("origin" in request)));
+  } finally {
+    stateql.close();
+    if (previous === undefined) delete process.env[envReference];
+    else process.env[envReference] = previous;
+  }
+});
+
+test("opaque credential refs are bounded but otherwise preserve their syntax", async () => {
+  const root = createTemporaryDirectory("stateql-credential-ref-validation-test-");
+  const stateql = new StateQL({ home: join(root, "state") });
+  try {
+    assertFailure(
+      await stateql.addProfile("blank", undefined, { credentialRef: " \t " }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.addProfile("long", undefined, { credentialRef: "x".repeat(1_025) }),
+      "INVALID_COMMAND",
+    );
+    const reference = `not an ENV name/${"x".repeat(1_008)}`;
+    assert.equal(reference.length, 1_024);
+    const profile = await succeed(
+      stateql.addProfile("bounded", undefined, { credentialRef: reference }),
+    );
+    assert.equal(profile.credential_ref, reference);
+  } finally {
+    stateql.close();
+  }
+});
+
 test("connect rejects ambiguous sources before resolving credentials", async () => {
   const root = createTemporaryDirectory("stateql-credential-source-test-");
   let resolverCalled = false;
@@ -221,6 +305,32 @@ test("connect rejects ambiguous sources before resolving credentials", async () 
       await stateql.connect(undefined, {
         profile: "app",
         secretEnv: "APP_DATABASE_URL",
+      }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.connect("postgres://localhost/app", {
+        credentialRef: "vault://app",
+      }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.connect(undefined, {
+        secretEnv: "APP_DATABASE_URL",
+        credentialRef: "vault://app",
+      }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.connect(undefined, {
+        profile: "app",
+        credentialRef: "vault://app",
+      }),
+      "INVALID_COMMAND",
+    );
+    assertFailure(
+      await stateql.addProfile("ambiguous", "./app.sqlite", {
+        credentialRef: "vault://app",
       }),
       "INVALID_COMMAND",
     );

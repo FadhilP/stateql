@@ -87,6 +87,11 @@ const MIGRATIONS: Migration[] = [
       requireIndexes(db, ["history_session_origin"]);
     },
   },
+  {
+    name: "credential_refs_v1",
+    apply: migrateCredentialRefs,
+    validate: validateCredentialRefs,
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -147,10 +152,15 @@ function createInitialSchema(db: DatabaseSync): void {
       name TEXT PRIMARY KEY,
       target TEXT,
       secret_env TEXT,
+      credential_ref TEXT,
       read_only INTEGER NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      CHECK(target IS NOT NULL OR secret_env IS NOT NULL)
+      CHECK (
+        (target IS NOT NULL) +
+        (secret_env IS NOT NULL) +
+        (credential_ref IS NOT NULL) = 1
+      )
     );
     CREATE TABLE IF NOT EXISTS connections (
       id TEXT PRIMARY KEY,
@@ -160,6 +170,7 @@ function createInitialSchema(db: DatabaseSync): void {
       database_name TEXT NOT NULL,
       source TEXT NOT NULL,
       secret_env TEXT,
+      credential_ref TEXT,
       read_only INTEGER NOT NULL,
       version INTEGER NOT NULL,
       created_at TEXT NOT NULL,
@@ -323,6 +334,86 @@ function validateSharedSessionActors(db: DatabaseSync): void {
     if (row.count) throw new Error(`State migration left ${table}.${column} empty.`);
   }
 }
+
+function migrateCredentialRefs(db: DatabaseSync): void {
+  const profileColumns = new Set(
+    (db.prepare("PRAGMA table_info(profiles)").all() as unknown as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+  const hasCredentialRef = profileColumns.has("credential_ref");
+
+  if (!profileCredentialRefSchemaCurrent(db)) {
+    const missingSources = db.prepare(
+      `SELECT COUNT(*) AS count FROM profiles
+       WHERE target IS NULL AND secret_env IS NULL${hasCredentialRef ? " AND credential_ref IS NULL" : ""}`,
+    ).get() as { count: number };
+    if (missingSources.count) {
+      throw new Error("State migration found a profile without a connection source.");
+    }
+
+    const legacyCredentialRef = hasCredentialRef ? "credential_ref" : "NULL";
+    db.exec(`
+      ALTER TABLE profiles RENAME TO profiles_legacy_credential_refs_v1;
+      CREATE TABLE profiles (
+        name TEXT PRIMARY KEY,
+        target TEXT,
+        secret_env TEXT,
+        credential_ref TEXT,
+        read_only INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (target IS NOT NULL) +
+          (secret_env IS NOT NULL) +
+          (credential_ref IS NOT NULL) = 1
+        )
+      );
+      INSERT INTO profiles
+        (name, target, secret_env, credential_ref, read_only, created_at, updated_at)
+      SELECT
+        name,
+        CASE
+          WHEN ${legacyCredentialRef} IS NULL AND secret_env IS NULL THEN target
+          ELSE NULL
+        END,
+        CASE WHEN ${legacyCredentialRef} IS NULL THEN secret_env ELSE NULL END,
+        ${legacyCredentialRef},
+        read_only,
+        created_at,
+        updated_at
+      FROM profiles_legacy_credential_refs_v1;
+      DROP TABLE profiles_legacy_credential_refs_v1;
+    `);
+  }
+
+  addColumn(db, "connections", "credential_ref", "TEXT");
+}
+
+function validateCredentialRefs(db: DatabaseSync): void {
+  requireColumns(db, "profiles", ["credential_ref"]);
+  requireColumns(db, "connections", ["credential_ref"]);
+  if (!profileCredentialRefSchemaCurrent(db)) {
+    throw new Error("State migration did not enforce exactly one profile source.");
+  }
+  const invalid = db.prepare(
+    `SELECT COUNT(*) AS count FROM profiles
+     WHERE (target IS NOT NULL) +
+           (secret_env IS NOT NULL) +
+           (credential_ref IS NOT NULL) != 1`,
+  ).get() as { count: number };
+  if (invalid.count) {
+    throw new Error("State migration left a profile with ambiguous connection sources.");
+  }
+}
+
+function profileCredentialRefSchemaCurrent(db: DatabaseSync): boolean {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'profiles'",
+  ).get() as { sql: string } | undefined;
+  return Boolean(row?.sql && /CHECK\s*\(\s*\(target IS NOT NULL\)\s*\+\s*\(secret_env IS NOT NULL\)\s*\+\s*\(credential_ref IS NOT NULL\)\s*=\s*1\s*\)/i.test(row.sql));
+}
+
 
 function addColumn(
   db: DatabaseSync,

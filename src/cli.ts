@@ -25,6 +25,7 @@ const parsed = parseArgs({
     name: { type: "string" },
     profile: { type: "string" },
     env: { type: "string" },
+    "credential-ref": { type: "string" },
     "read-only": { type: "boolean" },
     "read-write": { type: "boolean" },
     params: { type: "string" },
@@ -157,6 +158,7 @@ async function dispatch(): Promise<Response<unknown>> {
       return stateql.connect(subcommand, {
         ...(values.name ? { name: values.name } : {}),
         ...(values.env ? { secretEnv: values.env } : {}),
+        ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
         ...(values.profile ? { profile: values.profile } : {}),
         ...(values["read-only"]
           ? { readOnly: true }
@@ -325,6 +327,7 @@ async function dispatchProfile(
         args[1],
         {
           ...(values.env ? { secretEnv: values.env } : {}),
+          ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
           readOnly: !values["read-write"],
         },
       );
@@ -680,9 +683,10 @@ function helpText(): string {
 Usage: stql <command> [arguments] [options]
 
 Commands:
-  connect, disconnect, status
-  profile add|list|show|remove
-  session start|list|show|summary|close
+  connect TARGET | --env ENV | --credential-ref REF | --profile NAME
+  disconnect, status
+  profile add NAME [TARGET | --env ENV | --credential-ref REF]
+  profile list|show|remove
   query, filter, exec, show, rows, count, columns, export
   mongo query|exec|plan '<EJSON command>'
   alias set
@@ -694,6 +698,7 @@ Commands:
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
+Credential refs require a trusted host CredentialResolver; the standalone CLI cannot resolve them.
 State: --max-state-bytes N, --cache-ttl-seconds N, --result-ttl-seconds N.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;

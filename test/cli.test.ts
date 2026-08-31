@@ -83,6 +83,33 @@ test("local profiles persist and connect by bare or explicit name", async () => 
     (JSON.parse(cliConnect.stdout) as { profile: string }).profile,
     "cli",
   );
+
+  const opaqueReference = "vault://team/production";
+  const addCredentialProfile = spawnSync(
+    process.execPath,
+    [
+      "dist/src/cli.js",
+      "profile",
+      "add",
+      "hosted",
+      "--credential-ref",
+      opaqueReference,
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(addCredentialProfile.status, 0, addCredentialProfile.stderr);
+  const addedCredentialProfile = JSON.parse(addCredentialProfile.stdout) as {
+    target: string | null;
+    secret_env: string | null;
+    credential_ref: string | null;
+  };
+  assert.equal(addedCredentialProfile.target, null);
+  assert.equal(addedCredentialProfile.secret_env, null);
+  assert.equal(addedCredentialProfile.credential_ref, opaqueReference);
 });
 
 test("CLI accepts shell-safe parameters and applies destructive plans", async () => {

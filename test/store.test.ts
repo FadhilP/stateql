@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { statSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
@@ -541,6 +541,64 @@ test("StateQL validates durable-state options and closes idempotently", () => {
   stateql[Symbol.dispose]();
 });
 
+test("credential ref migration preserves legacy profiles and enforces one source", () => {
+  const home = createTemporaryDirectory("stateql-credential-ref-migration-test-");
+  mkdirSync(home, { recursive: true });
+  const legacy = new DatabaseSync(join(home, "state.sqlite"));
+  legacy.exec(`
+    CREATE TABLE profiles (
+      name TEXT PRIMARY KEY,
+      target TEXT,
+      secret_env TEXT,
+      read_only INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK(target IS NOT NULL OR secret_env IS NOT NULL)
+    );
+    INSERT INTO profiles VALUES
+      ('local', './local.sqlite', NULL, 0, '2026-01-01', '2026-01-01'),
+      ('hosted', NULL, 'APP_DATABASE_URL', 1, '2026-01-01', '2026-01-01'),
+      ('legacy_dual', './ignored.sqlite', 'LEGACY_DATABASE_URL', 1, '2026-01-01', '2026-01-01');
+  `);
+  legacy.close();
+
+  const migrated = new StateStore(home, () => new Date("2026-01-02T00:00:00Z"));
+  assert.deepEqual(
+    migrated.listProfiles().map(({ name, target, secret_env, credential_ref }) => ({
+      name,
+      target,
+      secret_env,
+      credential_ref,
+    })),
+    [
+      { name: "hosted", target: null, secret_env: "APP_DATABASE_URL", credential_ref: null },
+      { name: "legacy_dual", target: null, secret_env: "LEGACY_DATABASE_URL", credential_ref: null },
+      { name: "local", target: "./local.sqlite", secret_env: null, credential_ref: null },
+    ],
+  );
+  assert.ok(
+    migrated.db.prepare(
+      "SELECT 1 FROM pragma_table_info('connections') WHERE name = 'credential_ref'",
+    ).get(),
+  );
+  assert.ok(
+    migrated.db.prepare(
+      "SELECT 1 FROM schema_migrations WHERE name = 'credential_refs_v1'",
+    ).get(),
+  );
+  assert.throws(() => migrated.db.prepare(
+    `INSERT INTO profiles
+      (name, target, secret_env, credential_ref, read_only, created_at, updated_at)
+     VALUES ('ambiguous', './db.sqlite', 'DATABASE_URL', NULL, 1, '', '')`,
+  ).run());
+  migrated.close();
+
+  const reopened = new StateStore(home, () => new Date("2026-01-03T00:00:00Z"));
+  assert.equal(reopened.listProfiles().length, 3);
+  reopened.close();
+});
+
+
 test("migrations retain their registry and repair a migration/schema mismatch", () => {
   const home = createTemporaryDirectory("stateql-migration-test-");
   const initial = new StateQL({ home });
@@ -555,6 +613,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "history_sql_v1",
       "operation_outcomes_v1",
       "history_origin_v1",
+      "credential_refs_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");

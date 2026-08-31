@@ -43,6 +43,7 @@ export interface ConnectionRecord {
   database_name: string;
   source: string;
   secret_env: string | null;
+  credential_ref: string | null;
   read_only: number;
   version: number;
   created_at: string;
@@ -52,6 +53,7 @@ export interface ProfileRecord {
   name: string;
   target: string | null;
   secret_env: string | null;
+  credential_ref: string | null;
   read_only: number;
   created_at: string;
   updated_at: string;
@@ -420,19 +422,21 @@ export class StateStore {
     name: string;
     target?: string;
     secretEnv?: string;
+    credentialRef?: string;
     readOnly: boolean;
   }): ProfileRecord {
     const timestamp = this.now().toISOString();
     this.db
       .prepare(
         `INSERT INTO profiles
-          (name, target, secret_env, read_only, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          (name, target, secret_env, credential_ref, read_only, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.name,
         input.target ?? null,
         input.secretEnv ?? null,
+        input.credentialRef ?? null,
         input.readOnly ? 1 : 0,
         timestamp,
         timestamp,
@@ -467,6 +471,7 @@ export class StateStore {
     databaseName: string;
     source: string;
     secretEnv?: string;
+    credentialRef?: string;
     readOnly: boolean;
   }): ConnectionRecord | undefined {
     this.db.exec("BEGIN IMMEDIATE");
@@ -489,8 +494,8 @@ export class StateStore {
         .prepare(
           `INSERT INTO connections
             (id, session_id, name, driver, database_name, source, secret_env,
-             read_only, version, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+             credential_ref, read_only, version, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
         )
         .run(
           id,
@@ -500,6 +505,7 @@ export class StateStore {
           input.databaseName,
           input.source,
           input.secretEnv ?? null,
+          input.credentialRef ?? null,
           input.readOnly ? 1 : 0,
           timestamp,
         );
@@ -740,6 +746,8 @@ export class StateStore {
              AND previous_connection.source = current_connection.source
              AND COALESCE(previous_connection.secret_env, '') =
                  COALESCE(current_connection.secret_env, '')
+             AND COALESCE(previous_connection.credential_ref, '') =
+                 COALESCE(current_connection.credential_ref, '')
              AND previous_connection.database_name = current_connection.database_name
            ORDER BY operations.created_at DESC LIMIT 1`,
         )

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { StateQLError } from "./errors.js";
 import type { ConnectionRecord } from "./store.js";
-import type { Driver, StateConfidence } from "./types.js";
+import type { CredentialSource, Driver, StateConfidence } from "./types.js";
 
 export function databaseIdentity(connection: ConnectionRecord): unknown {
   return {
@@ -9,6 +9,7 @@ export function databaseIdentity(connection: ConnectionRecord): unknown {
     database: connection.database_name,
     source: connection.source,
     secretEnvironment: connection.secret_env,
+    credentialReference: connection.credential_ref,
   };
 }
 
@@ -55,13 +56,17 @@ export function mongoDatabaseName(target: string): string {
 export function credentialSource(
   value: string,
   expectedDriver?: Driver,
+  referenceSource: CredentialSource = "secret_env",
 ): { driver: Driver; source: string } {
+  const sourceLabel = referenceSource === "credential_ref"
+    ? "Credential reference"
+    : "Secret environment variable";
   const explicitSqlite = /^sqlite:(?!\/\/)/i.test(value);
   const driver = explicitSqlite ? "sqlite" : detectDriver(value);
   if (driver === "sqlite" && (!explicitSqlite || value.length === 7)) {
     throw new StateQLError(
       "INVALID_COMMAND",
-      "Secret environment variable must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source; MongoDB URLs are also supported.",
+      `${sourceLabel} must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source; MongoDB URLs are also supported.`,
       {
         suggestedAction:
           "Store the full database URL, or prefix an SQLite path with sqlite:.",
@@ -75,7 +80,7 @@ export function credentialSource(
     } catch {
       throw new StateQLError(
         "INVALID_COMMAND",
-        "Secret environment variable must contain a valid database URL.",
+        `${sourceLabel} must contain a valid database URL.`,
       );
     }
   }
@@ -135,4 +140,16 @@ export function validateProfileName(name: string): void {
 
 export function isEnvironmentName(name: string): boolean {
   return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
+}
+
+export function validateCredentialRef(reference: unknown): asserts reference is string {
+  if (
+    typeof reference === "string" &&
+    reference.trim().length > 0 &&
+    reference.length <= 1_024
+  ) return;
+  throw new StateQLError(
+    "INVALID_COMMAND",
+    "Credential reference must be a nonempty string of at most 1024 characters.",
+  );
 }

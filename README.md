@@ -76,12 +76,13 @@ its cache entry is valid. Use `--cache bypass` when a fresh read is required.
 
 ## Connections and profiles
 
-A connection accepts exactly one source: a direct target, `--env`, or
-`--profile`.
+A connection accepts exactly one source: a direct target, `--env`,
+`--credential-ref`, or `--profile`.
 
 ```bash
 stql connect <sqlite-path|postgres-url|mysql-url|mongodb-url> [--name NAME] [--read-write]
 stql connect --env ENV [--name NAME] [--read-write]
+stql connect --credential-ref REF [--name NAME] [--read-write]
 stql connect --profile NAME
 stql disconnect
 stql status
@@ -113,18 +114,25 @@ connection metadata.
 
 ### Local profiles
 
-Profiles store connection targets, read-only policy, and environment-variable
-names. Credential values are never stored. Profiles persist under `STQL_HOME`
-with other StateQL metadata.
+Profiles store exactly one connection target, environment-variable name, or
+opaque credential reference together with read-only policy. Credential values
+are never stored. Profiles persist under `STQL_HOME` with other StateQL
+metadata, and list/show responses include `credential_ref` when configured.
 
 ```bash
 stql profile add local ./app.sqlite --read-write
 stql profile add production --env PROD_DATABASE_URL --read-only
+stql profile add hosted --credential-ref 'vault://team/app' --read-only
 stql profile list
 stql profile show production
 stql connect local
 stql connect --profile production
 ```
+
+Credential references are bounded nonempty opaque strings; StateQL does not
+apply environment-variable syntax or normalization to them. They can only be
+resolved by a trusted host `CredentialResolver`, so the standalone CLI may
+store them in profiles but cannot connect with them.
 
 A bare connection target matching a profile name resolves to that profile;
 otherwise it remains a path or database URL.
@@ -464,8 +472,9 @@ for user confirmation before changing membership or the shared connection.
 
 ### Harness credential resolution
 
-Library integrations can resolve a profile's credential reference through a
-trusted approval or secret-storage layer instead of mutating `process.env`:
+Library integrations can resolve environment-variable names or opaque
+credential references through a trusted approval or secret-storage layer
+instead of mutating `process.env`:
 
 ```ts
 import {
@@ -479,6 +488,7 @@ async function resolveCredential(
 ): Promise<string | undefined> {
   const approved = await credentialBroker.request({
     reference: request.reference,
+    source: request.source ?? "secret_env",
     actor: request.actorId,
     session: request.session.id,
     operation: request.operation,
@@ -496,13 +506,16 @@ const stateql = StateQL.forActor({
 });
 ```
 
-When no custom resolver is configured, StateQL reads references from
-`process.env`. A configured resolver is authoritative: returning `undefined`
-produces `CREDENTIAL_UNAVAILABLE` and never falls back to the process
-environment. Resolvers may throw `CredentialResolutionError` with `denied`,
-`cancelled`, `timeout`, or `unavailable` to produce controlled, secret-free
-failures. Unknown resolver errors are replaced with a generic
-`CREDENTIAL_RESOLUTION_FAILED` response.
+When no custom resolver is configured, StateQL reads only `secret_env`
+references from `process.env`; `credential_ref` never falls back to the
+environment. A configured resolver is authoritative for both sources: returning
+`undefined` produces `CREDENTIAL_UNAVAILABLE` and never falls back to the
+process environment. Resolver requests include `source` (`secret_env` or
+`credential_ref`) while retaining `reference`; source may be omitted only on
+legacy secret-environment request objects. Resolvers may throw
+`CredentialResolutionError` with `denied`, `cancelled`, `timeout`, or
+`unavailable` to produce controlled, secret-free failures. Unknown resolver
+errors are replaced with a generic `CREDENTIAL_RESOLUTION_FAILED` response.
 
 StateQL calls the resolver only immediately before database access, after SQL
 safety and duplicate checks. Requests contain actor and session identity, the

@@ -20,6 +20,7 @@ import {
   isEnvironmentName,
   mongoDatabaseName,
   normalizeSqliteSource,
+  validateCredentialRef,
   validateProfileName,
   version,
 } from "./connection.js";
@@ -78,6 +79,7 @@ import type {
   CountData,
   CredentialAccess,
   CredentialOperation,
+  CredentialSource,
   CredentialRequest,
   CredentialResolver,
   DisconnectData,
@@ -263,16 +265,20 @@ export class StateQL {
           "Commit or roll back the active transaction before connecting again.",
         );
       }
-      const sourceCount = [target, options.profile, options.secretEnv]
-        .filter((value) => value !== undefined).length;
-      if (sourceCount > 1) {
+      const sourceCount = [
+        target,
+        options.profile,
+        options.secretEnv,
+        options.credentialRef,
+      ].filter((value) => value !== undefined).length;
+      if (sourceCount !== 1) {
         throw new StateQLError(
           "INVALID_COMMAND",
-          "Use exactly one connection target, profile, or secret environment variable.",
+          "Use exactly one connection target, profile, secret environment variable, or credential reference.",
         );
       }
       const implicitProfile =
-        !options.profile && !options.secretEnv && target
+        !options.profile && !options.secretEnv && !options.credentialRef && target
           ? this.store.getProfile(target)
           : undefined;
       const profile = options.profile
@@ -285,22 +291,39 @@ export class StateQL {
           { suggestedAction: "Run stql profile list." },
         );
       }
+      if (
+        profile &&
+        [profile.target, profile.secret_env, profile.credential_ref]
+          .filter((value) => value !== null).length !== 1
+      ) {
+        throw new StateQLError(
+          "STATE_CORRUPTED",
+          `Profile "${profile.name}" does not have exactly one connection source.`,
+        );
+      }
 
       const resolvedTarget = profile?.target ?? target;
       const secretEnv = options.secretEnv ?? profile?.secret_env ?? undefined;
-      if (secretEnv && !isEnvironmentName(secretEnv)) {
+      const credentialRef = options.credentialRef ?? profile?.credential_ref ?? undefined;
+      if (secretEnv !== undefined && !isEnvironmentName(secretEnv)) {
         throw new StateQLError(
           "INVALID_COMMAND",
           "Secret environment variable name is invalid.",
         );
       }
+      if (credentialRef !== undefined) validateCredentialRef(credentialRef);
+      const credentialReference = secretEnv ?? credentialRef;
+      const credentialReferenceSource: CredentialSource | undefined = secretEnv !== undefined
+        ? "secret_env"
+        : credentialRef !== undefined ? "credential_ref" : undefined;
       const readOnly =
         options.readOnly ??
         (profile ? Boolean(profile.read_only) : true);
       const context = this.executionContext(options);
-      const secret = secretEnv
+      const secret = credentialReference && credentialReferenceSource
         ? await this.resolveCredential(
-            secretEnv,
+            credentialReference,
+            credentialReferenceSource,
             session,
             "connect",
             readOnly ? "read" : "write",
@@ -314,32 +337,32 @@ export class StateQL {
       if (!secret) {
         throw new StateQLError("INVALID_COMMAND", "Connection target is required.");
       }
-      const resolvedSource = secretEnv
-        ? credentialSource(secret)
+      const resolvedSource = credentialReferenceSource
+        ? credentialSource(secret, undefined, credentialReferenceSource)
         : { driver: detectDriver(secret), source: secret };
       const { driver } = resolvedSource;
       if (
         driver !== "sqlite" &&
-        !secretEnv &&
+        !credentialReference &&
         databaseUrlHasSecret(secret)
       ) {
         throw new StateQLError(
           "PERMISSION_DENIED",
-          `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env.`,
+          `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`,
           {
             suggestedAction:
-              "Set the URL in an environment variable and reconnect with --env NAME.",
+              "Use an environment variable or trusted host credential reference.",
           },
         );
       }
 
-      const adapterSource = secretEnv
+      const adapterSource = credentialReferenceSource
         ? resolvedSource.source
         : driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
       const source =
         driver === "sqlite"
           ? adapterSource
-          : secretEnv
+          : credentialReferenceSource
             ? redact(secret)
             : adapterSource;
       const databaseName =
@@ -356,6 +379,7 @@ export class StateQL {
         database_name: databaseName,
         source,
         secret_env: secretEnv ?? null,
+        credential_ref: credentialRef ?? null,
         read_only: readOnly ? 1 : 0,
         version: 0,
         created_at: this.now().toISOString(),
@@ -387,6 +411,7 @@ export class StateQL {
         databaseName,
         source,
         ...(secretEnv ? { secretEnv } : {}),
+        ...(credentialRef ? { credentialRef } : {}),
         readOnly,
       });
       if (!connection) {
@@ -422,10 +447,12 @@ export class StateQL {
   ): Promise<Response<ProfileData>> {
     return this.run("profile.add", async () => {
       validateProfileName(name);
-      if (Boolean(target) === Boolean(options.secretEnv)) {
+      const sourceCount = [target, options.secretEnv, options.credentialRef]
+        .filter((value) => value !== undefined).length;
+      if (sourceCount !== 1 || target === "") {
         throw new StateQLError(
           "INVALID_COMMAND",
-          "Profile requires exactly one target or secret environment variable.",
+          "Profile requires exactly one target, secret environment variable, or credential reference.",
         );
       }
       if (this.store.getProfile(name)) {
@@ -434,11 +461,14 @@ export class StateQL {
           `Profile "${name}" already exists.`,
         );
       }
-      if (options.secretEnv && !isEnvironmentName(options.secretEnv)) {
+      if (options.secretEnv !== undefined && !isEnvironmentName(options.secretEnv)) {
         throw new StateQLError(
           "INVALID_COMMAND",
           "Secret environment variable name is invalid.",
         );
+      }
+      if (options.credentialRef !== undefined) {
+        validateCredentialRef(options.credentialRef);
       }
 
       let storedTarget = target;
@@ -447,7 +477,7 @@ export class StateQL {
         if (driver !== "sqlite" && databaseUrlHasSecret(target)) {
           throw new StateQLError(
             "PERMISSION_DENIED",
-            `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env.`,
+            `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`,
           );
         }
         if (driver === "sqlite") storedTarget = normalizeSqliteSource(target);
@@ -457,6 +487,7 @@ export class StateQL {
         name,
         target: storedTarget,
         secretEnv: options.secretEnv,
+        credentialRef: options.credentialRef,
         readOnly: options.readOnly ?? true,
       });
       return {
@@ -2029,6 +2060,7 @@ export class StateQL {
             name: command.name,
             readOnly: command.read_only,
             secretEnv: command.secret_env,
+            credentialRef: command.credential_ref,
             profile: command.profile,
             timeoutMs: command.timeout_ms,
           });
@@ -2043,6 +2075,7 @@ export class StateQL {
             {
               readOnly: command.read_only ?? true,
               secretEnv: command.secret_env,
+              credentialRef: command.credential_ref,
             },
           );
         case "profile.list":
@@ -2916,9 +2949,14 @@ export class StateQL {
     access: CredentialAccess,
     context: AdapterContext,
   ): Promise<string> {
-    if (!connection.secret_env) return connection.source;
+    const reference = connection.secret_env ?? connection.credential_ref;
+    if (!reference) return connection.source;
+    const source: CredentialSource = connection.secret_env
+      ? "secret_env"
+      : "credential_ref";
     const value = await this.resolveCredential(
-      connection.secret_env,
+      reference,
+      source,
       session,
       operation,
       access,
@@ -2933,11 +2971,12 @@ export class StateQL {
         },
       },
     );
-    return credentialSource(value, connection.driver).source;
+    return credentialSource(value, connection.driver, source).source;
   }
 
   private async resolveCredential(
     reference: string,
+    source: CredentialSource,
     session: SessionRecord,
     operation: CredentialOperation,
     access: CredentialAccess,
@@ -2961,8 +3000,10 @@ export class StateQL {
           new CredentialResolutionError("timeout"),
         );
       }
-      const value = env[reference];
-      if (value) return value;
+      if (source === "secret_env") {
+        const value = env[reference];
+        if (value) return value;
+      }
       throw credentialStateQLError(
         reference,
         new CredentialResolutionError("unavailable"),
@@ -2971,6 +3012,7 @@ export class StateQL {
 
     const request: CredentialRequest = {
       reference,
+      source,
       actorId: this.actorId,
       session: { id: session.id, name: session.name },
       operation,
