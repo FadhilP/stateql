@@ -260,6 +260,8 @@ export interface StateQLOptions extends ExecutionOptions {
   maxResultBytes?: number;
   maxStateBytes?: number;
   credentialResolver?: CredentialResolver;
+  /** Maximum time allowed for one credential resolution; defaults to two minutes. */
+  credentialTimeoutMs?: number;
   now?: () => Date;
 }
 

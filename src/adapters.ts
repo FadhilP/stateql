@@ -26,6 +26,7 @@ export interface WriteResult {
 
 export interface AdapterContext {
   deadline: number;
+  timeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -80,6 +81,7 @@ export function createAdapterContext(
 ): AdapterContext {
   return {
     deadline: Date.now() + timeoutMs,
+    timeoutMs,
     ...(signal ? { signal } : {}),
   };
 }

@@ -137,6 +137,7 @@ import {
 
 const DEFAULT_SNAPSHOT_HISTORY_LIMIT = 50;
 const MAX_SNAPSHOT_HISTORY_LIMIT = 100;
+const DEFAULT_CREDENTIAL_RESOLUTION_TIMEOUT_MS = 120_000;
 
 interface ActionResult<T> {
   data: T;
@@ -176,6 +177,7 @@ export class StateQL {
   private readonly maxResultRows: number;
   private readonly maxResultBytes: number;
   private readonly timeoutMs: number;
+  private readonly credentialTimeoutMs: number;
   private readonly signal?: AbortSignal;
   private readonly commandContexts = new AsyncLocalStorage<CommandExecutionContext>();
   private readonly credentialResolver?: CredentialResolver;
@@ -214,6 +216,10 @@ export class StateQL {
       "maxResultBytes",
     );
     this.timeoutMs = executionTimeout(options.timeoutMs ?? 30_000);
+    this.credentialTimeoutMs = executionTimeout(
+      options.credentialTimeoutMs ?? DEFAULT_CREDENTIAL_RESOLUTION_TIMEOUT_MS,
+      "credentialTimeoutMs",
+    );
     const maxStateBytes = positiveInteger(
       options.maxStateBytes ?? 256 * 1024 * 1024,
       "maxStateBytes",
@@ -2987,50 +2993,54 @@ export class StateQL {
     > = {},
   ): Promise<string> {
     const resolver = this.credentialResolver;
+    const credentialContext = createAdapterContext(
+      this.credentialTimeoutMs,
+      context.signal,
+    );
+    let value: string | undefined;
     if (!resolver) {
-      if (context.signal?.aborted) {
+      if (credentialContext.signal?.aborted) {
         throw credentialStateQLError(
           reference,
           new CredentialResolutionError("cancelled"),
         );
       }
-      if (context.deadline <= Date.now()) {
+      if (credentialContext.deadline <= Date.now()) {
         throw credentialStateQLError(
           reference,
           new CredentialResolutionError("timeout"),
         );
       }
-      if (source === "secret_env") {
-        const value = env[reference];
-        if (value) return value;
+      if (source === "secret_env") value = env[reference];
+    } else {
+      const request: CredentialRequest = {
+        reference,
+        source,
+        actorId: this.actorId,
+        session: { id: session.id, name: session.name },
+        operation,
+        access,
+        ...(context.signal ? { signal: context.signal } : {}),
+        ...details,
+      };
+      try {
+        value = await resolveCredentialBeforeDeadline(
+          resolver,
+          request,
+          credentialContext,
+        );
+      } catch (error) {
+        throw credentialStateQLError(reference, error);
       }
+    }
+    if (!value) {
       throw credentialStateQLError(
         reference,
         new CredentialResolutionError("unavailable"),
       );
     }
-
-    const request: CredentialRequest = {
-      reference,
-      source,
-      actorId: this.actorId,
-      session: { id: session.id, name: session.name },
-      operation,
-      access,
-      ...(context.signal ? { signal: context.signal } : {}),
-      ...details,
-    };
-    try {
-      const value = await resolveCredentialBeforeDeadline(
-        resolver,
-        request,
-        context,
-      );
-      if (!value) throw new CredentialResolutionError("unavailable");
-      return value;
-    } catch (error) {
-      throw credentialStateQLError(reference, error);
-    }
+    context.deadline = Date.now() + (context.timeoutMs ?? this.timeoutMs);
+    return value;
   }
 
   private async openAdapter(
@@ -3521,7 +3531,7 @@ function credentialStateQLError(
       case "timeout":
         return new StateQLError(
           "DEADLINE_EXCEEDED",
-          "Credential resolution exceeded the operation deadline.",
+          "Credential resolution exceeded the credential deadline.",
           { retryable: true },
         );
     }
@@ -3536,17 +3546,17 @@ function credentialStateQLError(
 function safeCredentialErrorMessage(error: unknown, source: string): string {
   return redact(errorMessage(error).split(source).join("[credential redacted]"))
     .replace(
-      /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/giu,
+      /\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+(?::[^\s\/@]*)?@/giu,
       "$1***@",
     );
 }
 
-function executionTimeout(value: number): number {
-  const timeout = positiveInteger(value, "timeoutMs");
+function executionTimeout(value: number, name = "timeoutMs"): number {
+  const timeout = positiveInteger(value, name);
   if (timeout > 2_147_483_647) {
     throw new StateQLError(
       "INVALID_COMMAND",
-      "timeoutMs cannot exceed 2147483647 milliseconds.",
+      `${name} cannot exceed 2147483647 milliseconds.`,
     );
   }
   return timeout;

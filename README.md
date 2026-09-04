@@ -415,6 +415,7 @@ const stateql = StateQL.forActor({
   home: "./.stql",
   actor: "pi-session-id",
   timeoutMs: 30_000,
+  credentialTimeoutMs: 120_000,
   maxResultBytes: 16 * 1024 * 1024,
   maxStateBytes: 256 * 1024 * 1024,
 });
@@ -505,6 +506,10 @@ const stateql = StateQL.forActor({
   credentialResolver: resolveCredential,
 });
 ```
+
+Credential resolution has its own two-minute default deadline
+(`credentialTimeoutMs`) and remains cancellable through `request.signal`.
+The database-operation timeout begins after a credential is resolved.
 
 When no custom resolver is configured, StateQL reads only `secret_env`
 references from `process.env`; `credential_ref` never falls back to the

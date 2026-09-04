@@ -38,6 +38,10 @@ function credentialFixture() {
   };
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 test("custom credential resolvers receive bounded operation context and resolve once per adapter operation", async () => {
   const fixture = credentialFixture();
   const { stateql, requests } = fixture;
@@ -447,9 +451,31 @@ test("credential failures are controlled, cancellable, and do not expose resolve
   assert.equal(resolverCalled, false);
   cancelled.close();
 
+  let observedAbort = false;
+  const activeController = new AbortController();
+  const activelyCancelled = new StateQL({
+    home: join(root, "actively-cancelled"),
+    signal: activeController.signal,
+    credentialResolver(request) {
+      return new Promise(() => {
+        request.signal?.addEventListener("abort", () => {
+          observedAbort = true;
+        }, { once: true });
+      });
+    },
+  });
+  const pending = activelyCancelled.connect(undefined, {
+    secretEnv: "ACTIVELY_CANCELLED_DATABASE_URL",
+  });
+  setTimeout(() => activeController.abort(), 10);
+  assertFailure(await pending, "OPERATION_CANCELLED");
+  assert.equal(observedAbort, true);
+  activelyCancelled.close();
+
   const timedOut = new StateQL({
     home: join(root, "timeout"),
-    timeoutMs: 5,
+    timeoutMs: 1_000,
+    credentialTimeoutMs: 5,
     credentialResolver: () => new Promise(() => undefined),
   });
   assertFailure(
@@ -457,6 +483,47 @@ test("credential failures are controlled, cancellable, and do not expose resolve
     "DEADLINE_EXCEEDED",
   );
   timedOut.close();
+});
+
+test("credential resolution has a separate deadline before the database deadline starts", async () => {
+  const root = createTemporaryDirectory("stateql-credential-deadline-test-");
+  const database = join(root, "deadline.sqlite");
+  const stateql = new StateQL({
+    home: join(root, "state"),
+    credentialTimeoutMs: 500,
+    credentialResolver: async (request) => {
+      if (request.operation === "query") await delay(150);
+      return `sqlite:${database}`;
+    },
+  });
+  const slowSql = `
+    WITH RECURSIVE count_up(value) AS (
+      SELECT 0
+      UNION ALL
+      SELECT value + 1 FROM count_up WHERE value < 1000000000
+    )
+    SELECT sum(value) AS total FROM count_up
+  `;
+  try {
+    await succeed(stateql.connect(undefined, {
+      secretEnv: "DEADLINE_DATABASE_URL",
+      readOnly: false,
+      timeoutMs: 1_000,
+    }));
+    const started = Date.now();
+    const response = await stateql.query(slowSql, {
+      cache: "bypass",
+      timeoutMs: 100,
+    });
+    assert.equal(response.ok, false);
+    if (!response.ok) {
+      assert.equal(response.error.code, "DEADLINE_EXCEEDED");
+      assert.equal(response.error.executed, true);
+    }
+    assert.ok(Date.now() - started >= 200);
+  } finally {
+    stateql.close();
+  }
 });
 
 test("resolved sources stay out of responses, snapshots, and history", async () => {
