@@ -135,6 +135,7 @@ export interface HistoryRecord {
   origin: CommandOrigin;
   command: string;
   sql: string | null;
+  target: string | null;
   handle: string | null;
   executed: number;
   cached: number;
@@ -1339,6 +1340,7 @@ export class StateStore {
     origin?: CommandOrigin;
     command: string;
     sql?: string;
+    target?: string;
     handle?: string;
     executed: boolean;
     cached: boolean;
@@ -1350,9 +1352,9 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO history
-          (id, timestamp, session_id, actor_id, origin, command, sql, handle,
+          (id, timestamp, session_id, actor_id, origin, command, sql, target, handle,
            executed, cached, success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1362,6 +1364,7 @@ export class StateStore {
         input.origin ?? "legacy",
         input.command,
         boundedHistorySql(input.sql),
+        input.target?.slice(0, 1024) ?? null,
         input.handle ?? null,
         input.executed ? 1 : 0,
         input.cached ? 1 : 0,

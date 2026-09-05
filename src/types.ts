@@ -109,6 +109,7 @@ export interface HistoryEntry {
   origin: CommandOrigin;
   command: string;
   sql: string | null;
+  target?: string | null;
   handle: string | null;
   executed: boolean;
   cached: boolean;

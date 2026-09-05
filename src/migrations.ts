@@ -92,6 +92,11 @@ const MIGRATIONS: Migration[] = [
     apply: migrateCredentialRefs,
     validate: validateCredentialRefs,
   },
+  {
+    name: "history_target_v1",
+    apply(db) { addColumn(db, "history", "target", "TEXT"); },
+    validate(db) { requireColumns(db, "history", ["target"]); },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {

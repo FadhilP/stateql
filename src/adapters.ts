@@ -65,7 +65,7 @@ export interface Adapter {
   readonly confidence: StateConfidence;
   ping(): Promise<void>;
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
-  write(sql: string, params: SqlParameters): Promise<WriteResult>;
+  write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult>;
   writeBatch(
     operations: OperationRecord[],
     isolation: string,
@@ -181,8 +181,8 @@ class SQLiteAdapter implements Adapter {
     return this.call<ReadResult>("read", [sql, params], false, false);
   }
 
-  async write(sql: string, params: SqlParameters): Promise<WriteResult> {
-    return this.call<WriteResult>("write", [sql, params], true, false);
+  async write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult> {
+    return this.call<WriteResult>("write", [sql, params, expectedRows], true, false);
   }
 
   async writeBatch(
@@ -363,7 +363,7 @@ class PostgresAdapter implements Adapter {
     }
   }
 
-  async write(sql: string, params: SqlParameters): Promise<WriteResult> {
+  async write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
     try {
       await this.connect();
@@ -376,6 +376,7 @@ class PostgresAdapter implements Adapter {
     try {
       await this.setLocalDeadline();
       const result = await this.query(sql, postgresParams(params), true);
+      if (expectedRows === 1 && result.rowCount !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
       committing = true;
       await this.query("COMMIT", [], true);
       return { affectedRows: result.rowCount ?? 0 };
@@ -479,6 +480,19 @@ class PostgresAdapter implements Adapter {
     const [schema, name] = table.includes(".")
       ? table.split(".", 2)
       : ["public", table];
+    if (kind === "editable") {
+      await this.setLocalDeadline();
+      const result = await this.query(
+        `SELECT c.column_name AS name, c.data_type AS type, c.is_nullable = 'YES' AS nullable,
+          (c.is_generated = 'ALWAYS' OR c.is_identity = 'YES') AS generated,
+          COALESCE(k.ordinal_position, 0) AS key
+         FROM information_schema.columns c
+         LEFT JOIN information_schema.key_column_usage k ON k.table_schema = c.table_schema AND k.table_name = c.table_name AND k.column_name = c.column_name
+          AND EXISTS (SELECT 1 FROM information_schema.table_constraints t WHERE t.constraint_schema = k.constraint_schema AND t.constraint_name = k.constraint_name AND t.table_name = k.table_name AND t.constraint_type = 'PRIMARY KEY')
+         WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position`, [schema, name], false);
+      const objects = await this.query("SELECT table_type FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2", [schema, name], false);
+      return { writable: objects.rows[0]?.table_type === "BASE TABLE", columns: result.rows.map(column => ({ ...column, key: Number(column.key) })) };
+    }
     await this.setLocalDeadline();
     const columns = await this.query(
       `SELECT column_name AS name, data_type AS type,
@@ -627,7 +641,7 @@ class MySqlAdapter implements Adapter {
     }
   }
 
-  async write(sql: string, params: SqlParameters): Promise<WriteResult> {
+  async write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
     let values: ExecuteValues[];
     try {
@@ -641,12 +655,19 @@ class MySqlAdapter implements Adapter {
       if (error instanceof AdapterExecutionError) throw error;
       throw new AdapterWriteError(errorText(error), false);
     }
+    let committing = false;
     try {
       const [result] = await this.query(sql, values, true, true);
+      if (expectedRows === 1 && mysqlAffectedRows(result) !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
+      committing = true;
       await this.query("COMMIT", [], true, false);
       return { affectedRows: mysqlAffectedRows(result) };
     } catch (error) {
-      await this.rollbackQuietly();
+      const rolledBack = await this.rollbackQuietly();
+      if (!committing && rolledBack) {
+        if (error instanceof AdapterExecutionError) throw new AdapterExecutionError(error.message, error.reason, false);
+        throw new AdapterWriteError(errorText(error), false);
+      }
       if (error instanceof AdapterExecutionError) throw error;
       throw new AdapterWriteError(errorText(error), true);
     }
@@ -757,6 +778,17 @@ class MySqlAdapter implements Adapter {
       : table.slice(0, separator);
     const name = separator === -1 ? table : table.slice(separator + 1);
     if (!schema || !name) throw new Error(`Invalid table name "${table}".`);
+    if (kind === "editable") {
+      const [result] = await this.query(
+        `SELECT c.COLUMN_NAME AS name, c.DATA_TYPE AS type, c.IS_NULLABLE = 'YES' AS nullable,
+          c.EXTRA LIKE '%GENERATED%' AS \`generated\`, COALESCE(k.ORDINAL_POSITION, 0) AS \`key\`
+         FROM information_schema.columns c LEFT JOIN information_schema.key_column_usage k
+          ON k.TABLE_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME AND k.COLUMN_NAME = c.COLUMN_NAME AND k.CONSTRAINT_NAME = 'PRIMARY'
+         WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ? ORDER BY c.ORDINAL_POSITION`, [schema, name], false, true);
+      const [objects] = await this.query("SELECT ENGINE AS engine FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", [schema, name], false, true);
+      return { writable: String(mysqlRows(objects)[0]?.engine).toLowerCase() === "innodb",
+        columns: mysqlRows(result).map(column => ({ ...column, nullable: Boolean(column.nullable), generated: Boolean(column.generated), key: Number(column.key) })) };
+    }
     const [columnResult] = await this.query(
       `SELECT COLUMN_NAME AS name, DATA_TYPE AS type,
               IS_NULLABLE = 'YES' AS nullable

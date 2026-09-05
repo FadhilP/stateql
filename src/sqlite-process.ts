@@ -80,7 +80,7 @@ function execute(request: Request): unknown {
     }
     case "write": {
       if (readOnly) throw new Error("Connection is read-only.");
-      const [sql, params] = request.args as [string, SqlParameters];
+      const [sql, params, expectedRows] = request.args as [string, SqlParameters, 1 | undefined];
       try {
         database.exec("BEGIN");
       } catch (error) {
@@ -88,6 +88,7 @@ function execute(request: Request): unknown {
       }
       try {
         const result = bindRun(database.prepare(sql), params);
+        if (expectedRows === 1 && Number(result.changes) !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
         database.exec("COMMIT");
         return { affectedRows: Number(result.changes) };
       } catch (error) {
@@ -180,6 +181,11 @@ function inspect(database: DatabaseSync, kind: string, table?: string): unknown 
   }
   if (!table) throw new Error(`Table is required for inspect ${kind}.`);
   const quoted = quoteSqliteLiteral(table);
+  if (kind === "editable") {
+    const object = database.prepare("SELECT type FROM sqlite_master WHERE name = ?").get(table) as { type: string } | undefined;
+    const columns = database.prepare(`PRAGMA table_xinfo(${quoted})`).all() as Array<Record<string, unknown>>;
+    return { writable: object?.type === "table", columns: columns.map(column => ({ name: String(column.name), type: String(column.type).toLowerCase(), nullable: !column.notnull && !column.pk, generated: Number(column.hidden) !== 0, key: Number(column.pk) })) };
+  }
   const columns = database
     .prepare(`PRAGMA table_info(${quoted})`)
     .all() as Array<Record<string, unknown>>;

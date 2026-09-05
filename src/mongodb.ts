@@ -279,7 +279,7 @@ export class MongoAdapter {
     }
   }
 
-  async write(command: MongoWriteCommand): Promise<MongoWriteResult> {
+  async write(command: MongoWriteCommand, expectedRows?: 1): Promise<MongoWriteResult> {
     let value: MongoWriteCommand;
     try {
       value = validateMongoWriteCommand(command);
@@ -295,14 +295,18 @@ export class MongoAdapter {
       throw new AdapterWriteError(errorText(error), false);
     }
 
+    if (expectedRows === 1 && (value.operation !== "updateOne" || value.options?.upsert)) throw new AdapterWriteError("Conditional edits require updateOne without upsert.", false);
     try {
-      return await withContext(
+      const result = await withContext(
         this.executeWrite(value),
         this.context,
         () => this.stop(),
         true,
       );
+      if (expectedRows === 1 && result.outcome.matched_count !== 1) throw new AdapterWriteError("ROW_CONFLICT: The document changed or was removed.", false);
+      return result;
     } catch (error) {
+      if (error instanceof AdapterWriteError) throw error;
       const stopped = writeStoppedError(error, this.context, true);
       if (stopped) throw stopped;
       throw new AdapterWriteError(errorText(error), knownNoWrite(error) ? false : true);
@@ -412,6 +416,10 @@ export class MongoAdapter {
       await this.requireCollection(collectionName);
       if (kind === "constraints") {
         return { collection: collectionName, constraints: [] };
+      }
+      if (kind === "editable") {
+        const objects = await this.client.db(this.databaseName).listCollections({ name: collectionName }, { nameOnly: true, signal: operationSignal(this.context), maxTimeMS: remainingMilliseconds(this.context) }).toArray();
+        return { writable: objects[0]?.type === "collection", columns: [] };
       }
       const columns = await this.sampleColumns(collectionName);
       if (kind === "columns") return { collection: collectionName, columns };

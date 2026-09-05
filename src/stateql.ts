@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
+import { compileTableUpdate, editableRow, parseTableUpdate, type EditableTable, type TableIdentity, type TableChange, type TableUpdate } from "./table-editor.js";
 import { writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
@@ -113,6 +115,8 @@ import type {
   RollbackTransactionData,
   RowsData,
   RowsOptions,
+  Row,
+  Column,
   SqlParameters,
   StateConfidence,
   StateQLActorOptions,
@@ -183,6 +187,10 @@ export class StateQL {
   private readonly credentialResolver?: CredentialResolver;
   private readonly now: () => Date;
   private closed = false;
+  private readonly tableResults = new Map<string, EditableTable>();
+  private readonly editTokens = new Map<string, { metadata: EditableTable; original: Row; sessionId: string; connectionId: string; stateVersion: string; expires: number }>();
+  // ponytail: cache one bounded immutable result; use indexed result storage if larger results are needed.
+  private panelRows?: { id: string; json: string; rows: Row[] };
 
   constructor(options: StateQLOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -253,6 +261,9 @@ export class StateQL {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.panelRows = undefined;
+    this.tableResults.clear();
+    this.editTokens.clear();
     this.store.close();
   }
 
@@ -1240,6 +1251,169 @@ export class StateQL {
     });
   }
 
+  /** Owned, full-value pages for host UIs. Reading a page does not add a command to history. */
+  readMaterialized(id: string, options: RowsOptions & { signal?: AbortSignal } = {}): RowsData & { columns: Column[]; row_tokens: Array<string | null>; writable_columns: string[]; editing_reason?: string } {
+    options.signal?.throwIfAborted();
+    const result = this.panelResult(id);
+    const offset = nonNegativeInteger(options.offset ?? 0, "offset");
+    const limit = positiveInteger(options.limit ?? 100, "limit");
+    if (limit > 100 || offset > 10_000) throw new StateQLError("OUTPUT_LIMIT_EXCEEDED", "Page bounds exceeded.");
+    const all = this.fullResultRows(result);
+    const rows: Row[] = [];
+    let bytes = 0;
+    for (const row of all.slice(offset, offset + limit)) {
+      const size = Buffer.byteLength(JSON.stringify(row), "utf8");
+      if (bytes + size > 200 * 1024) {
+        if (!rows.length) throw new StateQLError("OUTPUT_LIMIT_EXCEEDED", "A row exceeds the browser page limit. Export this result instead.");
+        break;
+      }
+      rows.push(row);
+      bytes += size;
+    }
+    const next = offset + rows.length;
+    const metadata = this.tableResults.get(id);
+    const connection = this.store.activeConnection(this.store.ensureSession(this.sessionName));
+    const eligible = metadata && connection?.id === result.connection_id && !connection.read_only && version(connection) === result.state_version;
+    const rowTokens = rows.map(row => {
+      if (!eligible || !editableRow(metadata, row)) return null;
+      const token = randomUUID();
+      for (const [key, entry] of this.editTokens) if (entry.expires <= this.now().getTime()) this.editTokens.delete(key);
+      if (this.editTokens.size >= 1000) this.editTokens.delete(this.editTokens.keys().next().value!);
+      this.editTokens.set(token, { metadata, original: structuredClone(row), sessionId: result.session_id, connectionId: result.connection_id, stateVersion: result.state_version, expires: this.now().getTime() + 10 * 60_000 });
+      return token;
+    });
+    const writable = metadata?.driver === "mongodb" ? [...new Set(rows.flatMap(row => Object.keys(row)))].filter(name => name !== "_id")
+      : metadata?.columns.filter(column => !column.key && !column.generated).map(column => column.name) ?? [];
+    return { row_tokens: rowTokens, writable_columns: writable, ...(!metadata?.writable ? { editing_reason: metadata?.reason ?? "Query results are read-only." } : {}),
+      result_id: result.id, offset, limit, rows: structuredClone(rows), columns: this.store.resultColumns(result),
+      returned: rows.length, total: all.length, truncated: next < all.length, next_offset: next < all.length ? next : null };
+  }
+
+  /** No caller-selected filesystem paths. The host delivers these bounded attachment bytes. */
+  async serializeResult(id: string, format: "json" | "jsonl" | "csv", signal?: AbortSignal, origin: CommandOrigin = "api"): Promise<Response<{ content: string; format: string; rows: number }>> {
+    return this.commandContexts.run(mergeCommandExecutionContext(this.commandContexts.getStore(), { signal, origin }), () => this.run("export", async () => {
+      if (!["json", "jsonl", "csv"].includes(format)) throw new StateQLError("INVALID_COMMAND", "Unsupported export format.");
+      const result = this.panelResult(id);
+      const rows = this.fullResultRows(result);
+      const columns = this.store.resultColumns(result).map(column => column.name);
+      const chunks: string[] = [];
+      let bytes = 0;
+      const append = (chunk: string) => {
+        bytes += Buffer.byteLength(chunk, "utf8");
+        if (bytes > 32 * 1024 * 1024) throw new StateQLError("OUTPUT_LIMIT_EXCEEDED", "Export exceeds 32 MiB.");
+        chunks.push(chunk);
+      };
+      const csvCell = (value: unknown) => {
+        let valueText = value === null || value === undefined ? "" : typeof value === "object" ? JSON.stringify(value) : String(value);
+        if (typeof value !== "number" && /^[\s\u0000-\u001f]*[=+@-]|^[\t\r\n]/u.test(valueText)) valueText = "'" + valueText;
+        return /[",\r\n]/u.test(valueText) ? '"' + valueText.replaceAll('"', '""') + '"' : valueText;
+      };
+      if (format === "json") append("[");
+      if (format === "csv") append(columns.map(csvCell).join(",") + "\n");
+      const deadline = Date.now() + 30_000;
+      for (let index = 0; index < rows.length; index++) {
+        if (index % 100 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          signal?.throwIfAborted();
+          this.signal?.throwIfAborted();
+          if (Date.now() > deadline) throw new StateQLError("DEADLINE_EXCEEDED", "Export preparation timed out.");
+        }
+        const row = rows[index]!;
+        append(format === "csv" ? columns.map(column => csvCell(row[column])).join(",") + "\n"
+          : (format === "json" && index ? "," : "") + JSON.stringify(row) + (format === "jsonl" ? "\n" : ""));
+      }
+      signal?.throwIfAborted();
+      if (format === "json") append("]\n");
+      this.panelResult(id);
+      return { data: { content: chunks.join(""), format, rows: rows.length }, handle: id };
+    }));
+  }
+
+  async readTable(table: { schema?: string; name: string }, limit = 1000, options: QueryOptions & { origin?: CommandOrigin } = {}): Promise<Response<ResultData & { table: { schema?: string; name: string }; sample_limit: number; query: string }>> {
+    return this.commandContexts.run(mergeCommandExecutionContext(this.commandContexts.getStore(), { signal: options.signal, origin: options.origin ?? "api" }), async () => {
+    if (!table || typeof table.name !== "string" || !table.name || table.name.length > 500 || table.name.includes("\0") ||
+      (table.schema !== undefined && (typeof table.schema !== "string" || !table.schema || table.schema.length > 500 || table.schema.includes("\0"))) ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new StateQLError("INVALID_COMMAND", "Invalid table or sample limit.");
+    const snapshot = this.snapshot({ historyLimit: 1 });
+    const driver = snapshot.connection?.driver;
+    if (!driver) throw new StateQLError("CONNECTION_NOT_FOUND", "Connect to a database first.");
+    if (driver === "sqlite" && table.schema && table.schema !== "main") throw new StateQLError("INVALID_COMMAND", "Only the main SQLite schema is supported.");
+    if (driver === "mongodb" && table.schema) throw new StateQLError("INVALID_COMMAND", "MongoDB collections do not accept a schema.");
+    const quote = (name: string) => driver === "mysql" ? "\`" + name.replaceAll("\`", "\`\`") + "\`" : '"' + name.replaceAll('"', '""') + '"';
+    const qualified = [table.schema, table.name].filter((part): part is string => Boolean(part)).map(quote).join(".");
+    const query = driver === "mongodb" ? JSON.stringify({ operation: "find", collection: table.name, options: { limit } }, null, 2)
+      : "SELECT * FROM " + qualified + " LIMIT " + limit;
+    const metadata = await this.editableMetadata(table, options);
+    const response = driver === "mongodb"
+      ? await this.mongoQuery({ operation: "find", collection: table.name, options: { limit } }, options)
+      : await this.query(query, options);
+    if (!response.ok) return response;
+    if (this.tableResults.size >= 20) this.tableResults.delete(this.tableResults.keys().next().value!);
+    this.tableResults.set(response.data.result_id, metadata);
+    return { ...response, data: { ...response.data, table, sample_limit: limit, query } };
+    });
+  }
+
+  async planTableUpdate(token: string, changes: TableChange, options: ExecutionOptions & { origin?: CommandOrigin } = {}): Promise<Response<PlanData>> {
+    return this.commandContexts.run(mergeCommandExecutionContext(this.commandContexts.getStore(), { signal: options.signal, origin: options.origin ?? "api" }), () => this.run("table.plan", async session => {
+      this.rejectDuringStagedTransaction(session, "Table edits");
+      const connection = this.requireConnection(session);
+      const original = this.editTokens.get(token);
+      if (!original || original.sessionId !== session.id || original.connectionId !== connection.id ||
+        original.stateVersion !== version(connection) || original.expires <= this.now().getTime())
+        throw new StateQLError("STALE_PLAN", "Row identity expired or the connection changed. Reload the row.");
+      if (connection.read_only) throw new StateQLError("READ_ONLY_CONNECTION", "This connection is read-only.");
+      const metadata = await this.editableMetadata(original.metadata.table, options);
+      if (JSON.stringify(metadata) !== JSON.stringify(original.metadata)) throw new StateQLError("STALE_PLAN", "Table metadata changed. Reload the table.");
+      const update: TableUpdate = { metadata, original: original.original, changes };
+      const compiled = compileTableUpdate(update);
+      const context = this.executionContext(options);
+      const source = await this.resolveConnectionSource(connection, session, "plan", "read", context);
+      const adapter = connection.driver === "mongodb" ? await this.openMongoAdapter(connection, context, source) : await this.openAdapter(connection, context, source);
+      try {
+        const plan = this.store.savePlan({ sessionId: session.id, ownerActorId: this.actorId, connectionId: connection.id,
+          sql: compiled.sql, parameters: [JSON.stringify(update)], statementType: "table.update", stateVersion: version(connection),
+          stateSignature: await adapter.signature(), destructive: false, allowUnbounded: false, allowDestructive: false,
+          expiresAt: new Date(original.expires).toISOString() });
+        return { data: { plan_id: plan.id, statement_type: plan.statement_type, destructive: false, requires_confirmation: true, required_overrides: [],
+          state_version: plan.state_version, owner_actor_id: this.actorId, expires_at: plan.expires_at }, handle: plan.id };
+      } finally { await closeAdapterQuietly(adapter); }
+    }));
+  }
+
+  private async editableMetadata(table: TableIdentity, options: ExecutionOptions): Promise<EditableTable> {
+    const snapshot = this.snapshot({ historyLimit: 1 });
+    const driver = snapshot.connection!.driver;
+    const unavailable: EditableTable = { table, driver, columns: [], writable: false, reason: "This table or its values cannot be edited safely." };
+    // The legacy inspection API splits qualified names. Fail closed for ambiguous names.
+    if (table.name.includes(".") || table.schema?.includes(".")) return { ...unavailable, reason: "Editing identifiers containing dots is not supported." };
+    const name = driver === "sqlite" || driver === "mongodb" ? table.name : [table.schema, table.name].filter(Boolean).join(".");
+    const response = await this.inspect("editable", name, options);
+    if (!response.ok) return { ...unavailable, reason: response.error.code };
+    const value = response.data as { writable?: boolean; columns?: EditableTable["columns"] };
+    if (!value || !Array.isArray(value.columns) || value.columns.length > 100) return unavailable;
+    return { table, driver, columns: value.columns, writable: value.writable === true && !snapshot.connection!.read_only,
+      ...(value.writable ? {} : { reason: "Only ordinary tables with transactional writes and a primary key can be edited." }) };
+  }
+
+  private panelResult(id: string): ResultRecord {
+    if (typeof id !== "string" || !id || id.length > 200) throw new StateQLError("INVALID_COMMAND", "A result ID is required.");
+    const session = this.store.ensureSession(this.sessionName);
+    if (!this.store.isSessionMember(session.id, this.actorId)) this.throwMembershipDenied(session);
+    const result = this.requireResult(id, session);
+    if (result.id !== id) throw new StateQLError("INVALID_COMMAND", "Use an immutable result ID, not an alias.");
+    if (Date.parse(result.expires_at) <= this.now().getTime()) throw new StateQLError("RESULT_EXPIRED", "Result expired. Run the query again.");
+    if (result.row_count > 10_000 || Buffer.byteLength(result.rows_json, "utf8") > 16 * 1024 * 1024)
+      throw new StateQLError("OUTPUT_LIMIT_EXCEEDED", "Stored result exceeds browser limits.");
+    return result;
+  }
+
+  private fullResultRows(result: ResultRecord): Row[] {
+    if (this.panelRows?.id !== result.id || this.panelRows.json !== result.rows_json)
+      this.panelRows = { id: result.id, json: result.rows_json, rows: this.store.resultRows(result) };
+    return this.panelRows.rows;
+  }
+
   async exportResult(
     idOrAlias: string,
     output: string,
@@ -1650,7 +1824,7 @@ export class StateQL {
       } finally {
         await closeAdapterQuietly(adapter);
       }
-    });
+    }, undefined, table);
   }
 
   async plan(sql: string, options: PlanOptions = {}): Promise<Response<PlanData>> {
@@ -1842,18 +2016,21 @@ export class StateQL {
       if (Date.parse(plan.expires_at) <= this.now().getTime()) {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
-      const nativePlan = plan.statement_type.startsWith("mongo.");
+      const tableUpdate = plan.statement_type === "table.update" ? parseTableUpdate(plan.parameters) : undefined;
+      const compiled = tableUpdate ? compileTableUpdate(tableUpdate) : undefined;
+      if (compiled && compiled.sql !== plan.sql) throw new StateQLError("STALE_PLAN", "Stored update does not match its plan.");
+      const nativePlan = tableUpdate?.metadata.driver === "mongodb" || plan.statement_type.startsWith("mongo.");
       historySql = nativePlan ? undefined : plan.sql;
-      const mongoCommand = nativePlan
+      const mongoCommand = compiled?.mongo ?? (nativePlan
         ? storedMongoPlan(plan.parameters, plan.statement_type, plan.id)
-        : undefined;
-      const planParameters = nativePlan
+        : undefined);
+      const planParameters = compiled?.params ?? (nativePlan
         ? undefined
         : parseJson<SqlParameters>(
             plan.parameters,
             `plan "${plan.id}" parameters`,
             isSqlParameters,
-          );
+          ));
       const claimToken = this.store.nextId("claim");
       const claimed = this.store.claimPlan(
         plan.id,
@@ -1886,6 +2063,8 @@ export class StateQL {
         if (!nativePlan && connection.driver === "mongodb") {
           this.rejectMongoSql(connection, "mongoPlan");
         }
+        if (tableUpdate && JSON.stringify(await this.editableMetadata(tableUpdate.metadata.table, options)) !== JSON.stringify(tableUpdate.metadata))
+          throw new StateQLError("STALE_PLAN", "Table metadata changed. Reload and plan again.");
         const context = this.executionContext(options);
         const adapterSource = await this.resolveConnectionSource(
           connection,
@@ -1925,6 +2104,7 @@ export class StateQL {
               {
                 allowUnbounded: Boolean(claimed.allow_unbounded),
                 allowDestructive: Boolean(claimed.allow_destructive),
+                ...(tableUpdate ? { expectedRows: 1 as const } : {}),
               },
               context,
               { planId: claimed.id, claimToken },
@@ -1936,6 +2116,7 @@ export class StateQL {
               claimed.sql,
               {
                 params: planParameters,
+                ...(tableUpdate ? { expectedRows: 1 as const } : {}),
                 allowUnbounded: Boolean(claimed.allow_unbounded),
                 allowDestructive: Boolean(claimed.allow_destructive),
               },
@@ -2266,7 +2447,7 @@ export class StateQL {
     session: SessionRecord,
     connection: ConnectionRecord,
     sql: string,
-    options: ExecOptions,
+    options: ExecOptions & { expectedRows?: 1 },
     context: AdapterContext,
     planClaim?: { planId: string; claimToken: string },
     resolvedSource?: string,
@@ -2458,7 +2639,7 @@ export class StateQL {
     }
 
     try {
-      const write = await adapter.write(sql, parameters);
+      const write = await adapter.write(sql, parameters, options.expectedRows);
       try {
         const finalized = planClaim
           ? this.store.finishPlannedOperation({
@@ -2508,6 +2689,7 @@ export class StateQL {
       }
       if (error instanceof AdapterWriteError && !error.outcomeUnknown) {
         this.store.failOperation(operation.id);
+        if (error.message.startsWith("ROW_CONFLICT:")) throw new StateQLError("ROW_CONFLICT", "The row changed or no longer matches. Reload before editing.");
         throw new StateQLError(
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
@@ -2537,7 +2719,7 @@ export class StateQL {
     session: SessionRecord,
     connection: ConnectionRecord,
     command: MongoWriteCommand,
-    options: MongoExecOptions,
+    options: MongoExecOptions & { expectedRows?: 1 },
     context: AdapterContext,
     planClaim?: { planId: string; claimToken: string },
     resolvedSource?: string,
@@ -2729,7 +2911,7 @@ export class StateQL {
     }
 
     try {
-      const write = await adapter.write(value);
+      const write = await adapter.write(value, options.expectedRows);
       try {
         const finalized = planClaim
           ? this.store.finishPlannedOperation({
@@ -2781,6 +2963,7 @@ export class StateQL {
       }
       if (error instanceof AdapterWriteError && !error.outcomeUnknown) {
         this.store.failOperation(operation.id);
+        if (error.message.startsWith("ROW_CONFLICT:")) throw new StateQLError("ROW_CONFLICT", "The document changed or was removed. Reload before editing.");
         throw new StateQLError(
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
@@ -3129,6 +3312,7 @@ export class StateQL {
     command: string,
     action: (session: SessionRecord) => Promise<ActionResult<T>>,
     historySql?: string | (() => string | undefined),
+    historyTarget?: string,
   ): Promise<Response<T>> {
     const started = performance.now();
     const origin = this.commandContexts.getStore()?.origin ?? "legacy";
@@ -3159,6 +3343,7 @@ export class StateQL {
         actorId: this.actorId,
         origin,
         command,
+        target: historyTarget,
         ...(result.handle ? { handle: result.handle } : {}),
         ...(sqlText !== undefined ? { sql: sqlText } : {}),
         executed: result.executed ?? false,
@@ -3190,6 +3375,7 @@ export class StateQL {
         actorId: this.actorId,
         origin,
         command,
+        target: historyTarget,
         ...(sqlText !== undefined ? { sql: sqlText } : {}),
         executed: stateqlError.details.executed,
         cached: false,
@@ -3224,6 +3410,7 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     origin: item.origin,
     command: item.command,
     sql: item.sql,
+    ...(item.target ? { target: item.target } : {}),
     handle: item.handle,
     executed: Boolean(item.executed),
     cached: Boolean(item.cached),

@@ -614,6 +614,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "operation_outcomes_v1",
       "history_origin_v1",
       "credential_refs_v1",
+      "history_target_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
