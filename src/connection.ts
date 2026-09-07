@@ -17,10 +17,11 @@ export function detectDriver(target: string): Driver {
   if (/^postgres(?:ql)?:\/\//i.test(target)) return "postgres";
   if (/^mysql:\/\//i.test(target)) return "mysql";
   if (/^mongodb(?:\+srv)?:\/\//i.test(target)) return "mongodb";
+  if (/^rediss?:\/\//i.test(target)) return "redis";
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(target)) {
     throw new StateQLError(
       "UNSUPPORTED_DRIVER",
-      "Only MongoDB, MySQL, PostgreSQL, and SQLite are supported.",
+      "Only MongoDB, MySQL, PostgreSQL, Redis, and SQLite are supported.",
     );
   }
   return "sqlite";
@@ -53,6 +54,19 @@ export function mongoDatabaseName(target: string): string {
   );
 }
 
+export function redisDatabaseName(target: string): string {
+  try {
+    const url = new URL(target);
+    if (!url.hostname || !["redis:", "rediss:"].includes(url.protocol.toLowerCase())) throw new Error();
+    const path = url.pathname.replace(/^\//, "");
+    if (path && !/^\d+$/.test(path)) throw new Error();
+    return `db${path || "0"}`;
+  } catch {
+    throw new StateQLError("INVALID_COMMAND", "Invalid Redis URL or database number.");
+  }
+}
+
+
 export function credentialSource(
   value: string,
   expectedDriver?: Driver,
@@ -66,7 +80,7 @@ export function credentialSource(
   if (driver === "sqlite" && (!explicitSqlite || value.length === 7)) {
     throw new StateQLError(
       "INVALID_COMMAND",
-      `${sourceLabel} must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source; MongoDB URLs are also supported.`,
+      `${sourceLabel} must contain a complete PostgreSQL/MySQL/Redis URL or an explicit sqlite: source; MongoDB URLs are also supported.`,
       {
         suggestedAction:
           "Store the full database URL, or prefix an SQLite path with sqlite:.",

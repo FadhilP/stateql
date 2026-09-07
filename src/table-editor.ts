@@ -7,6 +7,7 @@ export interface EditableColumn { name: string; type: string; nullable: boolean;
 export interface EditableTable { table: TableIdentity; driver: Driver; columns: EditableColumn[]; writable: boolean; reason?: string }
 export interface TableChange { set?: Record<string, unknown>; unset?: string[] }
 export interface TableUpdate { metadata: EditableTable; original: Row; changes: TableChange }
+export interface TableUpdateBatch { version: 1; updates: TableUpdate[] }
 
 export function quoteIdentifier(name: string, driver: Driver): string {
   if (!name || name.length > 500 || name.includes("\0")) throw new StateQLError("INVALID_COMMAND", "Invalid database identifier.");
@@ -104,4 +105,21 @@ export function parseTableUpdate(parameters: string): TableUpdate {
     compileTableUpdate(update);
     return update;
   } catch { throw new StateQLError("STALE_PLAN", "The stored table update is invalid. Reload the row and plan again."); }
+}
+
+export function parseTableUpdates(parameters: string): TableUpdate[] {
+  try {
+    const outer: unknown = JSON.parse(parameters);
+    if (!Array.isArray(outer) || outer.length !== 1 || typeof outer[0] !== "string" || outer[0].length > 512 * 1024) throw new Error();
+    const batch = JSON.parse(outer[0]) as TableUpdateBatch;
+    if (!batch || batch.version !== 1 || !Array.isArray(batch.updates) || batch.updates.length < 1 || batch.updates.length > 100) throw new Error();
+    for (const update of batch.updates) {
+      if (!update?.metadata || !["sqlite", "postgres", "mysql", "mongodb"].includes(update.metadata.driver) ||
+        !Array.isArray(update.metadata.columns) || update.metadata.columns.length > 100 ||
+        !update.metadata.columns.every(column => typeof column.name === "string" && typeof column.type === "string" && typeof column.nullable === "boolean" && typeof column.generated === "boolean" && Number.isSafeInteger(column.key)) ||
+        !update.original || !update.changes || typeof update.changes !== "object") throw new Error();
+      compileTableUpdate(update);
+    }
+    return batch.updates;
+  } catch { throw new StateQLError("STALE_PLAN", "The stored table update batch is invalid. Reload the rows and plan again."); }
 }

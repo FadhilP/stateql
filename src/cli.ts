@@ -9,11 +9,14 @@ import { exitCodeFor } from "./errors.js";
 import { StateQL } from "./stateql.js";
 import type {
   BatchCommand,
+  CatalogObject,
+  CatalogObjectKind,
   Failure,
   MongoReadCommand,
   MongoWriteCommand,
   Response,
   SqlParameters,
+  RedisCommand,
 } from "./types.js";
 
 type OutputMode = "agent" | "json" | "jsonl" | "text" | "silent";
@@ -38,6 +41,12 @@ const parsed = parseArgs({
     "allow-destructive": { type: "boolean" },
     offset: { type: "string" },
     limit: { type: "string" },
+    cursor: { type: "string" },
+    schema: { type: "string" },
+    search: { type: "string" },
+    category: { type: "string" },
+    internal: { type: "boolean" },
+    external: { type: "boolean" },
     "timeout-ms": { type: "string" },
     "max-state-bytes": { type: "string" },
     "cache-ttl-seconds": { type: "string" },
@@ -177,6 +186,8 @@ async function dispatch(): Promise<Response<unknown>> {
       return dispatchSession(subcommand, rest);
     case "mongo":
       return dispatchMongo(subcommand, rest);
+    case "redis":
+      return dispatchRedis(subcommand, rest);
     case "query":
       return stateql.query(sql, {
         params,
@@ -226,6 +237,23 @@ async function dispatch(): Promise<Response<unknown>> {
         normalizeInspectKind(requireValue(subcommand, "inspection kind")),
         rest[0],
       );
+    case "objects":
+      return stateql.listObjects({
+        ...(subcommand ? { kind: subcommand as CatalogObjectKind } : {}),
+        ...(values.schema ? { schema: values.schema } : {}),
+        ...(values.search ? { search: values.search } : {}),
+        offset: values.cursor ?? numberOption(values.offset, 0),
+        limit: numberOption(values.limit, 50),
+      });
+    case "object": {
+      const object: CatalogObject = {
+        kind: requireValue(subcommand, "object kind") as CatalogObjectKind,
+        name: requireValue(rest[0], "object name"),
+        ...(values.schema ? { schema: values.schema } : {}),
+        ...(rest[1] ? { identity: rest[1] } : {}),
+      };
+      return stateql.describeObject(object);
+    }
     case "transaction":
       return dispatchTransaction(subcommand, rest[0]);
     case "plan":
@@ -239,7 +267,12 @@ async function dispatch(): Promise<Response<unknown>> {
     case "apply":
       return stateql.apply(requireValue(subcommand, "plan handle"));
     case "history":
-      return stateql.history(numberOption(values.limit, 20));
+      if (values.internal && values.external) throw new Error("--internal and --external are mutually exclusive.");
+      return stateql.history(numberOption(values.limit, 20), {
+        ...(values.category ? { category: values.category as "statement" | "introspection" | "management" } : {}),
+        ...(values.internal ? { internal: true } : values.external ? { internal: false } : {}),
+        offset: numberOption(values.offset, 0),
+      });
     case "receipt":
       return stateql.receipt(requireValue(subcommand, "operation handle"));
     case "doctor":
@@ -283,6 +316,28 @@ async function dispatchMongo(
       throw new Error(`Unknown MongoDB command "${action ?? ""}".`);
   }
 }
+
+async function dispatchRedis(
+  action: string | undefined,
+  args: string[],
+): Promise<Response<unknown>> {
+  const payload = parseRedisCommand(requireValue(args.join(" ").trim(), "Redis JSON command"));
+  switch (action) {
+    case "query": return stateql.redisQuery(payload, { cache: cacheMode(values.cache) });
+    case "exec": return stateql.redisExec(payload, { replay: values.replay ?? false, ...(values["idempotency-key"] ? { idempotencyKey: values["idempotency-key"] } : {}) });
+    case "plan": return stateql.redisPlan(payload);
+    default: throw new Error(`Unknown Redis command "${action ?? ""}".`);
+  }
+}
+
+function parseRedisCommand(value: string): RedisCommand {
+  try {
+    const parsed = JSON.parse(value) as RedisCommand;
+    if (!parsed || typeof parsed !== "object") throw new Error();
+    return parsed;
+  } catch { throw new Error("Invalid Redis JSON command."); }
+}
+
 
 function parseMongoCommand(value: string): unknown {
   try {
@@ -331,6 +386,14 @@ async function dispatchProfile(
           readOnly: !values["read-write"],
         },
       );
+    case "update":
+      if (values["read-only"] && values["read-write"]) throw new Error("--read-only and --read-write are mutually exclusive.");
+      return stateql.updateProfile(requireValue(args[0], "profile name"), {
+        ...(args[1] !== undefined ? { target: args[1] } : {}),
+        ...(values.env ? { secretEnv: values.env } : {}),
+        ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
+        ...(values["read-only"] ? { readOnly: true } : values["read-write"] ? { readOnly: false } : {}),
+      });
     case "list":
       return stateql.listProfiles();
     case "show":
@@ -685,14 +748,17 @@ Usage: stql <command> [arguments] [options]
 Commands:
   connect TARGET | --env ENV | --credential-ref REF | --profile NAME
   disconnect, status
-  profile add NAME [TARGET | --env ENV | --credential-ref REF]
+  profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
   profile list|show|remove
   query, filter, exec, show, rows, count, columns, export
   mongo query|exec|plan '<EJSON command>'
+  redis query|exec|plan '<JSON command>'
   alias set
   inspect schema|table|collection|collections|columns|indexes|constraints
+  objects [KIND] [--schema NAME] [--search TEXT] [--offset N|--cursor CURSOR]
+  object KIND NAME [IDENTITY] [--schema NAME]
   transaction begin|status|commit|rollback
-  plan, apply, history, receipt, doctor, purge, capabilities
+  plan, apply, history [--category CATEGORY] [--internal|--external], receipt, doctor, purge, capabilities
   batch [file.json|file.jsonl|-]
   pipe
 

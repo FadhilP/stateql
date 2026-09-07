@@ -1,12 +1,15 @@
 export type SqlDriver = "sqlite" | "postgres" | "mysql";
-export type Driver = SqlDriver | "mongodb";
+export type Driver = SqlDriver | "mongodb" | "redis";
 
 export type CommandOrigin = "legacy" | "user" | "model" | "system" | "api";
+export type HistoryCategory = "statement" | "introspection" | "management";
 
 /** Trusted host metadata for one executeCommand call; never part of BatchCommand input. */
 export interface CommandExecutionContext {
   signal?: AbortSignal;
   origin?: CommandOrigin;
+  /** Marks host-generated setup or introspection separately from user statements. */
+  internal?: boolean;
 }
 
 export type CredentialAccess = "read" | "write";
@@ -107,6 +110,8 @@ export interface HistoryEntry {
   session_id: string;
   actor_id: string;
   origin: CommandOrigin;
+  category: HistoryCategory;
+  internal: boolean;
   command: string;
   sql: string | null;
   target?: string | null;
@@ -116,6 +121,13 @@ export interface HistoryEntry {
   success: boolean;
   error_code: string | null;
 }
+
+export interface StateQLSnapshotOptions {
+  historyLimit?: number;
+  historyCategory?: HistoryCategory;
+  historyInternal?: boolean;
+}
+
 
 export interface StateQLSnapshot {
   session: {
@@ -240,6 +252,55 @@ export interface MongoWriteOutcome {
   deleted_count?: number;
 }
 
+export interface RedisCommand {
+  command: string;
+  args?: string[];
+}
+
+export interface RedisWriteOutcome extends MongoWriteOutcome {
+  result: string | number | null;
+}
+
+export type CatalogObjectKind =
+  | "table"
+  | "view"
+  | "collection"
+  | "function"
+  | "trigger"
+  | "enum"
+  | "key";
+
+export interface CatalogObject {
+  kind: CatalogObjectKind;
+  schema?: string;
+  name: string;
+  /** Stable database-native overload/object identity when name alone is ambiguous. */
+  identity?: string;
+  [key: string]: unknown;
+}
+
+export interface ListObjectsFilter {
+  kind?: CatalogObjectKind;
+  schema?: string;
+  search?: string;
+  /** Numeric for SQL/MongoDB; Redis uses its opaque SCAN cursor string. */
+  offset?: number | string;
+  limit?: number;
+}
+
+export interface ListObjectsData {
+  objects: CatalogObject[];
+  next_offset: number | string | null;
+  supported_kinds: CatalogObjectKind[];
+}
+
+export interface DescribeObjectData {
+  object: CatalogObject;
+  definition?: string | Record<string, unknown> | unknown[] | null;
+  [key: string]: unknown;
+}
+
+
 export interface ExecutionOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -247,6 +308,9 @@ export interface ExecutionOptions {
 
 export interface HistoryOptions {
   origin?: CommandOrigin;
+  category?: HistoryCategory;
+  internal?: boolean;
+  offset?: number;
 }
 
 export interface StateQLOptions extends ExecutionOptions {
@@ -312,6 +376,25 @@ export interface ProfileOptions {
   credentialRef?: string;
 }
 
+export interface ProfileUpdateOptions {
+  target?: string | null;
+  secretEnv?: string | null;
+  credentialRef?: string | null;
+  readOnly?: boolean;
+}
+
+export interface RedisQueryOptions extends ExecutionOptions {
+  cache?: "auto" | "bypass" | "require";
+}
+
+export interface RedisExecOptions extends ExecutionOptions {
+  replay?: boolean;
+  idempotencyKey?: string;
+}
+
+export interface RedisPlanOptions extends ExecutionOptions {}
+
+
 export interface RowsOptions {
   offset?: number;
   limit?: number;
@@ -336,6 +419,7 @@ export type BatchCommandName =
   | "profile.list"
   | "profile.show"
   | "profile.remove"
+  | "profile.update"
   | "session.start"
   | "session.list"
   | "session.show"
@@ -358,6 +442,11 @@ export type BatchCommandName =
   | "mongo.query"
   | "mongo.exec"
   | "mongo.plan"
+  | "redis.query"
+  | "redis.exec"
+  | "redis.plan"
+  | "objects.list"
+  | "object.describe"
   | "apply"
   | "history"
   | "receipt"
@@ -377,6 +466,8 @@ export interface BatchCommand {
   table?: string;
   params?: SqlParameters;
   mongo?: MongoReadCommand | MongoWriteCommand;
+  redis?: RedisCommand;
+  object?: CatalogObject;
   cache?: "auto" | "bypass" | "require";
   read_only?: boolean;
   secret_env?: string;
@@ -387,11 +478,14 @@ export interface BatchCommand {
   allow_unbounded?: boolean;
   allow_destructive?: boolean;
   offset?: number;
+  cursor?: string;
   limit?: number;
   isolation?: string;
   timeout_ms?: number;
   /** Retrieval filter for the history command; does not attribute this command. */
   history_origin?: CommandOrigin;
+  history_category?: HistoryCategory;
+  history_internal?: boolean;
   scope?: "expired" | "results" | "history" | "all";
 }
 
@@ -528,6 +622,9 @@ export interface SessionSummaryData {
 
 export interface ResultData {
   result_id: string;
+  alias: string;
+  /** Canonical generated alias; remains stable even when alias is an explicit caller alias. */
+  display_alias: string;
   rows: number;
   columns: Column[];
   preview: Row[];
@@ -537,6 +634,7 @@ export interface ResultData {
   duplicate_of?: string;
   state_version: string;
   storage: { mode: string; expires_at: string };
+  next_cursor?: string | null;
 }
 
 export interface RowsData {
@@ -583,7 +681,7 @@ export interface OperationData {
   state_version_before: string;
   state_version_after: string | null;
   replay_of?: string;
-  outcome?: MongoWriteOutcome;
+  outcome?: MongoWriteOutcome | RedisWriteOutcome;
 }
 
 export interface ExecData extends OperationData {

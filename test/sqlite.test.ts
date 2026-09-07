@@ -15,6 +15,29 @@ test("SQLite detection and SQL parsing stay explicit", () => {
   );
 });
 
+test("SQLite catalog discovery filters and pages in the adapter", async () => {
+  const fixture = await createFixture();
+  try {
+    await succeed(fixture.stateql.exec("CREATE TABLE alpha_table (id INTEGER PRIMARY KEY, value TEXT)"));
+    await succeed(fixture.stateql.exec("CREATE TABLE beta_table (id INTEGER PRIMARY KEY)"));
+    await succeed(fixture.stateql.exec("CREATE VIEW alpha_view AS SELECT id FROM alpha_table"));
+    await succeed(fixture.stateql.exec("CREATE TRIGGER alpha_trigger AFTER INSERT ON alpha_table BEGIN UPDATE alpha_table SET value = value WHERE id = NEW.id; END"));
+    const first = await succeed(fixture.stateql.listObjects({ limit: 2 }));
+    assert.equal(first.objects.length, 2);
+    assert.equal(typeof first.next_offset, "number");
+    const second = await succeed(fixture.stateql.listObjects({ offset: first.next_offset, limit: 2 }));
+    assert.ok(second.objects.length >= 1);
+    const views = await succeed(fixture.stateql.listObjects({ kind: "view", search: "alpha", limit: 10 }));
+    assert.deepEqual(views.supported_kinds, ["table", "view", "trigger"]);
+    assert.deepEqual(views.objects.map((object: { name: string }) => object.name), ["alpha_view"]);
+    const described = await succeed(fixture.stateql.describeObject(views.objects[0]));
+    assert.match(described.definition, /CREATE VIEW/i);
+    const unsupported = await fixture.stateql.listObjects({ kind: "function" });
+    assert.equal(unsupported.ok, false);
+  } finally { fixture.stateql.close(); }
+});
+
+
 test("SQLite in-memory targets are rejected instead of losing committed writes", async () => {
   const stateql = new StateQL({ home: createTemporaryDirectory() });
   for (const target of [":memory:", "sqlite::memory:"]) {

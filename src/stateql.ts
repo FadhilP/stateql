@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { compileTableUpdate, editableRow, parseTableUpdate, type EditableTable, type TableIdentity, type TableChange, type TableUpdate } from "./table-editor.js";
+import { compileTableUpdate, editableRow, parseTableUpdate, parseTableUpdates, type EditableTable, type TableIdentity, type TableChange, type TableUpdate } from "./table-editor.js";
 import { writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
@@ -12,6 +12,7 @@ import {
   createAdapterContext,
   type Adapter,
   type AdapterContext,
+  type BatchWriteOperation,
 } from "./adapters.js";
 import {
   confidence,
@@ -21,6 +22,7 @@ import {
   detectDriver,
   isEnvironmentName,
   mongoDatabaseName,
+  redisDatabaseName,
   normalizeSqliteSource,
   validateCredentialRef,
   validateProfileName,
@@ -39,6 +41,14 @@ import {
   validateMongoWriteCommand,
   MongoAdapter,
 } from "./mongodb.js";
+import {
+  deserializeRedisCommand,
+  RedisAdapter,
+  serializeRedisCommand,
+  validateRedisReadCommand,
+  validateRedisWriteCommand,
+  type RedisPrecondition,
+} from "./redis.js";
 import {
   filterMaterializedRows,
   prepareFilterStatement,
@@ -73,6 +83,10 @@ import type {
   CommandOrigin,
   BatchOptions,
   CapabilitiesData,
+  CatalogObject,
+  DescribeObjectData,
+  ListObjectsData,
+  ListObjectsFilter,
   CloseSessionData,
   ColumnsData,
   CommitTransactionData,
@@ -95,18 +109,24 @@ import type {
   HistoryData,
   HistoryEntry,
   HistoryOptions,
+  HistoryCategory,
   OperationData,
   PlanData,
   PlanOptions,
   ProfileData,
   ProfilesData,
   ProfileOptions,
+  ProfileUpdateOptions,
   MongoExecOptions,
   MongoPlanOptions,
   MongoQueryOptions,
   MongoReadCommand,
   MongoWriteCommand,
   MongoWriteOutcome,
+  RedisCommand,
+  RedisExecOptions,
+  RedisPlanOptions,
+  RedisQueryOptions,
   PurgeData,
   QueryOptions,
   RemovedProfileData,
@@ -122,6 +142,7 @@ import type {
   StateQLActorOptions,
   StateQLOptions,
   StateQLSnapshot,
+  StateQLSnapshotOptions,
   StatusData,
   Success,
   SessionData,
@@ -387,7 +408,9 @@ export class StateQL {
           ? basename(adapterSource)
           : driver === "mongodb"
             ? mongoDatabaseName(adapterSource)
-            : new URL(secret).pathname.replace(/^\//, "") || driver;
+            : driver === "redis"
+              ? redisDatabaseName(adapterSource)
+              : new URL(secret).pathname.replace(/^\//, "") || driver;
       const draft: ConnectionRecord = {
         id: "pending",
         session_id: session.id,
@@ -404,7 +427,9 @@ export class StateQL {
 
       const adapter = driver === "mongodb"
         ? await this.openMongoAdapter(draft, context, adapterSource)
-        : await this.openAdapter(draft, context, adapterSource);
+        : driver === "redis"
+          ? await this.openRedisAdapter(draft, context, adapterSource)
+          : await this.openAdapter(draft, context, adapterSource);
       try {
         await adapter.ping();
       } catch (error) {
@@ -464,47 +489,23 @@ export class StateQL {
   ): Promise<Response<ProfileData>> {
     return this.run("profile.add", async () => {
       validateProfileName(name);
-      const sourceCount = [target, options.secretEnv, options.credentialRef]
-        .filter((value) => value !== undefined).length;
-      if (sourceCount !== 1 || target === "") {
-        throw new StateQLError(
-          "INVALID_COMMAND",
-          "Profile requires exactly one target, secret environment variable, or credential reference.",
-        );
-      }
       if (this.store.getProfile(name)) {
         throw new StateQLError(
           "INVALID_COMMAND",
           `Profile "${name}" already exists.`,
         );
       }
-      if (options.secretEnv !== undefined && !isEnvironmentName(options.secretEnv)) {
-        throw new StateQLError(
-          "INVALID_COMMAND",
-          "Secret environment variable name is invalid.",
-        );
-      }
-      if (options.credentialRef !== undefined) {
-        validateCredentialRef(options.credentialRef);
-      }
-
-      let storedTarget = target;
-      if (target) {
-        const driver = detectDriver(target);
-        if (driver !== "sqlite" && databaseUrlHasSecret(target)) {
-          throw new StateQLError(
-            "PERMISSION_DENIED",
-            `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`,
-          );
-        }
-        if (driver === "sqlite") storedTarget = normalizeSqliteSource(target);
-      }
+      const source = validatedProfileSource({
+        target,
+        secretEnv: options.secretEnv,
+        credentialRef: options.credentialRef,
+      });
 
       const profile = this.store.addProfile({
         name,
-        target: storedTarget,
-        secretEnv: options.secretEnv,
-        credentialRef: options.credentialRef,
+        target: source.target ?? undefined,
+        secretEnv: source.secretEnv ?? undefined,
+        credentialRef: source.credentialRef ?? undefined,
         readOnly: options.readOnly ?? true,
       });
       return {
@@ -514,6 +515,37 @@ export class StateQL {
       };
     });
   }
+
+  async updateProfile(
+    name: string,
+    changes: ProfileUpdateOptions,
+  ): Promise<Response<ProfileData>> {
+    return this.run("profile.update", async () => {
+      validateProfileName(name);
+      const existing = this.store.getProfile(name);
+      if (!existing) throw new StateQLError("CONNECTION_NOT_FOUND", `Profile "${name}" was not found.`);
+      if (!changes || typeof changes !== "object" || Array.isArray(changes) ||
+        Object.keys(changes).some((key) => !["target", "secretEnv", "credentialRef", "readOnly"].includes(key))) {
+        throw new StateQLError("INVALID_COMMAND", "Profile update contains unknown fields.");
+      }
+      if (changes.readOnly !== undefined && typeof changes.readOnly !== "boolean") throw new StateQLError("INVALID_COMMAND", "Profile readOnly must be boolean.");
+      const changesSource = Object.hasOwn(changes, "target") || Object.hasOwn(changes, "secretEnv") || Object.hasOwn(changes, "credentialRef");
+      if (!changesSource && changes.readOnly === undefined) throw new StateQLError("INVALID_COMMAND", "Profile update has no changes.");
+      const source = changesSource
+        ? validatedProfileSource({ target: changes.target ?? undefined, secretEnv: changes.secretEnv ?? undefined, credentialRef: changes.credentialRef ?? undefined })
+        : { target: existing.target, secretEnv: existing.secret_env, credentialRef: existing.credential_ref };
+      const profile = this.store.updateProfile({
+        name,
+        target: source.target,
+        secretEnv: source.secretEnv,
+        credentialRef: source.credentialRef,
+        readOnly: changes.readOnly ?? Boolean(existing.read_only),
+      });
+      if (!profile) throw new StateQLError("CONNECTION_NOT_FOUND", `Profile "${name}" was not found.`);
+      return { data: profileData(profile), handle: `profile:${name}`, executed: true };
+    });
+  }
+
 
   async listProfiles(): Promise<Response<ProfilesData>> {
     return this.run("profile.list", async () => ({
@@ -571,7 +603,7 @@ export class StateQL {
     });
   }
 
-  snapshot(options: { historyLimit?: number } = {}): StateQLSnapshot {
+  snapshot(options: StateQLSnapshotOptions = {}): StateQLSnapshot {
     const session = this.store
       .listSessions()
       .find((candidate) => candidate.name === this.sessionName);
@@ -598,6 +630,13 @@ export class StateQL {
         `historyLimit cannot exceed ${MAX_SNAPSHOT_HISTORY_LIMIT}.`,
       );
     }
+    if (options.historyInternal !== undefined && typeof options.historyInternal !== "boolean") {
+      throw new StateQLError("INVALID_COMMAND", "Snapshot historyInternal filter must be boolean.");
+    }
+    const historyOptions = {
+      ...(options.historyCategory === undefined ? {} : { category: parseHistoryCategory(options.historyCategory) }),
+      ...(options.historyInternal === undefined ? {} : { internal: options.historyInternal }),
+    };
 
     return {
       session: {
@@ -639,7 +678,9 @@ export class StateQL {
           affected_rows: operation.affected_rows,
           status: operation.status,
         })),
-      history: this.store.history(session.id, historyLimit).map(historyEntry),
+      history: this.store
+        .history(session.id, historyLimit, historyOptions)
+        .map(historyEntry),
     };
   }
 
@@ -1110,6 +1151,48 @@ export class StateQL {
     });
   }
 
+  async redisQuery(
+    command: RedisCommand,
+    options: RedisQueryOptions = {},
+  ): Promise<Response<ResultData>> {
+    return this.run("redis.query", async (session) => {
+      const value = validatedRedisRead(command);
+      const serialized = serializeRedisCommand(value);
+      const connection = this.requireRedisConnection(session, "redisQuery");
+      this.rejectDuringStagedTransaction(session, "Redis queries");
+      const context = this.executionContext(options);
+      const source = await this.resolveConnectionSource(connection, session, "query", "read", context);
+      const adapter = await this.openRedisAdapter(connection, context, source);
+      try {
+        const stateVersion = version(connection);
+        const stateSignature = await adapter.signature();
+        const fingerprint = hash({ command: serialized, connection: connection.id, database: connection.database_name, stateVersion });
+        const cached = this.store.findResult(fingerprint);
+        const cacheMode = options.cache ?? "auto";
+        if (cacheMode !== "bypass" && cached && cached.row_count <= this.maxResultRows && this.cacheValid(cached, stateVersion, stateSignature)) {
+          return { data: this.resultData(cached, true), handle: cached.id, cached: true, stateVersion, confidence: cached.state_confidence };
+        }
+        if (cacheMode === "require") throw new StateQLError("CACHE_MISS", "No valid cached Redis result exists.", { retryable: true });
+        const result = await adapter.read(value);
+        const parameters: SqlParameters = [serialized, result.nextCursor ?? null];
+        const resultBytes = Buffer.byteLength(JSON.stringify(parameters), "utf8") + Buffer.byteLength(JSON.stringify(result.rows), "utf8") + Buffer.byteLength(JSON.stringify(result.columns), "utf8");
+        if (result.rows.length > this.maxResultRows || resultBytes > this.maxResultBytes) throw new StateQLError("OUTPUT_LIMIT_EXCEEDED", "Redis response exceeds materialization limits.");
+        const saved = this.store.saveResult({
+          sessionId: session.id, connectionId: connection.id, fingerprint,
+          sql: `Redis native ${value.command}`, parameters, rows: result.rows, columns: result.columns,
+          stateVersion, stateSignature, stateConfidence: adapter.confidence,
+          expiresAt: new Date(this.now().getTime() + this.resultTtlSeconds * 1000).toISOString(),
+        });
+        return { data: this.resultData(saved, false), handle: saved.id, executed: true, stateVersion, confidence: adapter.confidence };
+      } catch (error) {
+        if (error instanceof StateQLError) throw error;
+        if (error instanceof AdapterExecutionError) throw stoppedStateQLError(error, true);
+        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { retryable: true, executed: true });
+      } finally { await closeAdapterQuietly(adapter); }
+    });
+  }
+
+
   async show(idOrAlias: string): Promise<Response<ResultData>> {
     return this.withResult("show", idOrAlias, async (result) => ({
       data: this.resultData(result, true),
@@ -1330,7 +1413,7 @@ export class StateQL {
   }
 
   async readTable(table: { schema?: string; name: string }, limit = 1000, options: QueryOptions & { origin?: CommandOrigin } = {}): Promise<Response<ResultData & { table: { schema?: string; name: string }; sample_limit: number; query: string }>> {
-    return this.commandContexts.run(mergeCommandExecutionContext(this.commandContexts.getStore(), { signal: options.signal, origin: options.origin ?? "api" }), async () => {
+    return this.commandContexts.run(mergeCommandExecutionContext(this.commandContexts.getStore(), { signal: options.signal, origin: options.origin ?? "api", internal: true }), async () => {
     if (!table || typeof table.name !== "string" || !table.name || table.name.length > 500 || table.name.includes("\0") ||
       (table.schema !== undefined && (typeof table.schema !== "string" || !table.schema || table.schema.length > 500 || table.schema.includes("\0"))) ||
       !Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new StateQLError("INVALID_COMMAND", "Invalid table or sample limit.");
@@ -1339,6 +1422,7 @@ export class StateQL {
     if (!driver) throw new StateQLError("CONNECTION_NOT_FOUND", "Connect to a database first.");
     if (driver === "sqlite" && table.schema && table.schema !== "main") throw new StateQLError("INVALID_COMMAND", "Only the main SQLite schema is supported.");
     if (driver === "mongodb" && table.schema) throw new StateQLError("INVALID_COMMAND", "MongoDB collections do not accept a schema.");
+    if (driver === "redis") throw new StateQLError("INVALID_COMMAND", "Redis keys are not SQL tables; use redisQuery and describeObject.");
     const quote = (name: string) => driver === "mysql" ? "\`" + name.replaceAll("\`", "\`\`") + "\`" : '"' + name.replaceAll('"', '""') + '"';
     const qualified = [table.schema, table.name].filter((part): part is string => Boolean(part)).map(quote).join(".");
     const query = driver === "mongodb" ? JSON.stringify({ operation: "find", collection: table.name, options: { limit } }, null, 2)
@@ -1380,6 +1464,68 @@ export class StateQL {
       } finally { await closeAdapterQuietly(adapter); }
     }));
   }
+
+  async planTableUpdates(
+    changes: Array<{ row_token: string; changes: TableChange }>,
+    options: ExecutionOptions & { origin?: CommandOrigin } = {},
+  ): Promise<Response<PlanData>> {
+    return this.commandContexts.run(
+      mergeCommandExecutionContext(this.commandContexts.getStore(), { signal: options.signal, origin: options.origin ?? "api" }),
+      () => this.run("table.plan", async (session) => {
+        this.rejectDuringStagedTransaction(session, "Table edits");
+        if (!Array.isArray(changes) || changes.length < 1 || changes.length > 100 || Buffer.byteLength(JSON.stringify(changes), "utf8") > 256 * 1024) {
+          throw new StateQLError("INVALID_COMMAND", "Table edit batch must contain 1-100 bounded rows.");
+        }
+        const connection = this.requireConnection(session);
+        if (connection.read_only) throw new StateQLError("READ_ONLY_CONNECTION", "This connection is read-only.");
+        if (connection.driver === "redis") throw new StateQLError("UNSUPPORTED_DRIVER", "Redis does not support table edits.");
+        const now = this.now().getTime();
+        const tokens = new Set<string>();
+        const identities = new Set<string>();
+        const updates: TableUpdate[] = [];
+        let expires = Number.MAX_SAFE_INTEGER;
+        const metadataByTable = new Map<string, EditableTable>();
+        for (const item of changes) {
+          if (!item || typeof item.row_token !== "string" || tokens.has(item.row_token)) throw new StateQLError("INVALID_COMMAND", "Table edit row tokens must be unique.");
+          tokens.add(item.row_token);
+          const original = this.editTokens.get(item.row_token);
+          if (!original || original.sessionId !== session.id || original.connectionId !== connection.id || original.stateVersion !== version(connection) || original.expires <= now) {
+            throw new StateQLError("STALE_PLAN", "A row identity expired or the connection changed. Reload the rows.");
+          }
+          const tableKey = JSON.stringify(original.metadata.table);
+          let metadata = metadataByTable.get(tableKey);
+          if (!metadata) {
+            metadata = await this.editableMetadata(original.metadata.table, options);
+            metadataByTable.set(tableKey, metadata);
+          }
+          if (JSON.stringify(metadata) !== JSON.stringify(original.metadata)) throw new StateQLError("STALE_PLAN", "Table metadata changed. Reload the table.");
+          const identity = tableUpdateIdentity(metadata, original.original);
+          if (identities.has(identity)) throw new StateQLError("INVALID_COMMAND", "The same row cannot appear twice in one edit batch.");
+          identities.add(identity);
+          const update = { metadata, original: original.original, changes: item.changes };
+          compileTableUpdate(update);
+          updates.push(update);
+          expires = Math.min(expires, original.expires);
+        }
+        const payload = JSON.stringify({ version: 1, updates });
+        const context = this.executionContext(options);
+        const source = await this.resolveConnectionSource(connection, session, "plan", "read", context);
+        const adapter = connection.driver === "mongodb" ? await this.openMongoAdapter(connection, context, source) : await this.openAdapter(connection, context, source);
+        try {
+          const plan = this.store.savePlan({
+            sessionId: session.id, ownerActorId: this.actorId, connectionId: connection.id,
+            sql: `Conditional table update batch (${updates.length} rows)`, parameters: [payload], statementType: "table.updates",
+            stateVersion: version(connection), stateSignature: await adapter.signature(), destructive: false,
+            allowUnbounded: false, allowDestructive: false, expiresAt: new Date(expires).toISOString(),
+          });
+          return { data: { plan_id: plan.id, statement_type: plan.statement_type, destructive: false, requires_confirmation: true,
+            required_overrides: [], state_version: plan.state_version, owner_actor_id: plan.owner_actor_id, expires_at: plan.expires_at },
+            handle: plan.id, executed: true, stateVersion: plan.state_version, confidence: adapter.confidence };
+        } finally { await closeAdapterQuietly(adapter); }
+      }),
+    );
+  }
+
 
   private async editableMetadata(table: TableIdentity, options: ExecutionOptions): Promise<EditableTable> {
     const snapshot = this.snapshot({ historyLimit: 1 });
@@ -1472,6 +1618,19 @@ export class StateQL {
     });
   }
 
+  async redisExec(
+    command: RedisCommand,
+    options: RedisExecOptions = {},
+  ): Promise<Response<ExecData>> {
+    return this.run("redis.exec", async (session) => {
+      const value = validatedRedisWrite(command);
+      const connection = this.requireRedisConnection(session, "redisExec");
+      this.rejectDuringStagedTransaction(session, "Redis writes");
+      return this.performRedisExec(session, connection, value, options, this.executionContext(options));
+    });
+  }
+
+
   async receipt(id: string): Promise<Response<OperationData>> {
     return this.run("receipt", async (session) => {
       const operation = this.store.getOperation(id);
@@ -1495,6 +1654,7 @@ export class StateQL {
   ): Promise<Response<TransactionData>> {
     return this.run("transaction.begin", async (session) => {
       const connection = this.requireConnection(session);
+      if (connection.driver === "redis") throw new StateQLError("UNSUPPORTED_DRIVER", "Redis does not support staged StateQL transactions; use redisPlan/apply for one guarded mutation.");
       if (connection.read_only) {
         throw new StateQLError(
           "READ_ONLY_CONNECTION",
@@ -1798,6 +1958,7 @@ export class StateQL {
         "read",
         context,
       );
+      if (connection.driver === "redis") throw new StateQLError("INVALID_COMMAND", "Legacy inspect is not supported for Redis; use listObjects or describeObject.");
       const adapter = connection.driver === "mongodb"
         ? await this.openMongoAdapter(connection, context, adapterSource)
         : await this.openAdapter(connection, context, adapterSource);
@@ -1826,6 +1987,55 @@ export class StateQL {
       }
     }, undefined, table);
   }
+
+  async listObjects(
+    filter: ListObjectsFilter = {},
+    options: ExecutionOptions = {},
+  ): Promise<Response<ListObjectsData>> {
+    return this.run("objects.list", async (session) => {
+      validateCatalogFilter(filter);
+      const connection = this.requireConnection(session);
+      this.rejectDuringStagedTransaction(session, "Catalog discovery");
+      const context = this.executionContext(options);
+      const source = await this.resolveConnectionSource(connection, session, "inspect", "read", context);
+      const adapter = connection.driver === "mongodb"
+        ? await this.openMongoAdapter(connection, context, source)
+        : connection.driver === "redis"
+          ? await this.openRedisAdapter(connection, context, source)
+          : await this.openAdapter(connection, context, source);
+      try {
+        return { data: await adapter.listObjects(filter), executed: true, stateVersion: version(connection), confidence: adapter.confidence };
+      } catch (error) {
+        if (error instanceof AdapterExecutionError) throw stoppedStateQLError(error, true);
+        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { executed: true });
+      } finally { await closeAdapterQuietly(adapter); }
+    });
+  }
+
+  async describeObject(
+    object: CatalogObject,
+    options: ExecutionOptions = {},
+  ): Promise<Response<DescribeObjectData>> {
+    return this.run("object.describe", async (session) => {
+      validateCatalogObject(object);
+      const connection = this.requireConnection(session);
+      this.rejectDuringStagedTransaction(session, "Catalog description");
+      const context = this.executionContext(options);
+      const source = await this.resolveConnectionSource(connection, session, "inspect", "read", context);
+      const adapter = connection.driver === "mongodb"
+        ? await this.openMongoAdapter(connection, context, source)
+        : connection.driver === "redis"
+          ? await this.openRedisAdapter(connection, context, source)
+          : await this.openAdapter(connection, context, source);
+      try {
+        return { data: await adapter.describeObject(object), executed: true, stateVersion: version(connection), confidence: adapter.confidence };
+      } catch (error) {
+        if (error instanceof AdapterExecutionError) throw stoppedStateQLError(error, true);
+        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { executed: true });
+      } finally { await closeAdapterQuietly(adapter); }
+    });
+  }
+
 
   async plan(sql: string, options: PlanOptions = {}): Promise<Response<PlanData>> {
     return this.run("plan", async (session) => {
@@ -1991,6 +2201,41 @@ export class StateQL {
     });
   }
 
+  async redisPlan(
+    command: RedisCommand,
+    options: RedisPlanOptions = {},
+  ): Promise<Response<PlanData>> {
+    return this.run("redis.plan", async (session) => {
+      const value = validatedRedisWrite(command);
+      const connection = this.requireRedisConnection(session, "redisPlan");
+      this.rejectDuringStagedTransaction(session, "Plans");
+      if (connection.read_only) throw new StateQLError("READ_ONLY_CONNECTION", "Connection is read-only.");
+      const context = this.executionContext(options);
+      const source = await this.resolveConnectionSource(connection, session, "plan", "read", context);
+      const adapter = await this.openRedisAdapter(connection, context, source);
+      try {
+        const precondition = await adapter.precondition(value);
+        const payload = JSON.stringify({ command: serializeRedisCommand(value), precondition });
+        const plan = this.store.savePlan({
+          sessionId: session.id, ownerActorId: this.actorId, connectionId: connection.id,
+          sql: `Redis native ${value.command}`, parameters: [payload], statementType: `redis.${value.command.toLowerCase()}`,
+          stateVersion: version(connection), stateSignature: await adapter.signature(), destructive: value.command === "DEL",
+          allowUnbounded: false, allowDestructive: true,
+          expiresAt: new Date(this.now().getTime() + 10 * 60_000).toISOString(),
+        });
+        return { data: { plan_id: plan.id, statement_type: plan.statement_type, destructive: Boolean(plan.destructive),
+          requires_confirmation: true, required_overrides: [], state_version: plan.state_version,
+          owner_actor_id: plan.owner_actor_id, expires_at: plan.expires_at }, handle: plan.id, executed: true,
+          stateVersion: plan.state_version, confidence: adapter.confidence };
+      } catch (error) {
+        if (error instanceof StateQLError) throw error;
+        if (error instanceof AdapterExecutionError) throw stoppedStateQLError(error, true);
+        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { executed: true });
+      } finally { await closeAdapterQuietly(adapter); }
+    });
+  }
+
+
   async apply(
     planId: string,
     options: ExecutionOptions = {},
@@ -2017,14 +2262,19 @@ export class StateQL {
         throw new StateQLError("STALE_PLAN", "Plan has expired.");
       }
       const tableUpdate = plan.statement_type === "table.update" ? parseTableUpdate(plan.parameters) : undefined;
+      const tableUpdates = plan.statement_type === "table.updates" ? parseTableUpdates(plan.parameters) : undefined;
       const compiled = tableUpdate ? compileTableUpdate(tableUpdate) : undefined;
+      const compiledUpdates = tableUpdates?.map(compileTableUpdate);
       if (compiled && compiled.sql !== plan.sql) throw new StateQLError("STALE_PLAN", "Stored update does not match its plan.");
-      const nativePlan = tableUpdate?.metadata.driver === "mongodb" || plan.statement_type.startsWith("mongo.");
-      historySql = nativePlan ? undefined : plan.sql;
-      const mongoCommand = compiled?.mongo ?? (nativePlan
+      const mongoPlan = tableUpdate?.metadata.driver === "mongodb" || tableUpdates?.[0]?.metadata.driver === "mongodb" || plan.statement_type.startsWith("mongo.");
+      const redisPlan = plan.statement_type.startsWith("redis.");
+      const nativePlan = Boolean(mongoPlan || redisPlan);
+      historySql = nativePlan || tableUpdates ? undefined : plan.sql;
+      const mongoCommand = compiled?.mongo ?? (plan.statement_type.startsWith("mongo.")
         ? storedMongoPlan(plan.parameters, plan.statement_type, plan.id)
         : undefined);
-      const planParameters = compiled?.params ?? (nativePlan
+      const redisStored = redisPlan ? storedRedisPlan(plan.parameters, plan.statement_type, plan.id) : undefined;
+      const planParameters = compiled?.params ?? (nativePlan || tableUpdates
         ? undefined
         : parseJson<SqlParameters>(
             plan.parameters,
@@ -2054,17 +2304,23 @@ export class StateQL {
             "Database state changed after this plan was created.",
           );
         }
-        if (nativePlan && connection.driver !== "mongodb") {
-          throw new StateQLError(
-            "STALE_PLAN",
-            "MongoDB plan is not attached to a MongoDB connection.",
-          );
+        if (mongoPlan && connection.driver !== "mongodb") {
+          throw new StateQLError("STALE_PLAN", "MongoDB plan is not attached to a MongoDB connection.");
         }
-        if (!nativePlan && connection.driver === "mongodb") {
+        if (redisPlan && connection.driver !== "redis") {
+          throw new StateQLError("STALE_PLAN", "Redis plan is not attached to a Redis connection.");
+        }
+        if (!nativePlan && (connection.driver === "mongodb" || connection.driver === "redis")) {
           this.rejectMongoSql(connection, "mongoPlan");
         }
         if (tableUpdate && JSON.stringify(await this.editableMetadata(tableUpdate.metadata.table, options)) !== JSON.stringify(tableUpdate.metadata))
           throw new StateQLError("STALE_PLAN", "Table metadata changed. Reload and plan again.");
+        if (tableUpdates) {
+          for (const update of tableUpdates) {
+            if (JSON.stringify(await this.editableMetadata(update.metadata.table, options)) !== JSON.stringify(update.metadata))
+              throw new StateQLError("STALE_PLAN", "Table metadata changed. Reload and plan again.");
+          }
+        }
         const context = this.executionContext(options);
         const adapterSource = await this.resolveConnectionSource(
           connection,
@@ -2073,9 +2329,11 @@ export class StateQL {
           "write",
           context,
         );
-        const adapter = nativePlan
+        const adapter = mongoPlan
           ? await this.openMongoAdapter(connection, context, adapterSource)
-          : await this.openAdapter(connection, context, adapterSource);
+          : redisPlan
+            ? await this.openRedisAdapter(connection, context, adapterSource)
+            : await this.openAdapter(connection, context, adapterSource);
         try {
           if ((await adapter.signature()) !== claimed.state_signature) {
             throw new StateQLError(
@@ -2096,34 +2354,38 @@ export class StateQL {
         } finally {
           await closeAdapterQuietly(adapter);
         }
-        const result = mongoCommand
-          ? await this.performMongoExec(
-              session,
-              connection,
-              mongoCommand,
-              {
-                allowUnbounded: Boolean(claimed.allow_unbounded),
-                allowDestructive: Boolean(claimed.allow_destructive),
-                ...(tableUpdate ? { expectedRows: 1 as const } : {}),
-              },
-              context,
-              { planId: claimed.id, claimToken },
-              adapterSource,
-            )
-          : await this.performExec(
-              session,
-              connection,
-              claimed.sql,
-              {
-                params: planParameters,
-                ...(tableUpdate ? { expectedRows: 1 as const } : {}),
-                allowUnbounded: Boolean(claimed.allow_unbounded),
-                allowDestructive: Boolean(claimed.allow_destructive),
-              },
-              context,
-              { planId: claimed.id, claimToken },
-              adapterSource,
-            );
+        const result = tableUpdates && compiledUpdates
+          ? await this.performTableBatch(session, connection, tableUpdates, compiledUpdates, context, { planId: claimed.id, claimToken }, adapterSource)
+          : redisStored
+            ? await this.performRedisExec(session, connection, redisStored.command, {}, context, { planId: claimed.id, claimToken }, adapterSource, redisStored.precondition)
+            : mongoCommand
+              ? await this.performMongoExec(
+                  session,
+                  connection,
+                  mongoCommand,
+                  {
+                    allowUnbounded: Boolean(claimed.allow_unbounded),
+                    allowDestructive: Boolean(claimed.allow_destructive),
+                    ...(tableUpdate ? { expectedRows: 1 as const } : {}),
+                  },
+                  context,
+                  { planId: claimed.id, claimToken },
+                  adapterSource,
+                )
+              : await this.performExec(
+                  session,
+                  connection,
+                  claimed.sql,
+                  {
+                    params: planParameters,
+                    ...(tableUpdate ? { expectedRows: 1 as const } : {}),
+                    allowUnbounded: Boolean(claimed.allow_unbounded),
+                    allowDestructive: Boolean(claimed.allow_destructive),
+                  },
+                  context,
+                  { planId: claimed.id, claimToken },
+                  adapterSource,
+                );
         return {
           ...result,
           data: { plan_id: claimed.id, ...result.data },
@@ -2146,19 +2408,25 @@ export class StateQL {
     limit = 20,
     options: HistoryOptions = {},
   ): Promise<Response<HistoryData>> {
-    return this.run("history", async (session) => ({
-      data: {
-        history: this.store
-          .history(
-            session.id,
-            positiveInteger(limit, "limit"),
-            options.origin === undefined
-              ? undefined
-              : parseCommandOrigin(options.origin),
-          )
-          .map(historyEntry),
-      },
-    }));
+    return this.run("history", async (session) => {
+      if (options.internal !== undefined && typeof options.internal !== "boolean") throw new StateQLError("INVALID_COMMAND", "History internal filter must be boolean.");
+      return {
+        data: {
+          history: this.store
+            .history(
+              session.id,
+              positiveInteger(limit, "limit"),
+              {
+                ...(options.origin === undefined ? {} : { origin: parseCommandOrigin(options.origin) }),
+                ...(options.category === undefined ? {} : { category: parseHistoryCategory(options.category) }),
+                ...(options.internal === undefined ? {} : { internal: options.internal }),
+                offset: nonNegativeInteger(options.offset ?? 0, "offset"),
+              },
+            )
+            .map(historyEntry),
+        },
+      };
+    });
   }
 
   async doctor(): Promise<Response<DoctorData>> {
@@ -2190,7 +2458,7 @@ export class StateQL {
   async capabilities(): Promise<Response<CapabilitiesData>> {
     return this.run("capabilities", async () => ({
       data: {
-        drivers: ["mongodb", "mysql", "postgres", "sqlite"],
+        drivers: ["mongodb", "mysql", "postgres", "redis", "sqlite"],
         features: {
           result_handles: true,
           write_deduplication: true,
@@ -2205,6 +2473,10 @@ export class StateQL {
           state_diagnostics: true,
           state_purge: true,
           state_quota: true,
+          bounded_catalog: true,
+          generated_aliases: true,
+          multi_row_table_plans: true,
+          history_classification: true,
         },
         driver_features: {
           mongodb: {
@@ -2214,6 +2486,15 @@ export class StateQL {
             plans: true,
             transactions: true,
             transactions_require_replica_set: true,
+            inspection: true,
+          },
+          redis: {
+            sql: false,
+            native_read: true,
+            native_write: true,
+            plans: true,
+            transactions: false,
+            guarded_single_key_writes: true,
             inspection: true,
           },
         },
@@ -2265,6 +2546,13 @@ export class StateQL {
               credentialRef: command.credential_ref,
             },
           );
+        case "profile.update":
+          return this.updateProfile(batchString(command.name, "name"), {
+            ...(command.target !== undefined ? { target: command.target } : {}),
+            ...(command.secret_env !== undefined ? { secretEnv: command.secret_env } : {}),
+            ...(command.credential_ref !== undefined ? { credentialRef: command.credential_ref } : {}),
+            ...(command.read_only !== undefined ? { readOnly: command.read_only } : {}),
+          });
         case "profile.list":
           return this.listProfiles();
         case "profile.show":
@@ -2313,6 +2601,12 @@ export class StateQL {
             data: { ...response.data, alias: command.as },
           };
         }
+        case "redis.query": {
+          const response = await this.redisQuery(command.redis as RedisCommand, { cache: command.cache ?? "auto", timeoutMs: command.timeout_ms });
+          if (!response.ok || !command.as) return response;
+          this.store.setAlias(response.session_id, command.as, response.data.result_id);
+          return { ...response, data: { ...response.data, alias: command.as } };
+        }
         case "filter": {
           const response = await this.filter(
             batchString(command.handle, "handle"),
@@ -2345,6 +2639,12 @@ export class StateQL {
             allowDestructive: command.allow_destructive ?? false,
             timeoutMs: command.timeout_ms,
           });
+        case "redis.exec":
+          return this.redisExec(command.redis as RedisCommand, {
+            replay: command.replay ?? false,
+            idempotencyKey: command.idempotency_key,
+            timeoutMs: command.timeout_ms,
+          });
         case "show":
           return this.show(batchString(command.handle, "handle"));
         case "rows":
@@ -2365,6 +2665,16 @@ export class StateQL {
           return this.inspect(batchString(command.kind, "kind"), command.table, {
             timeoutMs: command.timeout_ms,
           });
+        case "objects.list":
+          return this.listObjects({
+            ...(command.kind ? { kind: command.kind as ListObjectsFilter["kind"] } : {}),
+            ...(command.table ? { schema: command.table } : {}),
+            ...(command.where ? { search: command.where } : {}),
+            offset: command.cursor ?? command.offset ?? 0,
+            limit: command.limit ?? 50,
+          }, { timeoutMs: command.timeout_ms });
+        case "object.describe":
+          return this.describeObject(command.object as CatalogObject, { timeoutMs: command.timeout_ms });
         case "transaction.begin":
           return this.beginTransaction(command.isolation);
         case "transaction.status":
@@ -2388,6 +2698,8 @@ export class StateQL {
             allowDestructive: command.allow_destructive,
             timeoutMs: command.timeout_ms,
           });
+        case "redis.plan":
+          return this.redisPlan(command.redis as RedisCommand, { timeoutMs: command.timeout_ms });
         case "apply":
           return this.apply(batchString(command.handle, "handle"), {
             timeoutMs: command.timeout_ms,
@@ -2395,6 +2707,9 @@ export class StateQL {
         case "history":
           return this.history(command.limit ?? 20, {
             origin: command.history_origin,
+            category: command.history_category,
+            internal: command.history_internal,
+            offset: command.offset,
           });
         case "receipt":
           return this.receipt(batchString(command.handle, "handle"));
@@ -2989,6 +3304,133 @@ export class StateQL {
     }
   }
 
+  private async performRedisExec(
+    session: SessionRecord,
+    connection: ConnectionRecord,
+    command: RedisCommand,
+    options: RedisExecOptions,
+    context: AdapterContext,
+    planClaim?: { planId: string; claimToken: string },
+    resolvedSource?: string,
+    precondition?: RedisPrecondition,
+  ): Promise<ActionResult<ExecData>> {
+    const value = validatedRedisWrite(command);
+    if (connection.driver !== "redis") throw new StateQLError("INVALID_COMMAND", "redisExec requires an active Redis connection.");
+    if (connection.read_only) throw new StateQLError("READ_ONLY_CONNECTION", "Connection is read-only.");
+    if (options.idempotencyKey !== undefined && !options.idempotencyKey.trim()) throw new StateQLError("INVALID_COMMAND", "Idempotency key cannot be empty.");
+    const serialized = serializeRedisCommand(value);
+    const fingerprint = hash({ command: serialized, database: databaseIdentity(connection) });
+    const reservation = this.store.reserveOperation({
+      sessionId: session.id, actorId: this.actorId, connectionId: connection.id, fingerprint,
+      sql: `Redis native ${value.command}`, parameters: [serialized], statementType: `redis.${value.command.toLowerCase()}`,
+      status: "executing", replay: options.replay ?? false, idempotencyKey: options.idempotencyKey,
+      stateVersionBefore: version(connection),
+    });
+    if (reservation.denied) throw new StateQLError(reservation.denied === "membership" ? "PERMISSION_DENIED" : "TRANSACTION_FAILED", "Redis write reservation was denied.");
+    const previous = reservation.previous;
+    if (previous && options.idempotencyKey && !options.replay && previous.fingerprint !== fingerprint) {
+      throw new StateQLError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used for a different write.");
+    }
+    if (previous && !reservation.operation) {
+      if (previous.status === "executing" || previous.status === "outcome_unknown") throw new StateQLError("OUTCOME_UNKNOWN", "A matching Redis write has an unknown outcome.", { executed: true });
+      if (options.idempotencyKey) return { data: { ...operationData(previous), duplicate: true, duplicate_of: previous.id, idempotency_key: options.idempotencyKey }, handle: previous.id, cached: true, stateVersion: previous.state_version_after ?? previous.state_version_before };
+      throw new StateQLError("POTENTIAL_DUPLICATE_WRITE", "An equivalent Redis operation was previously applied.", { extra: { previous_operation_id: previous.id, replay_required: true } });
+    }
+    const operation = reservation.operation!;
+    let adapter: RedisAdapter;
+    let source: string;
+    try {
+      source = resolvedSource ?? await this.resolveConnectionSource(connection, session, "exec", "write", context);
+      adapter = await this.openRedisAdapter(connection, context, source);
+    } catch (error) {
+      this.store.failOperation(operation.id);
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError("CONNECTION_FAILED", "Redis connection failed.", { retryable: true });
+    }
+    try {
+      const write = await adapter.write(value, precondition);
+      try {
+        const finalized = planClaim
+          ? this.store.finishPlannedOperation({ planId: planClaim.planId, claimToken: planClaim.claimToken, operationId: operation.id,
+              connectionId: connection.id, affectedRows: write.affectedRows, outcome: write.outcome })
+          : (() => { const stateVersion = this.store.bumpVersion(connection.id); return { operation: this.store.finishOperation(operation.id, write.affectedRows, stateVersion, write.outcome), stateVersion }; })();
+        return { data: { ...operationData(finalized.operation), duplicate: Boolean(previous), duplicate_override: Boolean(previous) },
+          handle: finalized.operation.id, executed: true, stateVersion: finalized.stateVersion, confidence: adapter.confidence };
+      } catch (error) {
+        this.store.markOperationOutcomeUnknown(operation.id);
+        throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), { executed: true, suggestedAction: "Inspect Redis state before issuing a replacement write." });
+      }
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      if ((error instanceof AdapterExecutionError || error instanceof AdapterWriteError) && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        if (error.message.startsWith("ROW_CONFLICT:")) throw new StateQLError("ROW_CONFLICT", "The Redis key changed. Reload and plan again.");
+        throw error instanceof AdapterExecutionError ? stoppedStateQLError(error, false) : new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { executed: true });
+      }
+      this.store.markOperationOutcomeUnknown(operation.id);
+      throw new StateQLError("OUTCOME_UNKNOWN", safeCredentialErrorMessage(error, source), { executed: true, suggestedAction: "Inspect Redis state before issuing a replacement write." });
+    } finally { await closeAdapterQuietly(adapter); }
+  }
+
+  private async performTableBatch(
+    session: SessionRecord,
+    connection: ConnectionRecord,
+    updates: TableUpdate[],
+    compiled: Array<ReturnType<typeof compileTableUpdate>>,
+    context: AdapterContext,
+    planClaim: { planId: string; claimToken: string },
+    source: string,
+  ): Promise<ActionResult<ExecData>> {
+    if (connection.driver === "redis") throw new StateQLError("UNSUPPORTED_DRIVER", "Redis does not support table edit batches.");
+    const reservation = this.store.reserveOperation({
+      sessionId: session.id, actorId: this.actorId, connectionId: connection.id,
+      fingerprint: hash({ plan: planClaim.planId, updates }), sql: `Conditional table update batch (${updates.length} rows)`,
+      parameters: [JSON.stringify({ version: 1, updates })], statementType: "table.updates", status: "executing",
+      replay: true, stateVersionBefore: version(connection),
+    });
+    if (!reservation.operation) throw new StateQLError("STALE_PLAN", "Table edit batch could not be reserved.");
+    const operation = reservation.operation;
+    const adapter = connection.driver === "mongodb"
+      ? await this.openMongoAdapter(connection, context, source)
+      : await this.openAdapter(connection, context, source);
+    try {
+      let affectedRows: number;
+      if (connection.driver === "mongodb") {
+        const commands = compiled.map((item) => {
+          if (!item.mongo) throw new StateQLError("STALE_PLAN", "Table edit batch contains mixed drivers.");
+          return item.mongo;
+        });
+        const results = await (adapter as MongoAdapter).writeBatch(commands, "snapshot", true);
+        affectedRows = results.reduce((sum, item) => sum + item.affectedRows, 0);
+      } else {
+        const operations: BatchWriteOperation[] = compiled.map((item, index) => ({
+          ...operation, id: `${operation.id}:${index}`, sql: item.sql, parameters: JSON.stringify(item.params), statement_type: "update", expectedRows: 1,
+        }));
+        const results = await (adapter as Adapter).writeBatch(operations, "serializable");
+        affectedRows = results.reduce((sum, item) => sum + item.affectedRows, 0);
+      }
+      try {
+        const finalized = this.store.finishPlannedOperation({ planId: planClaim.planId, claimToken: planClaim.claimToken,
+          operationId: operation.id, connectionId: connection.id, affectedRows });
+        return { data: operationData(finalized.operation), handle: finalized.operation.id, executed: true,
+          stateVersion: finalized.stateVersion, confidence: adapter.confidence };
+      } catch (error) {
+        this.store.markOperationOutcomeUnknown(operation.id);
+        throw new StateQLError("OUTCOME_UNKNOWN", errorMessage(error), { executed: true, suggestedAction: "Inspect every edited row before retrying." });
+      }
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      if ((error instanceof BatchWriteError || error instanceof AdapterExecutionError) && !error.outcomeUnknown) {
+        this.store.failOperation(operation.id);
+        if (error.message.startsWith("ROW_CONFLICT:")) throw new StateQLError("ROW_CONFLICT", "At least one row changed; the entire edit batch was rolled back.");
+        throw error instanceof AdapterExecutionError ? stoppedStateQLError(error, false) : new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { executed: true });
+      }
+      this.store.markOperationOutcomeUnknown(operation.id);
+      throw new StateQLError("OUTCOME_UNKNOWN", safeCredentialErrorMessage(error, source), { executed: true, suggestedAction: "Inspect every edited row before retrying." });
+    } finally { await closeAdapterQuietly(adapter); }
+  }
+
+
   private batchFailure(message: string): Promise<Response<unknown>> {
     return this.run("batch", async () => {
       throw new StateQLError("INVALID_COMMAND", message);
@@ -3068,15 +3510,29 @@ export class StateQL {
     return connection;
   }
 
+  private requireRedisConnection(
+    session: SessionRecord,
+    method: "redisQuery" | "redisExec" | "redisPlan",
+  ): ConnectionRecord {
+    const connection = this.requireConnection(session);
+    if (connection.driver !== "redis") throw new StateQLError("INVALID_COMMAND", `${method} requires an active Redis connection.`);
+    return connection;
+  }
+
+
   private rejectMongoSql(
     connection: ConnectionRecord,
     nativeMethod: "mongoQuery" | "mongoExec" | "mongoPlan",
   ): void {
-    if (connection.driver !== "mongodb") return;
+    if (connection.driver !== "mongodb" && connection.driver !== "redis") return;
+    const method = connection.driver === "redis"
+      ? nativeMethod === "mongoQuery" ? "redisQuery" : nativeMethod === "mongoExec" ? "redisExec" : "redisPlan"
+      : nativeMethod;
+    const name = connection.driver === "redis" ? "Redis" : "MongoDB";
     throw new StateQLError(
       "INVALID_COMMAND",
-      `SQL is not supported for MongoDB connections; use ${nativeMethod} instead.`,
-      { suggestedAction: `Use ${nativeMethod} with a native MongoDB command.` },
+      `SQL is not supported for ${name} connections; use ${method} instead.`,
+      { suggestedAction: `Use ${method} with a native ${name} command.` },
     );
   }
 
@@ -3260,6 +3716,21 @@ export class StateQL {
     }
   }
 
+  private async openRedisAdapter(
+    connection: ConnectionRecord,
+    context: AdapterContext,
+    source: string,
+  ): Promise<RedisAdapter> {
+    try {
+      if (connection.driver !== "redis") throw new Error("Redis adapter requires a Redis connection.");
+      return new RedisAdapter(source, Boolean(connection.read_only), context);
+    } catch (error) {
+      if (error instanceof StateQLError) throw error;
+      throw new StateQLError("CONNECTION_FAILED", safeCredentialErrorMessage(error, source), { retryable: true });
+    }
+  }
+
+
   private executionContext(options: ExecutionOptions): AdapterContext {
     return createAdapterContext(
       executionTimeout(options.timeoutMs ?? this.timeoutMs),
@@ -3279,6 +3750,8 @@ export class StateQL {
     );
     return {
       result_id: result.id,
+      alias: result.alias ?? this.store.generatedAlias(result.id),
+      display_alias: result.alias ?? this.store.generatedAlias(result.id),
       rows: result.row_count,
       columns: this.store.resultColumns(result),
       preview,
@@ -3286,6 +3759,7 @@ export class StateQL {
       truncated: preview.length < result.row_count,
       cached,
       ...(cached ? { duplicate_of: result.id } : {}),
+      ...(result.sql.startsWith("Redis native ") ? { next_cursor: redisResultCursor(result.parameters) } : {}),
       state_version: result.state_version,
       storage: {
         mode: "materialized",
@@ -3315,7 +3789,10 @@ export class StateQL {
     historyTarget?: string,
   ): Promise<Response<T>> {
     const started = performance.now();
-    const origin = this.commandContexts.getStore()?.origin ?? "legacy";
+    const commandContext = this.commandContexts.getStore();
+    const origin = commandContext?.origin ?? "legacy";
+    const category = historyCategory(command);
+    const internal = commandContext?.internal ?? false;
     let session = this.store.ensureSession(this.sessionName);
     const commandId = this.store.nextId("cmd");
     if (!this.store.isSessionMember(session.id, this.actorId)) {
@@ -3342,6 +3819,8 @@ export class StateQL {
         sessionId: session.id,
         actorId: this.actorId,
         origin,
+        category,
+        internal,
         command,
         target: historyTarget,
         ...(result.handle ? { handle: result.handle } : {}),
@@ -3374,6 +3853,8 @@ export class StateQL {
         sessionId: session.id,
         actorId: this.actorId,
         origin,
+        category,
+        internal,
         command,
         target: historyTarget,
         ...(sqlText !== undefined ? { sql: sqlText } : {}),
@@ -3408,6 +3889,8 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     session_id: item.session_id,
     actor_id: item.actor_id,
     origin: item.origin,
+    category: item.category,
+    internal: Boolean(item.internal),
     command: item.command,
     sql: item.sql,
     ...(item.target ? { target: item.target } : {}),
@@ -3453,12 +3936,16 @@ function mergeCommandExecutionContext(
       "Command execution context signal must be an AbortSignal.",
     );
   }
+  if (supplied.internal !== undefined && typeof supplied.internal !== "boolean") {
+    throw new StateQLError("INVALID_COMMAND", "Command execution context internal must be boolean.");
+  }
   return {
     signal: combineAbortSignals(inherited?.signal, supplied.signal),
     origin:
       supplied.origin === undefined
         ? inherited?.origin
         : parseCommandOrigin(supplied.origin),
+    internal: supplied.internal ?? inherited?.internal,
   };
 }
 
@@ -3506,6 +3993,17 @@ function validatedMongoWrite(command: unknown): MongoWriteCommand {
     throw new StateQLError("INVALID_COMMAND", errorMessage(error));
   }
 }
+
+function validatedRedisRead(command: unknown): RedisCommand {
+  try { return validateRedisReadCommand(command); }
+  catch (error) { throw new StateQLError("INVALID_COMMAND", errorMessage(error)); }
+}
+
+function validatedRedisWrite(command: unknown): RedisCommand {
+  try { return validateRedisWriteCommand(command); }
+  catch (error) { throw new StateQLError("INVALID_COMMAND", errorMessage(error)); }
+}
+
 
 
 function mongoDescriptor(operation: string): string {
@@ -3582,10 +4080,53 @@ function storedMongoWrite(
   }
 }
 
+function storedRedisPlan(parameters: string, statementType: string, planId: string): { command: RedisCommand; precondition: RedisPrecondition } {
+  try {
+    const outer = JSON.parse(parameters) as unknown;
+    if (!Array.isArray(outer) || outer.length !== 1 || typeof outer[0] !== "string") throw new Error();
+    const payload = JSON.parse(outer[0]) as { command?: unknown; precondition?: unknown };
+    if (typeof payload.command !== "string" || !payload.precondition || typeof payload.precondition !== "object") throw new Error();
+    const command = deserializeRedisCommand(payload.command);
+    const precondition = payload.precondition as RedisPrecondition;
+    if (typeof precondition.key !== "string" || typeof precondition.fingerprint !== "string" || typeof precondition.expiresAt !== "number" || !Number.isFinite(precondition.expiresAt) || statementType !== `redis.${command.command.toLowerCase()}`) throw new Error();
+    return { command, precondition };
+  } catch {
+    throw new StateQLError("STALE_PLAN", `Stored Redis plan "${planId}" payload is invalid.`);
+  }
+}
+
+function redisResultCursor(parameters: string): string | null {
+  try {
+    const value = JSON.parse(parameters) as unknown;
+    return Array.isArray(value) && (typeof value[1] === "string" || value[1] === null) ? value[1] : null;
+  } catch { return null; }
+}
+
+function tableUpdateIdentity(metadata: EditableTable, row: Row): string {
+  const identity = metadata.driver === "mongodb"
+    ? { table: metadata.table, id: row._id }
+    : { table: metadata.table, keys: metadata.columns.filter((column) => column.key > 0).sort((a, b) => a.key - b.key).map((column) => [column.name, row[column.name]]) };
+  return hash(identity);
+}
+
+function validateCatalogFilter(filter: ListObjectsFilter): void {
+  if (!filter || typeof filter !== "object" || Array.isArray(filter) || Object.keys(filter).some((key) => !["kind", "schema", "search", "offset", "limit"].includes(key))) throw new StateQLError("INVALID_COMMAND", "Catalog filter contains unknown fields.");
+  if (filter.kind !== undefined && !["table", "view", "collection", "function", "trigger", "enum", "key"].includes(filter.kind)) throw new StateQLError("INVALID_COMMAND", "Unknown catalog object kind.");
+  for (const [name, value] of [["schema", filter.schema], ["search", filter.search]] as const) if (value !== undefined && (typeof value !== "string" || !value || value.length > 200 || value.includes("\0"))) throw new StateQLError("INVALID_COMMAND", `Catalog ${name} is invalid.`);
+  if (filter.offset !== undefined && !((typeof filter.offset === "number" && Number.isSafeInteger(filter.offset) && filter.offset >= 0) || (typeof filter.offset === "string" && /^\d+$/.test(filter.offset)))) throw new StateQLError("INVALID_COMMAND", "Catalog offset is invalid.");
+  if (filter.limit !== undefined && (!Number.isSafeInteger(filter.limit) || filter.limit < 1 || filter.limit > 200)) throw new StateQLError("INVALID_COMMAND", "Catalog limit must be 1-200.");
+}
+
+function validateCatalogObject(object: CatalogObject): void {
+  if (!object || typeof object !== "object" || Array.isArray(object) || !["table", "view", "collection", "function", "trigger", "enum", "key"].includes(object.kind) || typeof object.name !== "string" || !object.name || object.name.length > 500 || object.name.includes("\0") || (object.schema !== undefined && (typeof object.schema !== "string" || !object.schema || object.schema.length > 500 || object.schema.includes("\0"))) || (object.identity !== undefined && (typeof object.identity !== "string" || !object.identity || object.identity.length > 1000 || object.identity.includes("\0")))) throw new StateQLError("INVALID_COMMAND", "Catalog object identity is invalid.");
+}
+
+
 function databaseDisplayName(
   driver: Exclude<ConnectionRecord["driver"], "sqlite">,
 ): string {
   if (driver === "mongodb") return "MongoDB";
+  if (driver === "redis") return "Redis";
   return driver === "postgres" ? "PostgreSQL" : "MySQL";
 }
 
@@ -3595,6 +4136,7 @@ function normalizeIsolation(
 ): string {
   const normalized = isolation.trim().toLowerCase().replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ");
+  if (driver === "redis") throw new StateQLError("UNSUPPORTED_DRIVER", "Redis does not support staged SQL-style transactions.");
   if (driver === "mongodb") {
     if (normalized === "snapshot") return normalized;
     throw new StateQLError(
@@ -3644,7 +4186,7 @@ function positiveInteger(value: number, name: string): number {
   throw new StateQLError("INVALID_COMMAND", `${name} must be a positive integer.`);
 }
 
-async function closeAdapterQuietly(adapter: Adapter | MongoAdapter): Promise<void> {
+async function closeAdapterQuietly(adapter: Adapter | MongoAdapter | RedisAdapter): Promise<void> {
   try {
     await adapter.close();
   } catch {
@@ -3759,6 +4301,34 @@ function stoppedStateQLError(
     { retryable: true, executed },
   );
 }
+
+function validatedProfileSource(input: { target?: string; secretEnv?: string; credentialRef?: string }): { target: string | null; secretEnv: string | null; credentialRef: string | null } {
+  const sourceCount = [input.target, input.secretEnv, input.credentialRef].filter((value) => value !== undefined).length;
+  if (sourceCount !== 1 || input.target === "" || input.secretEnv === "" || input.credentialRef === "") {
+    throw new StateQLError("INVALID_COMMAND", "Profile requires exactly one target, secret environment variable, or credential reference.");
+  }
+  if (input.secretEnv !== undefined && !isEnvironmentName(input.secretEnv)) throw new StateQLError("INVALID_COMMAND", "Secret environment variable name is invalid.");
+  if (input.credentialRef !== undefined) validateCredentialRef(input.credentialRef);
+  let target = input.target ?? null;
+  if (target) {
+    const driver = detectDriver(target);
+    if (driver !== "sqlite" && databaseUrlHasSecret(target)) throw new StateQLError("PERMISSION_DENIED", `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`);
+    if (driver === "sqlite") target = normalizeSqliteSource(target);
+  }
+  return { target, secretEnv: input.secretEnv ?? null, credentialRef: input.credentialRef ?? null };
+}
+
+function historyCategory(command: string): HistoryCategory {
+  if (["query", "exec", "plan", "apply", "mongo.query", "mongo.exec", "mongo.plan", "redis.query", "redis.exec", "redis.plan", "filter"].includes(command)) return "statement";
+  if (command.startsWith("inspect.") || ["objects.list", "object.describe", "table.read"].includes(command)) return "introspection";
+  return "management";
+}
+
+function parseHistoryCategory(value: unknown): HistoryCategory {
+  if (value === "statement" || value === "introspection" || value === "management") return value;
+  throw new StateQLError("INVALID_COMMAND", `Unknown history category "${String(value)}".`);
+}
+
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

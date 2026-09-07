@@ -112,6 +112,28 @@ test("local profiles persist and connect by bare or explicit name", async () => 
   assert.equal(addedCredentialProfile.credential_ref, opaqueReference);
 });
 
+test("profiles update source references and read-only state atomically without leaking secrets", async () => {
+  const stateql = new StateQL({ home: createTemporaryDirectory() });
+  try {
+    await succeed(stateql.addProfile("editable", undefined, { secretEnv: "DATABASE_URL", readOnly: true }));
+    const readWrite = await succeed(stateql.updateProfile("editable", { readOnly: false }));
+    assert.equal(readWrite.secret_env, "DATABASE_URL");
+    assert.equal(readWrite.read_only, false);
+    const referenced = await succeed(stateql.updateProfile("editable", { credentialRef: "vault://database/primary" }));
+    assert.equal(referenced.target, null);
+    assert.equal(referenced.secret_env, null);
+    assert.equal(referenced.credential_ref, "vault://database/primary");
+    const rejected = await stateql.updateProfile("editable", { target: "redis://user:password@localhost/0" });
+    assert.equal(rejected.ok, false);
+    if (!rejected.ok) assert.equal(rejected.error.code, "PERMISSION_DENIED");
+    const unchanged = await succeed(stateql.showProfile("editable"));
+    assert.equal(unchanged.credential_ref, "vault://database/primary");
+    assert.equal(JSON.stringify(unchanged).includes("password"), false);
+    assert.equal((await stateql.updateProfile("editable", {})).ok, false);
+  } finally { stateql.close(); }
+});
+
+
 test("CLI accepts shell-safe parameters and applies destructive plans", async () => {
   const fixture = await createFixture();
   await succeed(

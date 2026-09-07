@@ -356,7 +356,7 @@ test("credential sources require an explicit driver and retain stored-driver ide
     if (!invalid.ok) {
       assert.equal(
         invalid.error.message,
-        "Secret environment variable must contain a complete PostgreSQL/MySQL URL or an explicit sqlite: source; MongoDB URLs are also supported.",
+        "Secret environment variable must contain a complete PostgreSQL/MySQL/Redis URL or an explicit sqlite: source; MongoDB URLs are also supported.",
       );
       assert.equal(JSON.stringify(invalid).includes("password-only"), false);
       assert.equal(

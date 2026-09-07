@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import type {
   Column,
   CommandOrigin,
   Driver,
+  HistoryCategory,
   MongoWriteOutcome,
   Row,
   SqlParameters,
@@ -74,6 +76,7 @@ export interface ResultRecord {
   state_confidence: StateConfidence;
   expires_at: string;
   created_at: string;
+  alias?: string;
 }
 
 export interface OperationRecord {
@@ -133,6 +136,8 @@ export interface HistoryRecord {
   session_id: string;
   actor_id: string;
   origin: CommandOrigin;
+  category: HistoryCategory;
+  internal: number;
   command: string;
   sql: string | null;
   target: string | null;
@@ -174,6 +179,7 @@ export class StateStore {
       this.db.exec("PRAGMA busy_timeout = 5000");
       this.db.exec("PRAGMA foreign_keys = ON");
       runMigrations(this.db, this.now);
+      this.backfillGeneratedAliases();
       this.recoverStaleCommittingTransactions();
       this.deleteExpiredData();
     } catch (error) {
@@ -445,6 +451,29 @@ export class StateStore {
     return this.getProfile(input.name)!;
   }
 
+  updateProfile(input: {
+    name: string;
+    target: string | null;
+    secretEnv: string | null;
+    credentialRef: string | null;
+    readOnly: boolean;
+  }): ProfileRecord | undefined {
+    const result = this.db.prepare(
+      `UPDATE profiles
+       SET target = ?, secret_env = ?, credential_ref = ?, read_only = ?, updated_at = ?
+       WHERE name = ?`,
+    ).run(
+      input.target,
+      input.secretEnv,
+      input.credentialRef,
+      input.readOnly ? 1 : 0,
+      this.now().toISOString(),
+      input.name,
+    );
+    return Number(result.changes) === 1 ? this.getProfile(input.name) : undefined;
+  }
+
+
   getProfile(name: string): ProfileRecord | undefined {
     return this.db
       .prepare("SELECT * FROM profiles WHERE name = ?")
@@ -611,6 +640,7 @@ export class StateStore {
           this.now().toISOString(),
         );
       this.enforceResultQuota(id);
+      this.allocateGeneratedAlias(input.sessionId, id);
       const result = this.getResult(id)!;
       this.db.exec("COMMIT");
       return result;
@@ -621,7 +651,7 @@ export class StateStore {
   }
 
   findResult(fingerprint: string): ResultRecord | undefined {
-    return this.db
+    const result = this.db
       .prepare(
         `SELECT * FROM results
          WHERE fingerprint = ?
@@ -629,10 +659,12 @@ export class StateStore {
          LIMIT 1`,
       )
       .get(fingerprint) as ResultRecord | undefined;
+    if (result) result.alias = this.generatedAlias(result.id);
+    return result;
   }
 
   getResult(idOrAlias: string, sessionId?: string): ResultRecord | undefined {
-    return this.db
+    const result = this.db
       .prepare(
         `SELECT results.*
          FROM results
@@ -646,6 +678,8 @@ export class StateStore {
       .get(idOrAlias, idOrAlias, sessionId ?? null, sessionId ?? null) as
       | ResultRecord
       | undefined;
+    if (result) result.alias = this.generatedAlias(result.id);
+    return result;
   }
 
   resultRows(result: ResultRecord): Row[] {
@@ -665,13 +699,64 @@ export class StateStore {
   }
 
   setAlias(sessionId: string, name: string, resultId: string): void {
+    const existing = this.db.prepare(
+      "SELECT result_id, generated FROM aliases WHERE session_id = ? AND name = ?",
+    ).get(sessionId, name) as { result_id: string; generated: number } | undefined;
+    if (existing?.generated) {
+      if (existing.result_id === resultId) return;
+      throw new StateQLError("INVALID_COMMAND", "Generated result aliases cannot be reassigned.");
+    }
     this.db
       .prepare(
-        `INSERT INTO aliases(session_id, name, result_id)
-         VALUES (?, ?, ?)
+        `INSERT INTO aliases(session_id, name, result_id, generated)
+         VALUES (?, ?, ?, 0)
          ON CONFLICT(session_id, name) DO UPDATE SET result_id = excluded.result_id`,
       )
       .run(sessionId, name, resultId);
+  }
+
+  generatedAlias(resultId: string): string {
+    const row = this.db.prepare(
+      "SELECT name FROM aliases WHERE result_id = ? AND generated = 1",
+    ).get(resultId) as { name: string } | undefined;
+    if (!row) throw new Error(`Result "${resultId}" has no generated alias.`);
+    return row.name;
+  }
+
+  private allocateGeneratedAlias(sessionId: string, resultId: string): string {
+    const existing = this.db.prepare(
+      "SELECT name FROM aliases WHERE result_id = ? AND generated = 1",
+    ).get(resultId) as { name: string } | undefined;
+    if (existing) return existing.name;
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const name = randomBase32Alias();
+      this.db.prepare(
+        "INSERT OR IGNORE INTO aliases(session_id, name, result_id, generated) VALUES (?, ?, ?, 1)",
+      ).run(sessionId, name, resultId);
+      const allocated = this.db.prepare(
+        "SELECT name FROM aliases WHERE result_id = ? AND generated = 1",
+      ).get(resultId) as { name: string } | undefined;
+      if (allocated) return allocated.name;
+    }
+    throw new Error("Could not allocate a unique result alias.");
+  }
+
+  private backfillGeneratedAliases(): void {
+    const results = this.db.prepare(
+      `SELECT results.id, results.session_id
+       FROM results
+       LEFT JOIN aliases ON aliases.result_id = results.id AND aliases.generated = 1
+       WHERE aliases.result_id IS NULL`,
+    ).all() as unknown as Array<{ id: string; session_id: string }>;
+    if (!results.length) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const result of results) this.allocateGeneratedAlias(result.session_id, result.id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   saveOperation(input: {
@@ -1338,6 +1423,8 @@ export class StateStore {
     sessionId: string;
     actorId: string;
     origin?: CommandOrigin;
+    category?: HistoryCategory;
+    internal?: boolean;
     command: string;
     sql?: string;
     target?: string;
@@ -1352,9 +1439,9 @@ export class StateStore {
     this.db
       .prepare(
         `INSERT INTO history
-          (id, timestamp, session_id, actor_id, origin, command, sql, target, handle,
+          (id, timestamp, session_id, actor_id, origin, category, internal, command, sql, target, handle,
            executed, cached, success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1362,6 +1449,8 @@ export class StateStore {
         input.sessionId,
         input.actorId,
         input.origin ?? "legacy",
+        input.category ?? "management",
+        input.internal ? 1 : 0,
         input.command,
         boundedHistorySql(input.sql),
         input.target?.slice(0, 1024) ?? null,
@@ -1390,18 +1479,23 @@ export class StateStore {
   history(
     sessionId: string,
     limit: number,
-    origin?: CommandOrigin,
+    input: CommandOrigin | { origin?: CommandOrigin; category?: HistoryCategory; internal?: boolean; offset?: number } = {},
   ): HistoryRecord[] {
+    const options = typeof input === "string" ? { origin: input } : input;
+    const predicates = ["session_id = ?"];
+    const values: Array<string | number | null> = [sessionId];
+    if (options.origin !== undefined) { predicates.push("origin = ?"); values.push(options.origin); }
+    if (options.category !== undefined) { predicates.push("category = ?"); values.push(options.category); }
+    if (options.internal !== undefined) { predicates.push("internal = ?"); values.push(options.internal ? 1 : 0); }
+    values.push(limit, options.offset ?? 0);
     return this.db
       .prepare(
         `SELECT * FROM history
-         WHERE session_id = ?${origin === undefined ? "" : " AND origin = ?"}
+         WHERE ${predicates.join(" AND ")}
          ORDER BY rowid DESC
-         LIMIT ?`,
+         LIMIT ? OFFSET ?`,
       )
-      .all(
-        ...(origin === undefined ? [sessionId, limit] : [sessionId, origin, limit]),
-      ) as unknown as HistoryRecord[];
+      .all(...values) as unknown as HistoryRecord[];
   }
 
   recentOperations(sessionId: string, limit: number): OperationRecord[] {
@@ -1423,6 +1517,7 @@ export class StateStore {
          LEFT JOIN aliases
            ON aliases.result_id = results.id
           AND aliases.session_id = results.session_id
+          AND aliases.generated = 1
          WHERE results.session_id = ?
          ORDER BY results.created_at DESC
          LIMIT ?`,
@@ -1576,7 +1671,7 @@ export class StateStore {
       const candidate = this.db.prepare(
         `SELECT id FROM results
          WHERE id <> ? AND NOT EXISTS (
-           SELECT 1 FROM aliases WHERE aliases.result_id = results.id
+           SELECT 1 FROM aliases WHERE aliases.result_id = results.id AND aliases.generated = 0
          )
          ORDER BY created_at, rowid LIMIT 1`,
       ).get(protectedId) as { id: string } | undefined;
@@ -1587,6 +1682,7 @@ export class StateStore {
           { suggestedAction: "Purge results or increase maxStateBytes." },
         );
       }
+      this.db.prepare("DELETE FROM aliases WHERE result_id = ? AND generated = 1").run(candidate.id);
       this.db.prepare("DELETE FROM results WHERE id = ?").run(candidate.id);
     }
   }
@@ -1666,6 +1762,12 @@ export class StateStore {
 function outcomeJson(outcome: MongoWriteOutcome | undefined): string | null {
   return outcome === undefined ? null : JSON.stringify(toJsonSafe(outcome));
 }
+
+function randomBase32Alias(): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  return [...randomBytes(10)].map((value) => alphabet[value & 31]).join("");
+}
+
 
 function boundedHistorySql(sql: string | undefined): string | null {
   if (sql === undefined) return null;

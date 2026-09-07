@@ -1,14 +1,14 @@
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
-import type { OperationRecord } from "./store.js";
-import type { Column, Row, SqlParameters } from "./types.js";
+import type { BatchWriteOperation } from "./adapters.js";
+import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Column, Row, SqlParameters } from "./types.js";
 import { hash, isSqlParameters, parseJson, toJsonSafe } from "./util.js";
 
 interface Request {
   id: number;
   source: string;
   readOnly: boolean;
-  operation: "read" | "write" | "writeBatch" | "signature" | "inspect";
+  operation: "read" | "write" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject";
   args: unknown[];
   busyTimeoutMs: number;
 }
@@ -103,7 +103,7 @@ function execute(request: Request): unknown {
     }
     case "writeBatch": {
       if (readOnly) throw new Error("Connection is read-only.");
-      const [operations, isolation] = request.args as [OperationRecord[], string];
+      const [operations, isolation] = request.args as [BatchWriteOperation[], string];
       if (isolation !== "serializable") {
         throw new Error(`SQLite does not support isolation level "${isolation}".`);
       }
@@ -123,6 +123,7 @@ function execute(request: Request): unknown {
               isSqlParameters,
             ),
           );
+          if (operation.expectedRows === 1 && Number(result.changes) !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
           results.push({ affectedRows: Number(result.changes) });
         }
       } catch (error) {
@@ -163,6 +164,14 @@ function execute(request: Request): unknown {
     case "inspect": {
       const [kind, table] = request.args as [string, string | undefined];
       return inspect(database, kind, table);
+    }
+    case "listObjects": {
+      const [filter] = request.args as [ListObjectsFilter];
+      return listObjects(database, filter);
+    }
+    case "describeObject": {
+      const [object] = request.args as [CatalogObject];
+      return describeObject(database, object);
     }
   }
 }
@@ -222,6 +231,36 @@ function inspect(database: DatabaseSync, kind: string, table?: string): unknown 
     foreign_keys: foreignKeys.length,
   };
 }
+
+function listObjects(database: DatabaseSync, filter: ListObjectsFilter): ListObjectsData {
+  const supported = ["table", "view", "trigger"] as const;
+  if (filter.kind !== undefined && !supported.includes(filter.kind as typeof supported[number])) throw new Error(`SQLite does not support catalog kind "${filter.kind}".`);
+  if (filter.schema !== undefined && filter.schema !== "main") throw new Error("SQLite only supports the main schema.");
+  const offset = filter.offset ?? 0;
+  const limit = filter.limit ?? 50;
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("Invalid SQLite catalog page bounds.");
+  if (filter.search !== undefined && (!filter.search || filter.search.length > 200 || filter.search.includes("\0"))) throw new Error("Invalid SQLite catalog search.");
+  const types = filter.kind ? [filter.kind] : [...supported];
+  const placeholders = types.map(() => "?").join(", ");
+  const rows = database.prepare(
+    `SELECT type AS kind, 'main' AS schema, name, 'main.' || name AS identity
+     FROM sqlite_master WHERE type IN (${placeholders}) AND name NOT LIKE 'sqlite_%'
+       AND (? IS NULL OR instr(lower(name), lower(?)) > 0)
+     ORDER BY kind, name LIMIT ? OFFSET ?`,
+  ).all(...types, filter.search ?? null, filter.search ?? null, limit + 1, offset) as unknown as CatalogObject[];
+  const more = rows.length > limit;
+  return { objects: rows.slice(0, limit), next_offset: more ? offset + limit : null, supported_kinds: [...supported] };
+}
+
+function describeObject(database: DatabaseSync, object: CatalogObject): DescribeObjectData {
+  if (!["table", "view", "trigger"].includes(object.kind) || (object.schema !== undefined && object.schema !== "main")) throw new Error(`SQLite does not support catalog kind "${object.kind}".`);
+  const row = database.prepare("SELECT type AS kind, 'main' AS schema, name, 'main.' || name AS identity, sql AS definition FROM sqlite_master WHERE type = ? AND name = ?").get(object.kind, object.name) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("Catalog object was not found.");
+  const definition = row.definition === null ? null : String(row.definition);
+  delete row.definition;
+  return { object: row as CatalogObject, definition };
+}
+
 
 function bindAll(
   statement: StatementSync,

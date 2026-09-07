@@ -105,6 +105,44 @@ test("conditional SQLite cardinality failure rolls back every changed row before
   } finally { await adapter.close(); store.close(); stateql.close(); }
 });
 
+test("multi-row table plans apply atomically and roll back a middle-row conflict", async () => {
+  const { stateql, database } = await createFixture();
+  const external = new DatabaseSync(database);
+  try {
+    await succeed(stateql.exec("CREATE TABLE batch_items (id INTEGER PRIMARY KEY, value TEXT)"));
+    await succeed(stateql.exec("INSERT INTO batch_items VALUES (1, 'one'), (2, 'two'), (3, 'three')"));
+    await succeed(stateql.exec("CREATE TRIGGER batch_conflict AFTER UPDATE ON batch_items WHEN NEW.id = 1 BEGIN UPDATE batch_items SET value = 'triggered' WHERE id = 2; END"));
+    const table = await succeed(stateql.readTable({ name: "batch_items" }, 100, { cache: "bypass" }));
+    const page = stateql.readMaterialized(table.result_id);
+    const plan = await succeed(stateql.planTableUpdates([
+      { row_token: page.row_tokens[0]!, changes: { set: { value: "first" } } },
+      { row_token: page.row_tokens[1]!, changes: { set: { value: "second" } } },
+    ]));
+    const conflicted = await stateql.apply(plan.plan_id);
+    assert.equal(conflicted.ok, false);
+    if (!conflicted.ok) assert.equal(conflicted.error.code, "ROW_CONFLICT");
+    assert.deepEqual(external.prepare("SELECT value FROM batch_items ORDER BY id").all().map((row) => row.value), ["one", "two", "three"]);
+    external.exec("DROP TRIGGER batch_conflict");
+
+    const fresh = await succeed(stateql.readTable({ name: "batch_items" }, 100, { cache: "bypass" }));
+    const freshPage = stateql.readMaterialized(fresh.result_id);
+    const appliedPlan = await succeed(stateql.planTableUpdates([
+      { row_token: freshPage.row_tokens[0]!, changes: { set: { value: "first" } } },
+      { row_token: freshPage.row_tokens[1]!, changes: { set: { value: "second" } } },
+    ]));
+    const applied = await succeed(stateql.apply(appliedPlan.plan_id));
+    assert.equal(applied.affected_rows, 2);
+    assert.deepEqual(external.prepare("SELECT value FROM batch_items ORDER BY id").all().map((row) => row.value), ["first", "second", "three"]);
+    assert.equal((await stateql.apply(appliedPlan.plan_id)).ok, false);
+    const duplicate = await stateql.planTableUpdates([
+      { row_token: freshPage.row_tokens[0]!, changes: { set: { value: "x" } } },
+      { row_token: freshPage.row_tokens[0]!, changes: { set: { value: "y" } } },
+    ]);
+    assert.equal(duplicate.ok, false);
+  } finally { external.close(); stateql.close(); }
+});
+
+
 for (const driver of ["postgres", "mysql"] as const) {
   const url = process.env[driver === "postgres" ? "STQL_POSTGRES_URL" : "STQL_MYSQL_URL"];
   test(`conditional ${driver} edits detect external changes and roll back cardinality failures`, { skip: !url }, async () => {

@@ -194,7 +194,7 @@ test("MongoDB capabilities are explicit", async () => {
   const response = await stateql.capabilities();
   assert.equal(response.ok, true);
   if (response.ok) {
-    assert.deepEqual(response.data.drivers, ["mongodb", "mysql", "postgres", "sqlite"]);
+    assert.deepEqual(response.data.drivers, ["mongodb", "mysql", "postgres", "redis", "sqlite"]);
     assert.deepEqual(response.data.driver_features?.mongodb, {
       sql: false,
       native_read: true,

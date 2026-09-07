@@ -307,6 +307,59 @@ test("history origin migration attributes legacy rows and restores filtering", (
   reopened.close();
 });
 
+test("results receive stable generated aliases without allowing reassignment", async () => {
+  const fixture = await createFixture();
+  try {
+    const first = await succeed(fixture.stateql.query("SELECT 1 AS value"));
+    assert.match(first.alias, /^[a-z2-7]{10}$/);
+    assert.equal((await succeed(fixture.stateql.show(first.alias))).result_id, first.result_id);
+    const cached = await succeed(fixture.stateql.query("SELECT 1 AS value"));
+    assert.equal(cached.result_id, first.result_id);
+    assert.equal(cached.alias, first.alias);
+    await succeed(fixture.stateql.setAlias("caller-name", first.result_id));
+    assert.equal((await succeed(fixture.stateql.show("caller-name"))).alias, first.alias);
+    const second = await succeed(fixture.stateql.query("SELECT 2 AS value", { cache: "bypass" }));
+    const stolen = await fixture.stateql.setAlias(first.alias, second.result_id);
+    assert.equal(stolen.ok, false);
+    if (!stolen.ok) assert.equal(stolen.error.code, "INVALID_COMMAND");
+    const store = (fixture.stateql as unknown as { store: StateStore }).store;
+    const generated = store.db.prepare("SELECT name FROM aliases WHERE generated = 1").all() as Array<{ name: string }>;
+    assert.equal(new Set(generated.map((row) => row.name)).size, generated.length);
+  } finally { fixture.stateql.close(); }
+});
+
+test("history and snapshot filters run before limits without recording history", async () => {
+  const fixture = await createFixture();
+  try {
+    await succeed(fixture.stateql.query("SELECT 42 AS statement"));
+    for (let index = 0; index < 105; index++) {
+      const command = index % 2 === 0
+        ? { command: "objects.list" as const, limit: 1 }
+        : { command: "profile.list" as const };
+      await succeed(fixture.stateql.executeCommand(command, { origin: "api", internal: true }));
+    }
+    const statements = await succeed(fixture.stateql.history(1, { category: "statement", internal: false }));
+    assert.equal(statements.history.length, 1);
+    assert.equal(statements.history[0].command, "query");
+    const internal = await succeed(fixture.stateql.history(2, { category: "introspection", internal: true }));
+    assert.equal(internal.history.length, 2);
+    assert.ok(internal.history.every((entry: HistoryEntry) => entry.internal && entry.category === "introspection"));
+
+    const initialSnapshot = fixture.stateql.snapshot();
+    const store = (fixture.stateql as unknown as { store: StateStore }).store;
+    const historyCount = store.history(initialSnapshot.session.session_id, 10_000).length;
+    const snapshot = fixture.stateql.snapshot({
+      historyLimit: 1,
+      historyCategory: "statement",
+      historyInternal: false,
+    });
+    assert.equal(snapshot.history.length, 1);
+    assert.equal(snapshot.history[0]?.command, "query");
+    assert.equal(store.history(snapshot.session.session_id, 10_000).length, historyCount);
+  } finally { fixture.stateql.close(); }
+});
+
+
 test("history keeps the latest 10,000 entries per session", () => {
   const root = createTemporaryDirectory();
   const store = new StateStore(root, () => new Date("2026-01-01T00:00:00Z"));
@@ -615,6 +668,8 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "history_origin_v1",
       "credential_refs_v1",
       "history_target_v1",
+      "generated_aliases_v1",
+      "history_classification_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");

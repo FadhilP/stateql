@@ -11,7 +11,7 @@ import {
 import type { Connection as MySqlConnection } from "mysql2/promise";
 import { Client, types as pgTypes, type QueryResult } from "pg";
 import { StateQLError } from "./errors.js";
-import type { Column, Row, SqlParameters, StateConfidence } from "./types.js";
+import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
 import { isSqlParameters, parseJson, toJsonSafe } from "./util.js";
 
@@ -23,6 +23,8 @@ export interface ReadResult {
 export interface WriteResult {
   affectedRows: number;
 }
+
+export type BatchWriteOperation = OperationRecord & { expectedRows?: 1 };
 
 export interface AdapterContext {
   deadline: number;
@@ -67,11 +69,13 @@ export interface Adapter {
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
   write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult>;
   writeBatch(
-    operations: OperationRecord[],
+    operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]>;
   signature(): Promise<string>;
   inspect(kind: string, table?: string): Promise<unknown>;
+  listObjects(filter: ListObjectsFilter): Promise<ListObjectsData>;
+  describeObject(object: CatalogObject): Promise<DescribeObjectData>;
   close(): Promise<void>;
 }
 
@@ -103,6 +107,11 @@ export async function createAdapter(
       throw new StateQLError(
         "UNSUPPORTED_DRIVER",
         "MongoDB uses the native MongoDB adapter.",
+      );
+    case "redis":
+      throw new StateQLError(
+        "UNSUPPORTED_DRIVER",
+        "Redis uses the native Redis adapter.",
       );
   }
 }
@@ -186,7 +195,7 @@ class SQLiteAdapter implements Adapter {
   }
 
   async writeBatch(
-    operations: OperationRecord[],
+    operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]> {
     return this.call<WriteResult[]>(
@@ -203,6 +212,14 @@ class SQLiteAdapter implements Adapter {
 
   async inspect(kind: string, table?: string): Promise<unknown> {
     return this.call("inspect", [kind, table], false, false);
+  }
+
+  async listObjects(filter: ListObjectsFilter): Promise<ListObjectsData> {
+    return this.call("listObjects", [filter], false, false);
+  }
+
+  async describeObject(object: CatalogObject): Promise<DescribeObjectData> {
+    return this.call("describeObject", [object], false, false);
   }
 
   async close(): Promise<void> {
@@ -237,7 +254,7 @@ class SQLiteAdapter implements Adapter {
   }
 
   private async call<T>(
-    operation: "read" | "write" | "writeBatch" | "signature" | "inspect",
+    operation: "read" | "write" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject",
     args: unknown[],
     outcomeUnknown: boolean,
     batch: boolean,
@@ -394,7 +411,7 @@ class PostgresAdapter implements Adapter {
   }
 
   async writeBatch(
-    operations: OperationRecord[],
+    operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]> {
     if (this.readOnly) throw new Error("Connection is read-only.");
@@ -422,6 +439,7 @@ class PostgresAdapter implements Adapter {
           true,
         );
         results.push({ affectedRows: result.rowCount ?? 0 });
+        if (operation.expectedRows === 1 && result.rowCount !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
       }
     } catch (error) {
       if (await this.rollbackQuietly()) {
@@ -455,6 +473,75 @@ class PostgresAdapter implements Adapter {
       throw error;
     }
   }
+
+  async listObjects(filter: ListObjectsFilter): Promise<ListObjectsData> {
+    if (filter.kind && !["table", "view", "function", "trigger", "enum"].includes(filter.kind)) throw new Error(`PostgreSQL does not support catalog kind "${filter.kind}".`);
+    const { where, params } = postgresCatalogFilter(filter);
+    const limit = catalogLimit(filter.limit);
+    const offset = catalogOffset(filter.offset);
+    const result = await this.read(
+      `SELECT * FROM (
+        SELECT CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS kind,
+               table_schema AS schema, table_name AS name,
+               table_schema || '.' || table_name AS identity
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+        UNION ALL
+        SELECT 'function', n.nspname, p.proname,
+               n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND p.prokind = 'f'
+        UNION ALL
+        SELECT DISTINCT 'trigger', event_object_schema, trigger_name,
+               event_object_schema || '.' || event_object_table || '.' || trigger_name
+        FROM information_schema.triggers
+        UNION ALL
+        SELECT 'enum', n.nspname, t.typname, n.nspname || '.' || t.typname
+        FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typtype = 'e'
+      ) objects ${where} ORDER BY schema, kind, name, identity LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit + 1, offset],
+    );
+    return catalogPage(result.rows as CatalogObject[], limit, offset, ["table", "view", "function", "trigger", "enum"]);
+  }
+
+  async describeObject(object: CatalogObject): Promise<DescribeObjectData> {
+    const schema = object.schema ?? "public";
+    if (object.kind === "function") {
+      const result = await this.read(
+        `SELECT pg_get_functiondef(p.oid) AS definition FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = $1 AND p.proname = $2
+           AND n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' = $3`,
+        [schema, object.name, object.identity ?? ""],
+      );
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition) };
+    }
+    if (object.kind === "trigger") {
+      const result = await this.read(
+        `SELECT pg_get_triggerdef(t.oid, true) AS definition FROM pg_trigger t
+         JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE NOT t.tgisinternal AND n.nspname=$1 AND t.tgname=$2
+           AND n.nspname || '.' || c.relname || '.' || t.tgname=$3`,
+        [schema, object.name, object.identity ?? ""],
+      );
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition) };
+    }
+    if (object.kind === "enum") {
+      const result = await this.read(
+        `SELECT e.enumlabel AS value FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid JOIN pg_namespace n ON n.oid=t.typnamespace
+         WHERE n.nspname=$1 AND t.typname=$2 ORDER BY e.enumsortorder`, [schema, object.name]);
+      return { object, definition: result.rows };
+    }
+    if (object.kind === "view") {
+      const result = await this.read("SELECT view_definition AS definition FROM information_schema.views WHERE table_schema=$1 AND table_name=$2", [schema, object.name]);
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition) };
+    }
+    if (object.kind === "table") return { object, definition: await this.inspect("table", `${schema}.${object.name}`) as Record<string, unknown> };
+    throw new Error(`PostgreSQL does not support catalog kind "${object.kind}".`);
+  }
+
 
   async close(): Promise<void> {
     if (!this.ending) {
@@ -674,7 +761,7 @@ class MySqlAdapter implements Adapter {
   }
 
   async writeBatch(
-    operations: OperationRecord[],
+    operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]> {
     if (this.readOnly) throw new Error("Connection is read-only.");
@@ -717,6 +804,7 @@ class MySqlAdapter implements Adapter {
           true,
         );
         results.push({ affectedRows: mysqlAffectedRows(result) });
+        if (operation.expectedRows === 1 && mysqlAffectedRows(result) !== 1) throw new Error("ROW_CONFLICT: The row changed or no longer has a unique identity.");
       }
     } catch (error) {
       if (await this.rollbackQuietly()) {
@@ -749,6 +837,54 @@ class MySqlAdapter implements Adapter {
       throw error;
     }
   }
+
+  async listObjects(filter: ListObjectsFilter): Promise<ListObjectsData> {
+    if (filter.kind && !["table", "view", "function", "trigger"].includes(filter.kind)) throw new Error(`MySQL does not support catalog kind "${filter.kind}".`);
+    const limit = catalogLimit(filter.limit);
+    const offset = catalogOffset(filter.offset);
+    const predicates = ["1=1"];
+    const params: unknown[] = [];
+    if (filter.kind) { predicates.push("kind = ?"); params.push(filter.kind); }
+    if (filter.schema) { predicates.push("schema_name = ?"); params.push(filter.schema); }
+    if (filter.search) { predicates.push("name LIKE ? ESCAPE '\\\\'"); params.push(`%${escapeLike(filter.search)}%`); }
+    const result = await this.read(
+      `SELECT kind, schema_name AS schema, name, identity FROM (
+        SELECT CASE WHEN TABLE_TYPE='VIEW' THEN 'view' ELSE 'table' END AS kind, TABLE_SCHEMA AS schema_name,
+               TABLE_NAME AS name, CONCAT(TABLE_SCHEMA, '.', TABLE_NAME) AS identity
+        FROM information_schema.tables WHERE TABLE_SCHEMA=DATABASE()
+        UNION ALL
+        SELECT 'function', ROUTINE_SCHEMA, ROUTINE_NAME, CONCAT(ROUTINE_SCHEMA, '.', ROUTINE_NAME)
+        FROM information_schema.routines WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_TYPE='FUNCTION'
+        UNION ALL
+        SELECT 'trigger', TRIGGER_SCHEMA, TRIGGER_NAME, CONCAT(TRIGGER_SCHEMA, '.', EVENT_OBJECT_TABLE, '.', TRIGGER_NAME)
+        FROM information_schema.triggers WHERE TRIGGER_SCHEMA=DATABASE()
+      ) objects WHERE ${predicates.join(" AND ")} ORDER BY schema_name, kind, name, identity LIMIT ? OFFSET ?`,
+      [...params, limit + 1, offset],
+    );
+    return catalogPage(result.rows as CatalogObject[], limit, offset, ["table", "view", "function", "trigger"]);
+  }
+
+  async describeObject(object: CatalogObject): Promise<DescribeObjectData> {
+    const schema = object.schema ?? await this.databaseName();
+    if (object.kind === "function") {
+      const result = await this.read("SELECT ROUTINE_DEFINITION AS definition FROM information_schema.routines WHERE ROUTINE_SCHEMA=? AND ROUTINE_NAME=? AND ROUTINE_TYPE='FUNCTION'", [schema, object.name]);
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition ?? "") };
+    }
+    if (object.kind === "trigger") {
+      const result = await this.read("SELECT ACTION_STATEMENT AS definition FROM information_schema.triggers WHERE TRIGGER_SCHEMA=? AND TRIGGER_NAME=?", [schema, object.name]);
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition ?? "") };
+    }
+    if (object.kind === "view") {
+      const result = await this.read("SELECT VIEW_DEFINITION AS definition FROM information_schema.views WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", [schema, object.name]);
+      if (!result.rows[0]) throw new Error("Catalog object was not found.");
+      return { object, definition: String(result.rows[0].definition ?? "") };
+    }
+    if (object.kind === "table") return { object, definition: await this.inspect("table", `${schema}.${object.name}`) as Record<string, unknown> };
+    throw new Error(`MySQL does not support catalog kind "${object.kind}".`);
+  }
+
 
   async close(): Promise<void> {
     if (this.closed) return;
@@ -1009,6 +1145,38 @@ function postgresParams(params: SqlParameters): unknown[] {
   if (Array.isArray(params)) return params;
   throw new Error("PostgreSQL parameters must be a JSON array.");
 }
+
+function catalogLimit(value: number | undefined): number {
+  const limit = value ?? 50;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("Catalog limit must be 1-200.");
+  return limit;
+}
+
+function catalogOffset(value: number | string | undefined): number {
+  const offset = value ?? 0;
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) throw new Error("SQL catalog offset must be a non-negative integer at most 1000000.");
+  return offset;
+}
+
+function catalogPage(objects: CatalogObject[], limit: number, offset: number, supportedKinds: CatalogObject["kind"][]): ListObjectsData {
+  const more = objects.length > limit;
+  return { objects: objects.slice(0, limit), next_offset: more ? offset + limit : null, supported_kinds: supportedKinds };
+}
+
+function escapeLike(value: string): string {
+  if (!value || value.length > 200 || value.includes("\0")) throw new Error("Catalog search must be 1-200 characters.");
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+function postgresCatalogFilter(filter: ListObjectsFilter): { where: string; params: unknown[] } {
+  const predicates: string[] = [];
+  const params: unknown[] = [];
+  if (filter.kind) { params.push(filter.kind); predicates.push(`kind = $${params.length}`); }
+  if (filter.schema) { params.push(filter.schema); predicates.push(`schema = $${params.length}`); }
+  if (filter.search) { params.push(`%${escapeLike(filter.search)}%`); predicates.push(`name ILIKE $${params.length} ESCAPE '\\'`); }
+  return { where: predicates.length ? `WHERE ${predicates.join(" AND ")}` : "", params };
+}
+
 
 function remainingMilliseconds(context: AdapterContext): number {
   return Math.max(1, Math.ceil(context.deadline - Date.now()));

@@ -22,7 +22,11 @@ import {
 } from "./adapters.js";
 import type { ConnectionRecord } from "./store.js";
 import type {
+  CatalogObject,
   Column,
+  DescribeObjectData,
+  ListObjectsData,
+  ListObjectsFilter,
   MongoDocument,
   MongoReadCommand,
   MongoWriteCommand,
@@ -316,6 +320,7 @@ export class MongoAdapter {
   async writeBatch(
     commands: MongoWriteCommand[],
     isolation: string,
+    expectedRows = false,
   ): Promise<MongoWriteResult[]> {
     if (isolation.toLowerCase() !== "snapshot") {
       throw new BatchWriteError(`Unsupported MongoDB isolation level "${isolation}".`, false);
@@ -350,12 +355,14 @@ export class MongoAdapter {
       for (const command of values) {
         throwIfStopped(this.context, dispatched);
         dispatched = true;
-        results.push(await withContext(
+        const result = await withContext(
           this.executeWrite(command, session),
           this.context,
           () => this.stop(),
           true,
-        ));
+        );
+        if (expectedRows && result.outcome.matched_count !== 1) throw new Error("ROW_CONFLICT: A document changed or was removed.");
+        results.push(result);
       }
       throwIfStopped(this.context, dispatched);
       committing = true;
@@ -439,13 +446,55 @@ export class MongoAdapter {
     }
   }
 
+  async listObjects(filter: ListObjectsFilter): Promise<ListObjectsData> {
+    if (filter.kind !== undefined && filter.kind !== "collection" && filter.kind !== "view") throw new Error(`MongoDB does not support catalog kind "${filter.kind}".`);
+    if (filter.schema !== undefined) throw new Error("MongoDB collections do not use schemas.");
+    const offset = filter.offset ?? 0;
+    const limit = filter.limit ?? 50;
+    if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("Invalid MongoDB catalog page bounds.");
+    if (filter.search !== undefined && (!filter.search || filter.search.length > 200 || filter.search.includes("\0"))) throw new Error("Invalid MongoDB catalog search.");
+    await this.connect();
+    const query: Document = {};
+    if (filter.kind === "collection") query.type = "collection";
+    if (filter.kind === "view") query.type = "view";
+    const cursor = this.client.db(this.databaseName).listCollections(query, {
+      nameOnly: true,
+      signal: operationSignal(this.context),
+      maxTimeMS: remainingMilliseconds(this.context),
+      timeoutMS: remainingMilliseconds(this.context),
+      batchSize: Math.min(limit + 1, 201),
+    });
+    const fetched = await collectCursor(cursor, offset + limit + 1, this.context);
+    const rows = fetched.slice(offset);
+    const more = rows.length > limit;
+    return {
+      objects: rows.slice(0, limit).map((row) => ({ kind: row.type === "view" ? "view" : "collection", name: String(row.name), identity: String(row.name) })),
+      next_offset: more ? offset + limit : null,
+      supported_kinds: ["collection", "view"],
+    };
+  }
+
+  async describeObject(object: CatalogObject): Promise<DescribeObjectData> {
+    if ((object.kind !== "collection" && object.kind !== "view") || object.schema !== undefined) throw new Error(`MongoDB does not support catalog kind "${object.kind}".`);
+    const rows = await collectCursor(this.client.db(this.databaseName).listCollections(
+      { name: object.name },
+      { nameOnly: false, signal: operationSignal(this.context), maxTimeMS: remainingMilliseconds(this.context), timeoutMS: remainingMilliseconds(this.context), batchSize: 1 },
+    ), 1, this.context);
+    const found = rows[0];
+    if (!found) throw new Error("Catalog object was not found.");
+    return ejsonSafe({
+      object: { kind: found.type === "view" ? "view" : "collection", name: found.name, identity: found.name },
+      definition: { type: found.type, options: found.options ?? {} },
+    }) as DescribeObjectData;
+  }
+
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.connected = false;
     await this.client.close().catch(() => undefined);
   }
-
   private async connect(): Promise<void> {
     throwIfStopped(this.context, false);
     if (this.closed) throw new Error("MongoDB adapter is closed.");
@@ -908,6 +957,11 @@ function ejsonSafe<T>(value: T): unknown {
   if (value === undefined) return null;
   return JSON.parse(BSON.EJSON.stringify(value, { relaxed: false })) as unknown;
 }
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 
 function remainingMilliseconds(context: AdapterContext): number {
   return Math.max(1, Math.min(2_147_483_647, Math.ceil(context.deadline - Date.now())));

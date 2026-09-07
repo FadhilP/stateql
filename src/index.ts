@@ -5,6 +5,7 @@ export {
   exitCodeFor,
 } from "./errors.js";
 export type { CredentialResolutionFailure } from "./errors.js";
+export type { TableChange, TableIdentity, TableUpdate } from "./table-editor.js";
 export type {
   ActorData,
   ActorLinkData,
@@ -16,6 +17,11 @@ export type {
   BatchCommand,
   BatchCommandName,
   BatchOptions,
+  CatalogObject,
+  CatalogObjectKind,
+  DescribeObjectData,
+  ListObjectsData,
+  ListObjectsFilter,
   CapabilitiesData,
   CommandExecutionContext,
   CommandOrigin,
@@ -42,6 +48,7 @@ export type {
   FilterOptions,
   HistoryData,
   HistoryEntry,
+  HistoryCategory,
   HistoryOptions,
   MongoAggregateOptions,
 
@@ -60,8 +67,14 @@ export type {
   PlanOptions,
   ProfileData,
   ProfileOptions,
+  ProfileUpdateOptions,
   ProfilesData,
   PurgeData,
+  RedisCommand,
+  RedisExecOptions,
+  RedisPlanOptions,
+  RedisQueryOptions,
+  RedisWriteOutcome,
   QueryOptions,
   RecentOperationData,
   RecentResultData,
@@ -78,6 +91,7 @@ export type {
   StateQLOptions,
   StateConfidence,
   StateQLSnapshot,
+  StateQLSnapshotOptions,
   StatusConnectionData,
   StatusData,
   Success,

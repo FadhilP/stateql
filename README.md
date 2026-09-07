@@ -2,8 +2,8 @@
 
 StateQL is a stateful database CLI and TypeScript library for AI agents and
 automation. It provides a safe interface for querying, changing, and inspecting
-SQLite, PostgreSQL, MySQL, and MongoDB databases while keeping results reusable
-and operations traceable across commands.
+SQLite, PostgreSQL, MySQL, MongoDB, and Redis databases while keeping results
+reusable and operations traceable across commands.
 
 StateQL is built around durable handles:
 
@@ -527,8 +527,8 @@ safety and duplicate checks. Requests contain actor and session identity, the
 operation's effective read/write access, an abort signal, and sanitized
 connection metadata.
 
-Returned values must be complete PostgreSQL, MySQL, or MongoDB URLs, or explicit
-`sqlite:` sources. StateQL validates the source and its stored driver before
+Returned values must be complete PostgreSQL, MySQL, MongoDB, or Redis URLs, or
+explicit `sqlite:` sources. StateQL validates the source and its stored driver before
 adapter construction and normalizes SQLite paths. Credential-bearing database
 URLs are redacted before connection metadata is persisted and never enter
 history, snapshots, cache keys, or responses. SQLite paths remain persisted
@@ -541,3 +541,138 @@ For writes, credential resolution happens after StateQL atomically reserves the
 operation for duplicate protection. A resolution failure keeps a non-executed
 `failed` audit record, does not consume the idempotency key, and permits a safe
 retry.
+
+## Pylon database integration API (0.9.0)
+
+### Result identities and aliases
+
+Every materialized SQL, MongoDB, Redis, table, or derived result keeps its
+immutable `q_*` `result_id` and receives a cryptographically random 10-character
+lowercase base32 `display_alias`. `ResultData.alias` normally equals that alias.
+When a batch command supplies `as`, `alias` remains the caller alias for backward
+compatibility while `display_alias` remains canonical. Generated aliases are
+session-scoped, allocated atomically with the result, stable on cache reuse, and
+cannot be reassigned by `setAlias`; explicit aliases and all old handles continue
+to resolve.
+
+### Safe profile updates
+
+```ts
+updateProfile(name, {
+  target?: string | null,
+  secretEnv?: string | null,
+  credentialRef?: string | null,
+  readOnly?: boolean,
+})
+```
+
+Omitting all source fields keeps the existing source. Supplying any source field
+replaces the source atomically: exactly one non-null source is required and the
+other source columns are cleared. Direct non-SQLite URLs containing credentials
+or secret-like query parameters are rejected. `profile.list/show/update` return
+only `{profile,target,secret_env,credential_ref,read_only}`. `target` is therefore
+a normalized SQLite path or a secret-free URL; reference-backed profiles expose
+only the environment-variable name or opaque credential reference, never a
+resolved value. Profile changes affect subsequent `connect` calls and do not
+silently mutate an already-open connection.
+
+### Bounded catalog
+
+```ts
+listObjects(
+  { kind?, schema?, search?, offset?, limit? },
+  { timeoutMs?, signal? },
+) -> { objects, next_offset, supported_kinds }
+
+describeObject(
+  { kind, schema?, name, identity? },
+  { timeoutMs?, signal? },
+) -> { object, definition? }
+```
+
+SQL/MongoDB offsets are non-negative numbers; limits default to 50 and are at
+most 200. Redis `offset` and `next_offset` are opaque numeric SCAN cursor strings;
+its limit is a SCAN `COUNT` hint with a hard 200-item response bound. Redis pages
+are not snapshots and can be empty or contain duplicates while keys change.
+Search is a case-insensitive name substring for SQL/MongoDB and escaped glob
+substring matching for Redis. No exact counts are forced.
+
+Supported kinds are returned on every page: SQLite `table,view,trigger`;
+PostgreSQL `table,view,function,trigger,enum`; MySQL
+`table,view,function,trigger`; MongoDB `collection,view`; Redis `key`.
+PostgreSQL function identities include identity arguments, so overloads remain
+distinct. `describeObject` is read-only and requires the structured identity;
+legacy `inspect` behavior is unchanged (and intentionally unavailable for Redis).
+
+### Reviewed multi-row table edits
+
+```ts
+planTableUpdates(
+  Array<{ row_token: string; changes: { set?: object; unset?: string[] } }>,
+  options?,
+) -> PlanData
+```
+
+Batches contain 1-100 distinct row identities and at most 256 KiB. All tokens,
+connection/state versions, expiries, metadata, editable columns, and values are
+validated before one plan is stored; expiry is the earliest token expiry.
+`apply(plan_id)` executes all conditional row updates in one SQLite/PostgreSQL/
+MySQL transaction and requires every row predicate to match, otherwise all are
+rolled back. MongoDB uses one snapshot transaction and rejects deployments that
+do not support transactions. Redis and active staged StateQL transactions are
+rejected. The existing `planTableUpdate` and `apply` APIs remain supported.
+Plans are actor-owned, claimed once, and retained as non-replayable when the
+remote commit outcome is uncertain.
+
+### Redis native commands
+
+Redis/Rediss URLs support URL database selection, password or ACL username,
+and TLS (`rediss`). Credential-bearing URLs must come from `secretEnv` or
+`credentialRef`. Native methods accept `{command: string, args?: string[]}`:
+
+- `redisQuery`: `GET`, `MGET`, `TYPE`, `EXISTS`, `TTL`, `PTTL`, `HGET`, `HMGET`,
+  bounded `LRANGE`, and bounded `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`.
+- `redisExec` and `redisPlan`: one-key `SET`, `DEL`, `HSET`, `HDEL`, `LPUSH`,
+  `RPUSH`, `SADD`, `SREM`, `ZADD`, or `ZREM` mutation.
+- `describeObject({kind:"key",name})`: bounded string/hash/list/set/zset value
+  inspection with TTL and continuation metadata where applicable.
+
+Arguments are UTF-8 strings, at most 100 values/256 KiB; materialized replies are
+at most 1 MiB. `KEYS`, scripts, modules, pub/sub, blocking commands, admin/flush,
+and arbitrary commands are rejected. Key discovery always uses SCAN. A Redis
+plan snapshots one bounded key and `apply` uses an isolated `WATCH` + one-command
+`MULTI/EXEC`; a pre-apply content or expiry change returns `ROW_CONFLICT` and is
+never retried automatically. Direct `redisExec` has Redis single-command
+atomicity only. Redis has no SQL rollback or StateQL staged transaction support;
+a lost write/EXEC reply is reported as `OUTCOME_UNKNOWN` and remains blocked.
+
+### Lean history
+
+```ts
+history(limit?, {
+  origin?,
+  category?: "statement" | "introspection" | "management",
+  internal?: boolean,
+  offset?: number,
+})
+```
+
+`category` and trusted-host `internal` filters are applied in SQLite before
+`ORDER BY`, `LIMIT`, and `OFFSET`, so introspection cannot starve statement
+history. `CommandExecutionContext.internal` is trusted host metadata and cannot
+be supplied inside a batch command. Existing calls and origin filtering remain
+compatible; old rows are classified from their command name and migrate as `internal: false`.
+
+The synchronous, non-mutating snapshot bridge accepts the same classification
+filters without entering the command queue or writing a history row:
+
+```ts
+stateql.snapshot({
+  historyLimit: 50,
+  historyCategory: "statement",
+  historyInternal: false,
+});
+```
+
+Both snapshot filters are applied by the store before `historyLimit`. Calling
+`snapshot()` with no options preserves the legacy 50-entry CLI snapshot.

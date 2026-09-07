@@ -97,6 +97,36 @@ const MIGRATIONS: Migration[] = [
     apply(db) { addColumn(db, "history", "target", "TEXT"); },
     validate(db) { requireColumns(db, "history", ["target"]); },
   },
+  {
+    name: "generated_aliases_v1",
+    apply(db) {
+      addColumn(db, "aliases", "generated", "INTEGER NOT NULL DEFAULT 0");
+      db.exec("CREATE UNIQUE INDEX IF NOT EXISTS aliases_generated_result ON aliases(result_id) WHERE generated = 1");
+    },
+    validate(db) {
+      requireColumns(db, "aliases", ["generated"]);
+      requireIndexes(db, ["aliases_generated_result"]);
+    },
+  },
+  {
+    name: "history_classification_v1",
+    apply(db) {
+      addColumn(db, "history", "category", "TEXT NOT NULL DEFAULT 'management'");
+      addColumn(db, "history", "internal", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        UPDATE history SET category = 'statement'
+        WHERE category = 'management' AND command IN
+          ('query','exec','plan','apply','filter','mongo.query','mongo.exec','mongo.plan','redis.query','redis.exec','redis.plan');
+        UPDATE history SET category = 'introspection'
+        WHERE category = 'management' AND (command LIKE 'inspect.%' OR command IN ('objects.list','object.describe','table.read'));
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS history_session_category ON history(session_id, category, internal)");
+    },
+    validate(db) {
+      requireColumns(db, "history", ["category", "internal"]);
+      requireIndexes(db, ["history_session_category"]);
+    },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -203,6 +233,7 @@ function createInitialSchema(db: DatabaseSync): void {
       session_id TEXT NOT NULL,
       name TEXT NOT NULL,
       result_id TEXT NOT NULL,
+      generated INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(session_id, name),
       FOREIGN KEY(result_id) REFERENCES results(id)
     );
@@ -266,6 +297,8 @@ function createInitialSchema(db: DatabaseSync): void {
       actor_id TEXT NOT NULL,
       command TEXT NOT NULL,
       origin TEXT NOT NULL DEFAULT 'legacy',
+      category TEXT NOT NULL DEFAULT 'management',
+      internal INTEGER NOT NULL DEFAULT 0,
       sql TEXT,
       handle TEXT,
       executed INTEGER NOT NULL,
