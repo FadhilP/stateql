@@ -465,6 +465,8 @@ export class StateQL {
       return {
         data: {
           connection_id: connection.id,
+          alias: connection.alias!,
+          display_alias: connection.alias!,
           driver,
           database: databaseName,
           name: connection.name,
@@ -648,6 +650,8 @@ export class StateQL {
       connection: connection
         ? {
             connection_id: connection.id,
+            alias: connection.alias!,
+            display_alias: connection.alias!,
             name: connection.name,
             status: "connected",
             driver: connection.driver,

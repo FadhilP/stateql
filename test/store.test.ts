@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { mkdirSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -305,6 +307,132 @@ test("history origin migration attributes legacy rows and restores filtering", (
       .get(),
   );
   reopened.close();
+});
+
+test("connection aliases persist across reopen, change on reconnect, and retain canonical references", async () => {
+  const home = createTemporaryDirectory();
+  const database = join(home, "target.sqlite");
+  let stateql = new StateQL({ home });
+  try {
+    const first = await succeed(stateql.connect(database, { name: "friendly", readOnly: false }));
+    assert.match(first.connection_id, /^conn_\d+$/);
+    assert.match(first.alias, /^[a-z2-7]{10}$/);
+    assert.equal(first.display_alias, first.alias);
+    assert.equal(first.name, "friendly");
+    assert.equal(stateql.snapshot().connection?.alias, first.alias);
+    assert.equal(stateql.snapshot().connection?.display_alias, first.alias);
+    const result = await succeed(stateql.query("SELECT 1 AS value"));
+    // A connection display alias does not occupy the result alias namespace.
+    await succeed(stateql.setAlias(first.alias, result.result_id));
+    stateql.close();
+    stateql = new StateQL({ home });
+    assert.equal(stateql.snapshot().connection?.connection_id, first.connection_id);
+    assert.equal(stateql.snapshot().connection?.alias, first.alias);
+    assert.equal((await succeed(stateql.show(first.alias))).result_id, result.result_id);
+    assert.equal((await succeed(stateql.query("SELECT 1 AS value"))).result_id, result.result_id);
+    await succeed(stateql.disconnect());
+    assert.equal(stateql.snapshot().connection, null);
+    const second = await succeed(stateql.connect(database));
+    assert.notEqual(second.connection_id, first.connection_id);
+    assert.notEqual(second.alias, first.alias);
+    assert.equal(stateql.snapshot().connection?.alias, second.alias);
+    const refreshed = await succeed(stateql.query("SELECT 1 AS value"));
+    assert.notEqual(refreshed.result_id, result.result_id);
+    const store = (stateql as unknown as { store: StateStore }).store;
+    assert.equal(store.getResult(result.result_id)?.connection_id, first.connection_id);
+    assert.equal(store.getResult(refreshed.result_id)?.connection_id, second.connection_id);
+    assert.equal(store.getConnection(first.connection_id)?.alias, first.alias);
+    assert.equal(store.getConnection(first.alias), undefined);
+  } finally { stateql.close(); }
+});
+
+test("connection alias collisions retry and allocation exhaustion rolls back the connection and counter", (t) => {
+  const store = new StateStore(createTemporaryDirectory(), () => new Date());
+  const session = store.createSession("actor");
+  const input = {
+    sessionId: session.id, actorId: "actor", name: "test", driver: "sqlite" as const,
+    databaseName: "test", source: ":memory:", readOnly: true,
+  };
+  let calls = 0;
+  const random = t.mock.method(crypto, "randomBytes", () => Buffer.alloc(10, calls++ === 2 ? 1 : 0));
+  syncBuiltinESMExports();
+  try {
+    const first = store.addConnection(input)!;
+    const second = store.addConnection(input)!;
+    assert.equal(first.alias, "aaaaaaaaaa");
+    assert.equal(second.alias, "bbbbbbbbbb");
+    assert.equal(calls, 3); // One collision before the second allocation succeeds.
+    assert.throws(() => store.db.prepare("UPDATE connections SET alias = ? WHERE id = ?")
+      .run(first.alias!, second.id), /UNIQUE constraint failed/);
+    // Uniqueness applies across sessions too.
+    const other = store.createSession("other");
+    assert.throws(() => store.addConnection({ ...input, sessionId: other.id, actorId: "other" }),
+      /Could not allocate a unique connection alias/);
+    assert.equal(calls, 67);
+    assert.equal(store.getSession(other.id)?.active_connection_id, null);
+    assert.equal(store.getSession(session.id)?.active_connection_id, second.id);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM connections").get()?.count, 2);
+    assert.equal(store.db.prepare("SELECT value FROM counters WHERE prefix = 'conn'").get()?.value, 2);
+    assert.equal(store.addConnection({ ...input, actorId: "not-a-member" }), undefined);
+    assert.equal(calls, 67);
+  } finally {
+    random.mock.restore();
+    syncBuiltinESMExports();
+    store.close();
+  }
+});
+
+for (const keepRegistry of [false, true]) {
+  test(`connection alias migration backfills legacy rows and reopens stably (registry retained: ${keepRegistry})`, async () => {
+    const fixture = await createFixture();
+    await succeed(fixture.stateql.connect(fixture.database));
+    const result = await succeed(fixture.stateql.query("SELECT 1 AS value"));
+    await succeed(fixture.stateql.setAlias("saved", result.result_id));
+    const active = fixture.stateql.snapshot().connection!.connection_id;
+    fixture.stateql.close();
+    const legacy = new DatabaseSync(join(fixture.home, "state.sqlite"));
+    const before = legacy.prepare("SELECT id, session_id, name, source, version FROM connections ORDER BY id").all();
+    legacy.exec("DROP INDEX connections_alias; ALTER TABLE connections DROP COLUMN alias");
+    if (!keepRegistry) legacy.exec("DELETE FROM schema_migrations WHERE name = 'connection_aliases_v1'");
+    legacy.close();
+
+    const migrated = new StateStore(fixture.home, () => new Date());
+    const aliases = migrated.db.prepare("SELECT id, alias FROM connections ORDER BY id").all();
+    assert.equal(aliases.length, 2);
+    assert.equal(new Set(aliases.map((row) => row.alias)).size, 2);
+    for (const row of aliases) assert.match(String(row.alias), /^[a-z2-7]{10}$/);
+    assert.deepEqual(migrated.db.prepare("SELECT id, session_id, name, source, version FROM connections ORDER BY id").all(), before);
+    assert.equal(migrated.getResult("saved")?.id, result.result_id);
+    assert.equal(migrated.getResult(result.alias)?.alias, result.alias);
+    assert.equal(migrated.getResult(result.alias)?.connection_id, active);
+    assert.ok(migrated.db.prepare("SELECT 1 FROM schema_migrations WHERE name = 'connection_aliases_v1'").get());
+    migrated.close();
+
+    const reopened = new StateStore(fixture.home, () => new Date());
+    try {
+      assert.deepEqual(reopened.db.prepare("SELECT id, alias FROM connections ORDER BY id").all(), aliases);
+      assert.deepEqual(reopened.db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally { reopened.close(); }
+  });
+}
+
+test("connection alias backfill rolls back all allocations on failure and can be retried", async () => {
+  const fixture = await createFixture();
+  const second = await succeed(fixture.stateql.connect(fixture.database));
+  fixture.stateql.close();
+  const database = new DatabaseSync(join(fixture.home, "state.sqlite"));
+  try {
+    database.exec("UPDATE connections SET alias = NULL");
+    database.exec(`CREATE TRIGGER fail_connection_alias BEFORE UPDATE OF alias ON connections
+      WHEN NEW.id = '${second.connection_id}' BEGIN SELECT RAISE(ABORT, 'backfill failure'); END`);
+    assert.throws(() => new StateStore(fixture.home, () => new Date()), /backfill failure/);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM connections WHERE alias IS NOT NULL").get()?.count, 0);
+    database.exec("DROP TRIGGER fail_connection_alias");
+  } finally { database.close(); }
+  const reopened = new StateStore(fixture.home, () => new Date());
+  try {
+    assert.equal(reopened.db.prepare("SELECT COUNT(*) AS count FROM connections WHERE alias IS NOT NULL").get()?.count, 2);
+  } finally { reopened.close(); }
 });
 
 test("results receive stable generated aliases without allowing reassignment", async () => {
@@ -670,6 +798,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "history_target_v1",
       "generated_aliases_v1",
       "history_classification_v1",
+      "connection_aliases_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");

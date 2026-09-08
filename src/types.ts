@@ -138,6 +138,9 @@ export interface StateQLSnapshot {
   actor_id: string;
   connection: {
     connection_id: string;
+    /** Generated display identity; optional for older snapshot producers. */
+    alias?: string;
+    display_alias?: string;
     name: string;
     status: "connected";
     driver: Driver;
@@ -505,6 +508,9 @@ export type Row = Record<string, unknown>;
 /** Data returned by the stable, non-dynamic StateQL public methods. */
 export interface ConnectionData {
   connection_id: string;
+  /** Persistent generated display identity; connection_id remains canonical. */
+  alias: string;
+  display_alias: string;
   driver: Driver;
   database: string;
   name: string;

@@ -39,6 +39,7 @@ export interface SessionRecord {
 
 export interface ConnectionRecord {
   id: string;
+  alias?: string;
   session_id: string;
   name: string;
   driver: Driver;
@@ -179,6 +180,7 @@ export class StateStore {
       this.db.exec("PRAGMA busy_timeout = 5000");
       this.db.exec("PRAGMA foreign_keys = ON");
       runMigrations(this.db, this.now);
+      this.backfillConnectionAliases();
       this.backfillGeneratedAliases();
       this.recoverStaleCommittingTransactions();
       this.deleteExpiredData();
@@ -539,6 +541,7 @@ export class StateStore {
           input.readOnly ? 1 : 0,
           timestamp,
         );
+      this.allocateConnectionAlias(id);
       this.db
         .prepare(
           `UPDATE sessions
@@ -548,6 +551,31 @@ export class StateStore {
         .run(id, timestamp, input.sessionId);
       this.db.exec("COMMIT");
       return this.getConnection(id)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private allocateConnectionAlias(connectionId: string): string {
+    for (let attempt = 0; attempt < 64; attempt++) {
+      this.db.prepare(
+        "UPDATE OR IGNORE connections SET alias = ? WHERE id = ? AND alias IS NULL",
+      ).run(randomBase32Alias(), connectionId);
+      const connection = this.getConnection(connectionId);
+      if (connection?.alias) return connection.alias;
+    }
+    throw new Error("Could not allocate a unique connection alias.");
+  }
+
+  private backfillConnectionAliases(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const connections = this.db.prepare(
+        "SELECT id FROM connections WHERE alias IS NULL",
+      ).all() as Array<{ id: string }>;
+      for (const connection of connections) this.allocateConnectionAlias(connection.id);
+      this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;

@@ -555,6 +555,15 @@ session-scoped, allocated atomically with the result, stable on cache reuse, and
 cannot be reassigned by `setAlias`; explicit aliases and all old handles continue
 to resolve.
 
+Connections likewise retain canonical `conn_*` IDs and receive persistent random
+10-character lowercase base32 aliases, exposed as `alias` and `display_alias` by
+`connect()` and `snapshot().connection` (optional in snapshot types for older
+producers). Connection aliases are unique within the state store, allocated
+atomically with the connection, and backfilled for existing records on startup.
+They survive reopening; reconnecting creates a new ID and alias. They are display
+identities only, separate from result aliases; internal references and lookups
+continue to use canonical connection IDs.
+
 ### Safe profile updates
 
 ```ts

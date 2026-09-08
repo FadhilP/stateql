@@ -127,6 +127,17 @@ const MIGRATIONS: Migration[] = [
       requireIndexes(db, ["history_session_category"]);
     },
   },
+  {
+    name: "connection_aliases_v1",
+    apply(db) {
+      addColumn(db, "connections", "alias", "TEXT");
+      db.exec("CREATE UNIQUE INDEX IF NOT EXISTS connections_alias ON connections(alias)");
+    },
+    validate(db) {
+      requireColumns(db, "connections", ["alias"]);
+      requireIndexes(db, ["connections_alias"]);
+    },
+  },
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
