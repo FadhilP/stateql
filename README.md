@@ -7,7 +7,7 @@ reusable and operations traceable across commands.
 
 StateQL is built around durable handles:
 
-1. Run a query and receive a result handle such as `q_1`.
+1. Run a query and receive a result handle such as `q_k7m2v5x9c3d6f8h4j2n7p5r9tw`.
 2. Reuse, filter, page, count, alias, or export that stored result without
    rerunning the original SQL.
 3. Use operation, plan, and transaction handles to inspect and control writes.
@@ -40,25 +40,25 @@ Parameters keep values separate from SQL. `ORDER BY` makes paging stable, and
 one-line JSON:
 
 ```json
-{"ok":true,"handle":"q_1","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"},{"id":18,"name":"Linus","email":"linus@kernel.org"}],"truncated":false,"cached":false,"total":3,"next_offset":null}
+{"ok":true,"handle":"q_k7m2v5x9c3d6f8h4j2n7p5r9tw","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"},{"id":18,"name":"Linus","email":"linus@kernel.org"}],"truncated":false,"cached":false,"total":3,"next_offset":null}
 ```
 
-`q_1` is a durable snapshot. Filter it locally without accessing the original
+`q_k7m2v5x9c3d6f8h4j2n7p5r9tw` is a durable snapshot. Filter it locally without accessing the original
 database:
 
 ```bash
-stql filter q_1 "email LIKE ?" --param "%@example.com"
+stql filter q_k7m2v5x9c3d6f8h4j2n7p5r9tw "email LIKE ?" --param "%@example.com"
 ```
 
 ```json
-{"ok":true,"handle":"q_2","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"}],"truncated":false,"cached":false,"total":2,"next_offset":null}
+{"ok":true,"handle":"q_z4n8c2v6b3m7k5j9h2g4f6d8sa","rows":[{"id":7,"name":"Ada","email":"ada@example.com"},{"id":12,"name":"Grace","email":"grace@example.com"}],"truncated":false,"cached":false,"total":2,"next_offset":null}
 ```
 
 The filtered snapshot receives its own handle. Give it a readable alias, page
 through it, inspect its count, or export it without rerunning SQL:
 
 ```bash
-stql alias set example-users q_2
+stql alias set example-users q_z4n8c2v6b3m7k5j9h2g4f6d8sa
 stql rows example-users --offset 0 --limit 1
 stql rows example-users --offset 1 --limit 1
 stql count example-users
@@ -68,16 +68,18 @@ stql export example-users --output example-users.csv --format csv
 Example first page:
 
 ```json
-{"ok":true,"handle":"q_2","rows":[{"id":7,"name":"Ada","email":"ada@example.com"}],"total":2,"truncated":true,"next_offset":1}
+{"ok":true,"handle":"q_z4n8c2v6b3m7k5j9h2g4f6d8sa","rows":[{"id":7,"name":"Ada","email":"ada@example.com"}],"total":2,"truncated":true,"next_offset":1}
 ```
 
-Running the same normalized query with the same parameters reuses `q_1` while
+Running the same normalized query with the same parameters reuses `q_k7m2v5x9c3d6f8h4j2n7p5r9tw` while
 its cache entry is valid. Use `--cache bypass` when a fresh read is required.
 
 ## Connections and profiles
 
 A connection accepts exactly one source: a direct target, `--env`,
-`--credential-ref`, or `--profile`.
+`--credential-ref`, or `--profile`. Library and batch callers may additionally
+attach `passwordRef`/`password_ref` to a literal password-free remote target;
+it is not a fourth source.
 
 ```bash
 stql connect <sqlite-path|postgres-url|mysql-url|mongodb-url> [--name NAME] [--read-write]
@@ -108,16 +110,18 @@ export SQLITE_DATABASE='sqlite:./app.sqlite'
 stql connect --env SQLITE_DATABASE --name local --read-only
 ```
 
-StateQL stores no PostgreSQL, MySQL, or MongoDB password. Credential-bearing
-URLs must be supplied through `--env`. SQLite paths remain persisted as
-connection metadata.
+StateQL stores no PostgreSQL, MySQL, MongoDB, or Redis password.
+Credential-bearing URLs must be supplied through `--env` or an opaque full-URL
+credential reference. SQLite paths remain persisted as connection metadata.
 
 ### Local profiles
 
 Profiles store exactly one connection target, environment-variable name, or
-opaque credential reference together with read-only policy. Credential values
-are never stored. Profiles persist under `STQL_HOME` with other StateQL
-metadata, and list/show responses include `credential_ref` when configured.
+opaque credential reference together with read-only policy. A remote literal
+target may additionally store a `password_ref`; SQLite, environment-backed, and
+full-URL `credential_ref` profiles cannot. Credential values are never stored.
+Profiles persist under `STQL_HOME` with other StateQL metadata, and list/show
+responses include nullable `credential_ref` and `password_ref` fields.
 
 ```bash
 stql profile add local ./app.sqlite --read-write
@@ -133,6 +137,21 @@ Credential references are bounded nonempty opaque strings; StateQL does not
 apply environment-variable syntax or normalization to them. They can only be
 resolved by a trusted host `CredentialResolver`, so the standalone CLI may
 store them in profiles but cannot connect with them.
+
+Library callers can keep nonsecret endpoint, username, database, TLS, and CA
+options in the literal URL while resolving only its password:
+
+```ts
+await stateql.connect(
+  "postgres://app@db.example/app?sslmode=verify-full&sslrootcert=/etc/app-ca.pem",
+  { passwordRef: "vault://database/app/password", readOnly: true },
+);
+```
+
+The same field is accepted by `addProfile`, `updateProfile`, and batch
+`connect`/`profile.add`/`profile.update` commands (snake case in batch input).
+Targets with an embedded password or query parameters that override endpoint or
+credential fields are rejected before credential resolution or driver access.
 
 A bare connection target matching a profile name resolves to that profile;
 otherwise it remains a path or database URL.
@@ -473,9 +492,21 @@ for user confirmation before changing membership or the shared connection.
 
 ### Harness credential resolution
 
-Library integrations can resolve environment-variable names or opaque
-credential references through a trusted approval or secret-storage layer
-instead of mutating `process.env`:
+Library integrations can resolve environment-variable names, opaque full-URL
+credential references, or password-only references through a trusted approval
+or secret-storage layer instead of mutating `process.env`:
+
+Integrations pinned to an older published package should gate setup before
+sending `password_ref`:
+
+```ts
+if ((StateQL.passwordReferenceVersion ?? 0) < 1) {
+  throw new Error("Installed StateQL does not support password references.");
+}
+```
+
+`passwordReferenceVersion = 1` guarantees the password-only resolver request,
+validation, persistence, reconnect, and redaction contract documented below.
 
 ```ts
 import {
@@ -512,27 +543,31 @@ Credential resolution has its own two-minute default deadline
 The database-operation timeout begins after a credential is resolved.
 
 When no custom resolver is configured, StateQL reads only `secret_env`
-references from `process.env`; `credential_ref` never falls back to the
-environment. A configured resolver is authoritative for both sources: returning
-`undefined` produces `CREDENTIAL_UNAVAILABLE` and never falls back to the
-process environment. Resolver requests include `source` (`secret_env` or
-`credential_ref`) while retaining `reference`; source may be omitted only on
-legacy secret-environment request objects. Resolvers may throw
-`CredentialResolutionError` with `denied`, `cancelled`, `timeout`, or
-`unavailable` to produce controlled, secret-free failures. Unknown resolver
-errors are replaced with a generic `CREDENTIAL_RESOLUTION_FAILED` response.
+references from `process.env`; `credential_ref` and `password_ref` never fall
+back to the environment. A configured resolver is authoritative for all
+sources: returning `undefined` produces `CREDENTIAL_UNAVAILABLE` and never falls
+back to the process environment. Resolver requests retain `reference` and
+include `source` (`secret_env`, `credential_ref`, or `password_ref`); source may
+be omitted only on legacy secret-environment request objects. A `password_ref`
+request additionally includes the exact password-free effective `target`.
+Resolvers may throw `CredentialResolutionError` with `denied`, `cancelled`,
+`timeout`, or `unavailable` to produce controlled, secret-free failures. Unknown
+resolver errors are replaced with a generic `CREDENTIAL_RESOLUTION_FAILED`
+response.
 
 StateQL calls the resolver only immediately before database access, after SQL
 safety and duplicate checks. Requests contain actor and session identity, the
 operation's effective read/write access, an abort signal, and sanitized
 connection metadata.
 
-Returned values must be complete PostgreSQL, MySQL, MongoDB, or Redis URLs, or
-explicit `sqlite:` sources. StateQL validates the source and its stored driver before
-adapter construction and normalizes SQLite paths. Credential-bearing database
-URLs are redacted before connection metadata is persisted and never enter
-history, snapshots, cache keys, or responses. SQLite paths remain persisted
-connection metadata, as they are for direct SQLite connections.
+For `secret_env` and `credential_ref`, returned values must be complete
+PostgreSQL, MySQL, MongoDB, or Redis URLs, or explicit `sqlite:` sources. For
+`password_ref`, the resolver returns only the password; an explicit empty string
+is a resolved password, while `undefined` fails closed. StateQL percent-encodes
+and injects only that password into the original target for adapter use, leaving
+all nonsecret URL/TLS/CA bytes unchanged. It persists only the original target
+and reference. Resolved credentials never enter connection metadata, history,
+snapshots, cache keys, responses, or stored errors.
 
 Harnesses remain responsible for approval policy, binding lifetime, revocation,
 and keeping values out of their own logs and model-visible data.
@@ -547,22 +582,26 @@ retry.
 ### Result identities and aliases
 
 Every materialized SQL, MongoDB, Redis, table, or derived result keeps its
-immutable `q_*` `result_id` and receives a cryptographically random 10-character
-lowercase base32 `display_alias`. `ResultData.alias` normally equals that alias.
-When a batch command supplies `as`, `alias` remains the caller alias for backward
-compatibility while `display_alias` remains canonical. Generated aliases are
-session-scoped, allocated atomically with the result, stable on cache reuse, and
-cannot be reassigned by `setAlias`; explicit aliases and all old handles continue
-to resolve.
+immutable canonical `q_*` `result_id`. New canonical resource IDs use a
+cryptographically random 26-character lowercase base32 suffix; existing
+incremental IDs such as `q_121` remain valid and are not rewritten. Results also
+receive a random 10-character lowercase base32 `display_alias`.
+`ResultData.alias` normally equals that alias. When a batch command supplies
+`as`, `alias` remains the caller alias for backward compatibility while
+`display_alias` remains canonical. Generated aliases are session-scoped,
+allocated atomically with the result, stable on cache reuse, and cannot be
+reassigned by `setAlias`; explicit aliases and all old handles continue to
+resolve.
 
-Connections likewise retain canonical `conn_*` IDs and receive persistent random
-10-character lowercase base32 aliases, exposed as `alias` and `display_alias` by
-`connect()` and `snapshot().connection` (optional in snapshot types for older
-producers). Connection aliases are unique within the state store, allocated
-atomically with the connection, and backfilled for existing records on startup.
-They survive reopening; reconnecting creates a new ID and alias. They are display
-identities only, separate from result aliases; internal references and lookups
-continue to use canonical connection IDs.
+Connections likewise retain canonical `conn_*` IDs with random 26-character
+suffixes and receive persistent random 10-character lowercase base32 aliases,
+exposed as `alias` and `display_alias` by `connect()` and
+`snapshot().connection` (optional in snapshot types for older producers).
+Connection aliases are unique within the state store, allocated atomically with
+the connection, and backfilled for existing records on startup. They survive
+reopening; reconnecting creates a new ID and alias. They are display identities
+only, separate from result aliases; internal references and lookups continue to
+use canonical connection IDs.
 
 ### Safe profile updates
 
@@ -571,19 +610,33 @@ updateProfile(name, {
   target?: string | null,
   secretEnv?: string | null,
   credentialRef?: string | null,
+  passwordRef?: string | null,
   readOnly?: boolean,
 })
 ```
 
-Omitting all source fields keeps the existing source. Supplying any source field
-replaces the source atomically: exactly one non-null source is required and the
-other source columns are cleared. Direct non-SQLite URLs containing credentials
-or secret-like query parameters are rejected. `profile.list/show/update` return
-only `{profile,target,secret_env,credential_ref,read_only}`. `target` is therefore
-a normalized SQLite path or a secret-free URL; reference-backed profiles expose
-only the environment-variable name or opaque credential reference, never a
-resolved value. Profile changes affect subsequent `connect` calls and do not
-silently mutate an already-open connection.
+Omitting all source and password-reference fields keeps the existing source and
+adjunct reference. Supplying any source field replaces the source atomically:
+exactly one non-null source is required and the other source columns are
+cleared. An omitted `passwordRef` is preserved when the existing literal target
+is unchanged; changing the target clears it unless the update explicitly supplies
+a replacement. Replacing the source with `secretEnv` or `credentialRef` clears
+it. An explicit non-null password reference combined with either
+reference-backed source is rejected. Direct URLs
+with embedded passwords or secret-like query parameters are rejected.
+`profile.list/show/update` return only
+`{profile,target,secret_env,credential_ref,password_ref,read_only}`. Profile
+changes affect subsequent `connect` calls and do not silently mutate an
+already-open connection.
+
+The `password_refs_v1` migration adds nullable `password_ref` columns to both
+profiles and connections and enforces that they accompany only literal target
+configuration. It rejects incompatible profile schemas/rows instead of dropping
+references. Downgrading a state home containing password references is
+unsupported: older binaries do not resolve this source and may attempt the
+password-free target using ambient/trust authentication; constraint-protected
+source replacements may also fail. Use the same or newer StateQL binary, or
+explicitly clear all password references before downgrade.
 
 ### Bounded catalog
 

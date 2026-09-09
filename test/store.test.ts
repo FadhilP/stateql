@@ -197,18 +197,13 @@ test("snapshot is typed, bounded, safe, and does not record history", async () =
   assert.throws(() => fixture.stateql.snapshot({ historyLimit: 1.5 }), /positive integer/);
   assert.throws(() => fixture.stateql.snapshot({ historyLimit: 101 }), /cannot exceed 100/);
 
-  const before = await fixture.stateql.status();
+  const historyBeforeSnapshot = store.history(snapshot.session.session_id, 10_000).length;
   fixture.stateql.snapshot();
-  const after = await fixture.stateql.status();
-  assert.equal(commandNumber(after.command_id), commandNumber(before.command_id) + 1);
+  assert.equal(store.history(snapshot.session.session_id, 10_000).length, historyBeforeSnapshot);
 
   await succeed(fixture.stateql.rollbackTransaction());
   fixture.stateql.close();
 });
-
-function commandNumber(commandId: string): number {
-  return Number(commandId.slice(commandId.indexOf("_") + 1));
-}
 
 test("history bounds SQL text by UTF-8 bytes", () => {
   const root = createTemporaryDirectory();
@@ -309,13 +304,173 @@ test("history origin migration attributes legacy rows and restores filtering", (
   reopened.close();
 });
 
+test("resource IDs are random while state versions and transaction order stay semantic", async () => {
+  const clock = new Date("2026-01-01T00:00:00.000Z");
+  const fixture = await createFixture(() => clock);
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  store.db.prepare("INSERT INTO counters(prefix, value) VALUES ('q', 3709)").run();
+
+  const statusResponse = await fixture.stateql.status();
+  assert.equal(statusResponse.ok, true);
+  assert.match(statusResponse.command_id, /^cmd_[a-z2-7]{26}$/);
+  const snapshot = fixture.stateql.snapshot();
+  assert.match(snapshot.session.session_id, /^s_[a-z2-7]{26}$/);
+  assert.match(snapshot.connection!.connection_id, /^conn_[a-z2-7]{26}$/);
+
+  const created = await succeed(fixture.stateql.exec("CREATE TABLE random_ids (value TEXT)"));
+  assert.match(created.operation_id, /^op_[a-z2-7]{26}$/);
+  const result = await succeed(fixture.stateql.query("SELECT * FROM random_ids"));
+  assert.match(result.result_id, /^q_[a-z2-7]{26}$/);
+  const plan = await succeed(
+    fixture.stateql.plan("INSERT INTO random_ids (value) VALUES ('planned')"),
+  );
+  assert.match(plan.plan_id, /^p_[a-z2-7]{26}$/);
+
+  let claimToken = "";
+  const claimPlan = store.claimPlan.bind(store);
+  store.claimPlan = (planId, sessionId, actorId, token) => {
+    claimToken = token;
+    return claimPlan(planId, sessionId, actorId, token);
+  };
+  try {
+    await succeed(fixture.stateql.apply(plan.plan_id));
+  } finally {
+    store.claimPlan = claimPlan;
+  }
+  assert.match(claimToken, /^claim_[a-z2-7]{26}$/);
+
+  const transaction = await succeed(fixture.stateql.beginTransaction());
+  assert.match(transaction.transaction_id, /^tx_[a-z2-7]{26}$/);
+  const first = await succeed(
+    fixture.stateql.exec("INSERT INTO random_ids (value) VALUES ('first')"),
+  );
+  const second = await succeed(
+    fixture.stateql.exec("INSERT INTO random_ids (value) VALUES ('second')"),
+  );
+  assert.match(first.operation_id, /^op_[a-z2-7]{26}$/);
+  assert.match(second.operation_id, /^op_[a-z2-7]{26}$/);
+  assert.deepEqual(
+    store.transactionOperations(transaction.transaction_id).map((operation) => operation.id),
+    [first.operation_id, second.operation_id],
+  );
+  const versionBeforeRollback = store.getConnection(snapshot.connection!.connection_id)!.version;
+  await succeed(fixture.stateql.rollbackTransaction(transaction.transaction_id));
+  assert.equal(
+    store.getConnection(snapshot.connection!.connection_id)!.version,
+    versionBeforeRollback,
+  );
+  assert.match(transaction.start_state_version, /^sv_\d+$/);
+  assert.equal(
+    store.db.prepare("SELECT value FROM counters WHERE prefix = 'q'").get()?.value,
+    3709,
+  );
+  fixture.stateql.close();
+});
+
+test("canonical ID collisions retry and exhaustion rolls back atomically", (t) => {
+  const store = new StateStore(createTemporaryDirectory(), () => new Date());
+  store.db.prepare("INSERT INTO counters(prefix, value) VALUES ('s', 121)").run();
+  let calls = 0;
+  let exhaust = false;
+  const random = t.mock.method(crypto, "randomBytes", (size: number) => {
+    const value = exhaust ? 1 : calls === 2 ? 1 : 0;
+    calls += 1;
+    return Buffer.alloc(size, value);
+  });
+  syncBuiltinESMExports();
+  try {
+    const first = store.createSession("first");
+    const second = store.createSession("second");
+    assert.equal(first.id, `s_${"a".repeat(26)}`);
+    assert.equal(second.id, `s_${"b".repeat(26)}`);
+    assert.equal(calls, 3); // The second allocation retries the first ID once.
+
+    exhaust = true;
+    assert.throws(
+      () => store.createSession("third"),
+      /Could not allocate a unique s ID/,
+    );
+    assert.equal(calls, 67);
+    assert.equal(store.getSessionByName("third"), undefined);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM sessions").get()?.count, 2);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM session_members").get()?.count, 2);
+    assert.equal(store.db.prepare("SELECT value FROM counters WHERE prefix = 's'").get()?.value, 121);
+  } finally {
+    random.mock.restore();
+    syncBuiltinESMExports();
+    store.close();
+  }
+});
+
+test("legacy incremental IDs and their stored references remain usable", async () => {
+  const fixture = await createFixture();
+  const created = await succeed(fixture.stateql.exec("CREATE TABLE legacy_ids (value TEXT)"));
+  const result = await succeed(fixture.stateql.query("SELECT * FROM legacy_ids"));
+  await succeed(fixture.stateql.setAlias("legacy-result", result.result_id));
+  const plan = await succeed(
+    fixture.stateql.plan("INSERT INTO legacy_ids (value) VALUES ('planned')"),
+  );
+  const transaction = await succeed(fixture.stateql.beginTransaction());
+  const pending = await succeed(
+    fixture.stateql.exec("INSERT INTO legacy_ids (value) VALUES ('pending')"),
+  );
+  const store = (fixture.stateql as unknown as { store: StateStore }).store;
+  const snapshot = fixture.stateql.snapshot();
+  const commandId = store.history(snapshot.session.session_id, 1)[0]!.id;
+
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    store.db.exec("PRAGMA defer_foreign_keys = ON");
+    store.db.prepare("UPDATE session_members SET session_id = 's_121' WHERE session_id = ?")
+      .run(snapshot.session.session_id);
+    store.db.prepare("UPDATE connections SET id = 'conn_29', session_id = 's_121' WHERE id = ?")
+      .run(snapshot.connection!.connection_id);
+    store.db.prepare("UPDATE results SET id = 'q_121', session_id = 's_121', connection_id = 'conn_29' WHERE id = ?")
+      .run(result.result_id);
+    store.db.prepare("UPDATE aliases SET session_id = 's_121', result_id = 'q_121' WHERE result_id = ?")
+      .run(result.result_id);
+    store.db.prepare("UPDATE operations SET session_id = 's_121', connection_id = 'conn_29', transaction_id = CASE WHEN transaction_id = ? THEN 'tx_11' ELSE transaction_id END")
+      .run(transaction.transaction_id);
+    store.db.prepare("UPDATE operations SET id = 'op_7' WHERE id = ?").run(pending.operation_id);
+    store.db.prepare("UPDATE transactions SET id = 'tx_11', session_id = 's_121', connection_id = 'conn_29' WHERE id = ?")
+      .run(transaction.transaction_id);
+    store.db.prepare("UPDATE plans SET id = 'p_9', session_id = 's_121', connection_id = 'conn_29' WHERE id = ?")
+      .run(plan.plan_id);
+    store.db.prepare(`UPDATE history SET session_id = 's_121', handle = CASE handle
+      WHEN ? THEN 'q_121' WHEN ? THEN 'op_7' WHEN ? THEN 'p_9' WHEN ? THEN 'tx_11' ELSE handle END`)
+      .run(result.result_id, pending.operation_id, plan.plan_id, transaction.transaction_id);
+    store.db.prepare("UPDATE history SET id = 'cmd_407' WHERE id = ?").run(commandId);
+    store.db.prepare(`UPDATE sessions SET id = 's_121', active_connection_id = 'conn_29',
+      active_transaction_id = 'tx_11' WHERE id = ?`).run(snapshot.session.session_id);
+    store.db.exec("COMMIT");
+  } catch (error) {
+    store.db.exec("ROLLBACK");
+    throw error;
+  }
+  fixture.stateql.close();
+
+  const reopened = new StateQL({ home: fixture.home });
+  assert.equal(reopened.snapshot().session.session_id, "s_121");
+  assert.equal(reopened.snapshot().connection?.connection_id, "conn_29");
+  assert.equal((await succeed(reopened.show("q_121"))).result_id, "q_121");
+  assert.equal((await succeed(reopened.show("legacy-result"))).result_id, "q_121");
+  assert.equal((await succeed(reopened.receipt("op_7"))).transaction_id, "tx_11");
+  assert.equal((await succeed(reopened.transactionStatus("tx_11"))).transaction_id, "tx_11");
+  const reopenedStore = (reopened as unknown as { store: StateStore }).store;
+  assert.equal(reopenedStore.getPlan("p_9")?.connection_id, "conn_29");
+  assert.ok(reopenedStore.history("s_121", 100).some((entry) => entry.id === "cmd_407"));
+  await succeed(reopened.rollbackTransaction("tx_11"));
+  await succeed(reopened.apply("p_9"));
+  assert.equal(reopenedStore.getOperation(created.operation_id)?.connection_id, "conn_29");
+  reopened.close();
+});
 test("connection aliases persist across reopen, change on reconnect, and retain canonical references", async () => {
   const home = createTemporaryDirectory();
   const database = join(home, "target.sqlite");
   let stateql = new StateQL({ home });
   try {
     const first = await succeed(stateql.connect(database, { name: "friendly", readOnly: false }));
-    assert.match(first.connection_id, /^conn_\d+$/);
+    assert.match(first.connection_id, /^conn_[a-z2-7]{26}$/);
     assert.match(first.alias, /^[a-z2-7]{10}$/);
     assert.equal(first.display_alias, first.alias);
     assert.equal(first.name, "friendly");
@@ -346,35 +501,41 @@ test("connection aliases persist across reopen, change on reconnect, and retain 
   } finally { stateql.close(); }
 });
 
-test("connection alias collisions retry and allocation exhaustion rolls back the connection and counter", (t) => {
+test("connection alias collisions retry and allocation exhaustion rolls back the connection", (t) => {
   const store = new StateStore(createTemporaryDirectory(), () => new Date());
   const session = store.createSession("actor");
   const input = {
     sessionId: session.id, actorId: "actor", name: "test", driver: "sqlite" as const,
     databaseName: "test", source: ":memory:", readOnly: true,
   };
-  let calls = 0;
-  const random = t.mock.method(crypto, "randomBytes", () => Buffer.alloc(10, calls++ === 2 ? 1 : 0));
+  let aliasCalls = 0;
+  let idCalls = 0;
+  const random = t.mock.method(crypto, "randomBytes", (size: number) => {
+    if (size === 26) return Buffer.alloc(size, idCalls++);
+    return Buffer.alloc(size, aliasCalls++ === 2 ? 1 : 0);
+  });
   syncBuiltinESMExports();
   try {
     const first = store.addConnection(input)!;
     const second = store.addConnection(input)!;
     assert.equal(first.alias, "aaaaaaaaaa");
     assert.equal(second.alias, "bbbbbbbbbb");
-    assert.equal(calls, 3); // One collision before the second allocation succeeds.
+    assert.equal(aliasCalls, 3); // One collision before the second allocation succeeds.
     assert.throws(() => store.db.prepare("UPDATE connections SET alias = ? WHERE id = ?")
       .run(first.alias!, second.id), /UNIQUE constraint failed/);
     // Uniqueness applies across sessions too.
     const other = store.createSession("other");
     assert.throws(() => store.addConnection({ ...input, sessionId: other.id, actorId: "other" }),
       /Could not allocate a unique connection alias/);
-    assert.equal(calls, 67);
+    assert.equal(aliasCalls, 67);
+    assert.equal(idCalls, 4);
     assert.equal(store.getSession(other.id)?.active_connection_id, null);
     assert.equal(store.getSession(session.id)?.active_connection_id, second.id);
     assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM connections").get()?.count, 2);
-    assert.equal(store.db.prepare("SELECT value FROM counters WHERE prefix = 'conn'").get()?.value, 2);
+    assert.equal(store.db.prepare("SELECT value FROM counters WHERE prefix = 'conn'").get(), undefined);
     assert.equal(store.addConnection({ ...input, actorId: "not-a-member" }), undefined);
-    assert.equal(calls, 67);
+    assert.equal(aliasCalls, 67);
+    assert.equal(idCalls, 4);
   } finally {
     random.mock.restore();
     syncBuiltinESMExports();
@@ -745,16 +906,17 @@ test("credential ref migration preserves legacy profiles and enforces one source
 
   const migrated = new StateStore(home, () => new Date("2026-01-02T00:00:00Z"));
   assert.deepEqual(
-    migrated.listProfiles().map(({ name, target, secret_env, credential_ref }) => ({
+    migrated.listProfiles().map(({ name, target, secret_env, credential_ref, password_ref }) => ({
       name,
       target,
       secret_env,
       credential_ref,
+      password_ref,
     })),
     [
-      { name: "hosted", target: null, secret_env: "APP_DATABASE_URL", credential_ref: null },
-      { name: "legacy_dual", target: null, secret_env: "LEGACY_DATABASE_URL", credential_ref: null },
-      { name: "local", target: "./local.sqlite", secret_env: null, credential_ref: null },
+      { name: "hosted", target: null, secret_env: "APP_DATABASE_URL", credential_ref: null, password_ref: null },
+      { name: "legacy_dual", target: null, secret_env: "LEGACY_DATABASE_URL", credential_ref: null, password_ref: null },
+      { name: "local", target: "./local.sqlite", secret_env: null, credential_ref: null, password_ref: null },
     ],
   );
   assert.ok(
@@ -764,7 +926,22 @@ test("credential ref migration preserves legacy profiles and enforces one source
   );
   assert.ok(
     migrated.db.prepare(
+      "SELECT 1 FROM pragma_table_info('profiles') WHERE name = 'password_ref'",
+    ).get(),
+  );
+  assert.ok(
+    migrated.db.prepare(
+      "SELECT 1 FROM pragma_table_info('connections') WHERE name = 'password_ref'",
+    ).get(),
+  );
+  assert.ok(
+    migrated.db.prepare(
       "SELECT 1 FROM schema_migrations WHERE name = 'credential_refs_v1'",
+    ).get(),
+  );
+  assert.ok(
+    migrated.db.prepare(
+      "SELECT 1 FROM schema_migrations WHERE name = 'password_refs_v1'",
     ).get(),
   );
   assert.throws(() => migrated.db.prepare(
@@ -772,11 +949,75 @@ test("credential ref migration preserves legacy profiles and enforces one source
       (name, target, secret_env, credential_ref, read_only, created_at, updated_at)
      VALUES ('ambiguous', './db.sqlite', 'DATABASE_URL', NULL, 1, '', '')`,
   ).run());
+  migrated.db.prepare(
+    `INSERT INTO profiles
+      (name, target, secret_env, credential_ref, password_ref, read_only, created_at, updated_at)
+     VALUES ('password', 'redis://cache.example/0', NULL, NULL, 'vault://password', 1, '', '')`,
+  ).run();
+  assert.throws(() => migrated.db.prepare(
+    `INSERT INTO profiles
+      (name, target, secret_env, credential_ref, password_ref, read_only, created_at, updated_at)
+     VALUES ('password_env', NULL, 'DATABASE_URL', NULL, 'vault://password', 1, '', '')`,
+  ).run());
+  const session = migrated.createSession("migration-password");
+  const connection = migrated.addConnection({
+    sessionId: session.id,
+    actorId: "migration-password",
+    name: "redis",
+    driver: "redis",
+    databaseName: "db0",
+    source: "redis://cache.example/0",
+    passwordRef: "vault://password",
+    readOnly: true,
+  });
+  assert.equal(connection?.password_ref, "vault://password");
+  assert.throws(() => migrated.db.prepare(
+    "UPDATE connections SET secret_env = 'DATABASE_URL' WHERE id = ?",
+  ).run(connection!.id));
+  assert.throws(() => migrated.addConnection({
+    sessionId: session.id,
+    actorId: "migration-password",
+    name: "sqlite",
+    driver: "sqlite",
+    databaseName: "local.sqlite",
+    source: "./local.sqlite",
+    passwordRef: "vault://password",
+    readOnly: true,
+  }));
   migrated.close();
 
   const reopened = new StateStore(home, () => new Date("2026-01-03T00:00:00Z"));
-  assert.equal(reopened.listProfiles().length, 3);
+  assert.equal(reopened.listProfiles().length, 4);
   reopened.close();
+});
+
+
+test("password reference migration refuses an incompatible profile schema without dropping references", () => {
+  const home = createTemporaryDirectory("stateql-password-ref-incompatible-migration-test-");
+  const initial = new StateQL({ home });
+  initial.close();
+  const database = new DatabaseSync(join(home, "state.sqlite"));
+  database.exec(`
+    ALTER TABLE profiles RENAME TO profiles_before_incompatible_test;
+    CREATE TABLE profiles (
+      name TEXT PRIMARY KEY,
+      target TEXT,
+      secret_env TEXT,
+      credential_ref TEXT,
+      password_ref TEXT,
+      read_only INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO profiles VALUES
+      ('invalid', NULL, 'DATABASE_URL', NULL, 'vault://password', 1, '', '');
+    DROP TABLE profiles_before_incompatible_test;
+  `);
+  database.close();
+  assert.throws(
+    () => new StateStore(home, () => new Date()),
+    /cannot safely rebuild a profile schema that already contains password references/,
+  );
 });
 
 
@@ -799,6 +1040,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "generated_aliases_v1",
       "history_classification_v1",
       "connection_aliases_v1",
+      "password_refs_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");

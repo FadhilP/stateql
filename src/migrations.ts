@@ -138,6 +138,12 @@ const MIGRATIONS: Migration[] = [
       requireIndexes(db, ["connections_alias"]);
     },
   },
+  {
+    name: "password_refs_v1",
+    apply: migratePasswordRefs,
+    validate: validatePasswordRefs,
+  },
+
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -391,8 +397,12 @@ function migrateCredentialRefs(db: DatabaseSync): void {
     ),
   );
   const hasCredentialRef = profileColumns.has("credential_ref");
+  const hasPasswordRef = profileColumns.has("password_ref");
 
   if (!profileCredentialRefSchemaCurrent(db)) {
+    if (hasPasswordRef) {
+      throw new Error("State migration cannot safely rebuild a profile schema that already contains password references.");
+    }
     const missingSources = db.prepare(
       `SELECT COUNT(*) AS count FROM profiles
        WHERE target IS NULL AND secret_env IS NULL${hasCredentialRef ? " AND credential_ref IS NULL" : ""}`,
@@ -462,6 +472,136 @@ function profileCredentialRefSchemaCurrent(db: DatabaseSync): boolean {
   ).get() as { sql: string } | undefined;
   return Boolean(row?.sql && /CHECK\s*\(\s*\(target IS NOT NULL\)\s*\+\s*\(secret_env IS NOT NULL\)\s*\+\s*\(credential_ref IS NOT NULL\)\s*=\s*1\s*\)/i.test(row.sql));
 }
+
+function migratePasswordRefs(db: DatabaseSync): void {
+  const profileColumns = tableColumns(db, "profiles");
+  const profilePasswordRef = profileColumns.has("password_ref") ? "password_ref" : "NULL";
+  if (!profilePasswordRefSchemaCurrent(db)) {
+    const invalid = db.prepare(
+      `SELECT COUNT(*) AS count FROM profiles
+       WHERE ${profilePasswordRef} IS NOT NULL AND target IS NULL`,
+    ).get() as { count: number };
+    if (invalid.count) {
+      throw new Error("State migration found a password reference without a target profile source.");
+    }
+    db.exec(`
+      ALTER TABLE profiles RENAME TO profiles_legacy_password_refs_v1;
+      CREATE TABLE profiles (
+        name TEXT PRIMARY KEY,
+        target TEXT,
+        secret_env TEXT,
+        credential_ref TEXT,
+        password_ref TEXT,
+        read_only INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (target IS NOT NULL) +
+          (secret_env IS NOT NULL) +
+          (credential_ref IS NOT NULL) = 1
+        ),
+        CHECK (password_ref IS NULL OR target IS NOT NULL)
+      );
+      INSERT INTO profiles
+        (name, target, secret_env, credential_ref, password_ref, read_only, created_at, updated_at)
+      SELECT name, target, secret_env, credential_ref, ${profilePasswordRef}, read_only, created_at, updated_at
+      FROM profiles_legacy_password_refs_v1;
+      DROP TABLE profiles_legacy_password_refs_v1;
+    `);
+  }
+
+  const connectionColumns = tableColumns(db, "connections");
+  const connectionPasswordRef = connectionColumns.has("password_ref") ? "password_ref" : "NULL";
+  if (!connectionPasswordRefSchemaCurrent(db)) {
+    const invalid = db.prepare(
+      `SELECT COUNT(*) AS count FROM connections
+       WHERE ${connectionPasswordRef} IS NOT NULL
+         AND (secret_env IS NOT NULL OR credential_ref IS NOT NULL OR
+              driver NOT IN ('postgres', 'mysql', 'mongodb', 'redis'))`,
+    ).get() as { count: number };
+    if (invalid.count) {
+      throw new Error("State migration found a password reference on a non-target connection source.");
+    }
+    db.exec(`
+      ALTER TABLE connections RENAME TO connections_legacy_password_refs_v1;
+      CREATE TABLE connections (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        driver TEXT NOT NULL,
+        database_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        secret_env TEXT,
+        credential_ref TEXT,
+        password_ref TEXT,
+        read_only INTEGER NOT NULL,
+        version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        alias TEXT,
+        CHECK (
+          password_ref IS NULL OR
+          (secret_env IS NULL AND credential_ref IS NULL AND
+           driver IN ('postgres', 'mysql', 'mongodb', 'redis'))
+        ),
+        FOREIGN KEY(session_id) REFERENCES sessions(id)
+      );
+      INSERT INTO connections
+        (id, session_id, name, driver, database_name, source, secret_env,
+         credential_ref, password_ref, read_only, version, created_at, alias)
+      SELECT id, session_id, name, driver, database_name, source, secret_env,
+             credential_ref, ${connectionPasswordRef}, read_only, version, created_at, alias
+      FROM connections_legacy_password_refs_v1;
+      DROP TABLE connections_legacy_password_refs_v1;
+      CREATE UNIQUE INDEX connections_alias ON connections(alias);
+    `);
+  }
+}
+
+function validatePasswordRefs(db: DatabaseSync): void {
+  requireColumns(db, "profiles", ["password_ref"]);
+  requireColumns(db, "connections", ["password_ref"]);
+  if (!profilePasswordRefSchemaCurrent(db) || !connectionPasswordRefSchemaCurrent(db)) {
+    throw new Error("State migration did not enforce password-reference source constraints.");
+  }
+  const invalidProfiles = db.prepare(
+    `SELECT COUNT(*) AS count FROM profiles
+     WHERE password_ref IS NOT NULL AND target IS NULL`,
+  ).get() as { count: number };
+  const invalidConnections = db.prepare(
+    `SELECT COUNT(*) AS count FROM connections
+     WHERE password_ref IS NOT NULL
+       AND (secret_env IS NOT NULL OR credential_ref IS NOT NULL OR
+            driver NOT IN ('postgres', 'mysql', 'mongodb', 'redis'))`,
+  ).get() as { count: number };
+  if (invalidProfiles.count || invalidConnections.count) {
+    throw new Error("State migration left an invalid password-reference source.");
+  }
+}
+
+function profilePasswordRefSchemaCurrent(db: DatabaseSync): boolean {
+  const sql = tableSql(db, "profiles");
+  return profileCredentialRefSchemaCurrent(db) &&
+    /CHECK\s*\(\s*password_ref IS NULL OR target IS NOT NULL\s*\)/i.test(sql);
+}
+
+function connectionPasswordRefSchemaCurrent(db: DatabaseSync): boolean {
+  return /CHECK\s*\(\s*password_ref IS NULL OR\s*\(secret_env IS NULL AND credential_ref IS NULL AND\s*driver IN \('postgres', 'mysql', 'mongodb', 'redis'\)\)\s*\)/i
+    .test(tableSql(db, "connections"));
+}
+function tableSql(db: DatabaseSync, table: string): string {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+  ).get(table) as { sql: string } | undefined;
+  return row?.sql ?? "";
+}
+
+function tableColumns(db: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+}
+
 
 
 function addColumn(

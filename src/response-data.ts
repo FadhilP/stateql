@@ -30,6 +30,7 @@ export function profileData(profile: ProfileRecord): ProfileData {
     target: profile.target,
     secret_env: profile.secret_env,
     credential_ref: profile.credential_ref,
+    password_ref: profile.password_ref,
     read_only: Boolean(profile.read_only),
   };
 }

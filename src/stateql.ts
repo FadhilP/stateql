@@ -21,10 +21,12 @@ import {
   databaseUrlHasSecret,
   detectDriver,
   isEnvironmentName,
+  injectPassword,
   mongoDatabaseName,
   redisDatabaseName,
   normalizeSqliteSource,
   validateCredentialRef,
+  validatePasswordReferenceTarget,
   validateProfileName,
   version,
 } from "./connection.js";
@@ -100,6 +102,7 @@ import type {
   CredentialResolver,
   DisconnectData,
   DoctorData,
+  Driver,
   ExecData,
   ExecOptions,
   ExecutionOptions,
@@ -176,6 +179,9 @@ interface ActionResult<T> {
 }
 
 export class StateQL {
+  /** Runtime contract marker for passwordRef/password_ref support. */
+  static readonly passwordReferenceVersion = 1 as const;
+
   static forActor(options: StateQLActorOptions): StateQL {
     if (!options.actor.trim()) {
       throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
@@ -315,8 +321,19 @@ export class StateQL {
           "Use exactly one connection target, profile, secret environment variable, or credential reference.",
         );
       }
+      if (
+        options.passwordRef !== undefined &&
+        (target === undefined || options.profile !== undefined ||
+          options.secretEnv !== undefined || options.credentialRef !== undefined)
+      ) {
+        throw new StateQLError(
+          "INVALID_COMMAND",
+          "A password reference requires a literal remote connection target.",
+        );
+      }
       const implicitProfile =
-        !options.profile && !options.secretEnv && !options.credentialRef && target
+        !options.profile && !options.secretEnv && !options.credentialRef &&
+          options.passwordRef === undefined && target
           ? this.store.getProfile(target)
           : undefined;
       const profile = options.profile
@@ -331,18 +348,20 @@ export class StateQL {
       }
       if (
         profile &&
-        [profile.target, profile.secret_env, profile.credential_ref]
-          .filter((value) => value !== null).length !== 1
+        ([profile.target, profile.secret_env, profile.credential_ref]
+          .filter((value) => value !== null).length !== 1 ||
+          (profile.password_ref !== null && profile.target === null))
       ) {
         throw new StateQLError(
           "STATE_CORRUPTED",
-          `Profile "${profile.name}" does not have exactly one connection source.`,
+          `Profile "${profile.name}" has an invalid connection source.`,
         );
       }
 
       const resolvedTarget = profile?.target ?? target;
       const secretEnv = options.secretEnv ?? profile?.secret_env ?? undefined;
       const credentialRef = options.credentialRef ?? profile?.credential_ref ?? undefined;
+      const passwordRef = options.passwordRef ?? profile?.password_ref ?? undefined;
       if (secretEnv !== undefined && !isEnvironmentName(secretEnv)) {
         throw new StateQLError(
           "INVALID_COMMAND",
@@ -350,76 +369,105 @@ export class StateQL {
         );
       }
       if (credentialRef !== undefined) validateCredentialRef(credentialRef);
+      if (passwordRef !== undefined) {
+        validateCredentialRef(passwordRef);
+        if (!resolvedTarget) {
+          throw new StateQLError("INVALID_COMMAND", "A password reference requires a literal remote connection target.");
+        }
+        validatePasswordReferenceTarget(resolvedTarget);
+      }
       const credentialReference = secretEnv ?? credentialRef;
-      const credentialReferenceSource: CredentialSource | undefined = secretEnv !== undefined
+      const credentialReferenceSource: Exclude<CredentialSource, "password_ref"> | undefined = secretEnv !== undefined
         ? "secret_env"
         : credentialRef !== undefined ? "credential_ref" : undefined;
       const readOnly =
         options.readOnly ??
         (profile ? Boolean(profile.read_only) : true);
       const context = this.executionContext(options);
-      const secret = credentialReference && credentialReferenceSource
-        ? await this.resolveCredential(
-            credentialReference,
-            credentialReferenceSource,
-            session,
-            "connect",
-            readOnly ? "read" : "write",
-            context,
-            {
-              ...(profile ? { profile: { name: profile.name } } : {}),
-              requestedReadOnly: readOnly,
-            },
-          )
-        : resolvedTarget;
-      if (!secret) {
-        throw new StateQLError("INVALID_COMMAND", "Connection target is required.");
-      }
-      const resolvedSource = credentialReferenceSource
-        ? credentialSource(secret, undefined, credentialReferenceSource)
-        : { driver: detectDriver(secret), source: secret };
-      const { driver } = resolvedSource;
-      if (
-        driver !== "sqlite" &&
-        !credentialReference &&
-        databaseUrlHasSecret(secret)
-      ) {
-        throw new StateQLError(
-          "PERMISSION_DENIED",
-          `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`,
+      let adapterSource: string;
+      let driver: Driver;
+      if (passwordRef !== undefined) {
+        const password = await this.resolveCredential(
+          passwordRef,
+          "password_ref",
+          session,
+          "connect",
+          readOnly ? "read" : "write",
+          context,
           {
-            suggestedAction:
-              "Use an environment variable or trusted host credential reference.",
+            ...(profile ? { profile: { name: profile.name } } : {}),
+            requestedReadOnly: readOnly,
           },
+          resolvedTarget!,
         );
+        ({ driver, source: adapterSource } = injectPassword(resolvedTarget!, password));
+      } else {
+        const secret = credentialReference && credentialReferenceSource
+          ? await this.resolveCredential(
+              credentialReference,
+              credentialReferenceSource,
+              session,
+              "connect",
+              readOnly ? "read" : "write",
+              context,
+              {
+                ...(profile ? { profile: { name: profile.name } } : {}),
+                requestedReadOnly: readOnly,
+              },
+            )
+          : resolvedTarget;
+        if (!secret) {
+          throw new StateQLError("INVALID_COMMAND", "Connection target is required.");
+        }
+        const resolvedSource = credentialReferenceSource
+          ? credentialSource(secret, undefined, credentialReferenceSource)
+          : { driver: detectDriver(secret), source: secret };
+        driver = resolvedSource.driver;
+        if (
+          driver !== "sqlite" &&
+          !credentialReference &&
+          databaseUrlHasSecret(secret)
+        ) {
+          throw new StateQLError(
+            "PERMISSION_DENIED",
+            `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`,
+            {
+              suggestedAction:
+                "Use an environment variable or trusted host credential reference.",
+            },
+          );
+        }
+        adapterSource = credentialReferenceSource
+          ? resolvedSource.source
+          : driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
       }
 
-      const adapterSource = credentialReferenceSource
-        ? resolvedSource.source
-        : driver === "sqlite" ? normalizeSqliteSource(secret) : secret;
-      const source =
-        driver === "sqlite"
+      const persistedSource = passwordRef !== undefined
+        ? resolvedTarget!
+        : driver === "sqlite"
           ? adapterSource
           : credentialReferenceSource
-            ? redact(secret)
+            ? redact(adapterSource)
             : adapterSource;
+      const identitySource = passwordRef !== undefined ? resolvedTarget! : adapterSource;
       const databaseName =
         driver === "sqlite"
           ? basename(adapterSource)
           : driver === "mongodb"
-            ? mongoDatabaseName(adapterSource)
+            ? mongoDatabaseName(identitySource)
             : driver === "redis"
-              ? redisDatabaseName(adapterSource)
-              : new URL(secret).pathname.replace(/^\//, "") || driver;
+              ? redisDatabaseName(identitySource)
+              : new URL(identitySource).pathname.replace(/^\//, "") || driver;
       const draft: ConnectionRecord = {
         id: "pending",
         session_id: session.id,
         name: options.name ?? profile?.name ?? databaseName,
         driver,
         database_name: databaseName,
-        source,
+        source: persistedSource,
         secret_env: secretEnv ?? null,
         credential_ref: credentialRef ?? null,
+        password_ref: passwordRef ?? null,
         read_only: readOnly ? 1 : 0,
         version: 0,
         created_at: this.now().toISOString(),
@@ -451,9 +499,10 @@ export class StateQL {
         name: draft.name,
         driver,
         databaseName,
-        source,
+        source: persistedSource,
         ...(secretEnv ? { secretEnv } : {}),
         ...(credentialRef ? { credentialRef } : {}),
+        ...(passwordRef !== undefined ? { passwordRef } : {}),
         readOnly,
       });
       if (!connection) {
@@ -501,6 +550,7 @@ export class StateQL {
         target,
         secretEnv: options.secretEnv,
         credentialRef: options.credentialRef,
+        passwordRef: options.passwordRef,
       });
 
       const profile = this.store.addProfile({
@@ -508,6 +558,7 @@ export class StateQL {
         target: source.target ?? undefined,
         secretEnv: source.secretEnv ?? undefined,
         credentialRef: source.credentialRef ?? undefined,
+        passwordRef: source.passwordRef ?? undefined,
         readOnly: options.readOnly ?? true,
       });
       return {
@@ -527,20 +578,30 @@ export class StateQL {
       const existing = this.store.getProfile(name);
       if (!existing) throw new StateQLError("CONNECTION_NOT_FOUND", `Profile "${name}" was not found.`);
       if (!changes || typeof changes !== "object" || Array.isArray(changes) ||
-        Object.keys(changes).some((key) => !["target", "secretEnv", "credentialRef", "readOnly"].includes(key))) {
+        Object.keys(changes).some((key) => !["target", "secretEnv", "credentialRef", "passwordRef", "readOnly"].includes(key))) {
         throw new StateQLError("INVALID_COMMAND", "Profile update contains unknown fields.");
       }
       if (changes.readOnly !== undefined && typeof changes.readOnly !== "boolean") throw new StateQLError("INVALID_COMMAND", "Profile readOnly must be boolean.");
       const changesSource = Object.hasOwn(changes, "target") || Object.hasOwn(changes, "secretEnv") || Object.hasOwn(changes, "credentialRef");
-      if (!changesSource && changes.readOnly === undefined) throw new StateQLError("INVALID_COMMAND", "Profile update has no changes.");
-      const source = changesSource
-        ? validatedProfileSource({ target: changes.target ?? undefined, secretEnv: changes.secretEnv ?? undefined, credentialRef: changes.credentialRef ?? undefined })
-        : { target: existing.target, secretEnv: existing.secret_env, credentialRef: existing.credential_ref };
+      const changesPassword = Object.hasOwn(changes, "passwordRef");
+      if (!changesSource && !changesPassword && changes.readOnly === undefined) throw new StateQLError("INVALID_COMMAND", "Profile update has no changes.");
+      const targetSource = changesSource ? changes.target ?? undefined : existing.target ?? undefined;
+      const source = validatedProfileSource({
+        target: targetSource,
+        secretEnv: changesSource ? changes.secretEnv ?? undefined : existing.secret_env ?? undefined,
+        credentialRef: changesSource ? changes.credentialRef ?? undefined : existing.credential_ref ?? undefined,
+        passwordRef: changesPassword
+          ? changes.passwordRef ?? undefined
+          : !changesSource || targetSource === existing.target
+            ? existing.password_ref ?? undefined
+            : undefined,
+      });
       const profile = this.store.updateProfile({
         name,
         target: source.target,
         secretEnv: source.secretEnv,
         credentialRef: source.credentialRef,
+        passwordRef: source.passwordRef,
         readOnly: changes.readOnly ?? Boolean(existing.read_only),
       });
       if (!profile) throw new StateQLError("CONNECTION_NOT_FOUND", `Profile "${name}" was not found.`);
@@ -2285,7 +2346,7 @@ export class StateQL {
             `plan "${plan.id}" parameters`,
             isSqlParameters,
           ));
-      const claimToken = this.store.nextId("claim");
+      const claimToken = this.store.randomId("claim");
       const claimed = this.store.claimPlan(
         plan.id,
         session.id,
@@ -2533,6 +2594,7 @@ export class StateQL {
             readOnly: command.read_only,
             secretEnv: command.secret_env,
             credentialRef: command.credential_ref,
+            passwordRef: command.password_ref ?? undefined,
             profile: command.profile,
             timeoutMs: command.timeout_ms,
           });
@@ -2548,6 +2610,7 @@ export class StateQL {
               readOnly: command.read_only ?? true,
               secretEnv: command.secret_env,
               credentialRef: command.credential_ref,
+              passwordRef: command.password_ref ?? undefined,
             },
           );
         case "profile.update":
@@ -2555,6 +2618,7 @@ export class StateQL {
             ...(command.target !== undefined ? { target: command.target } : {}),
             ...(command.secret_env !== undefined ? { secretEnv: command.secret_env } : {}),
             ...(command.credential_ref !== undefined ? { credentialRef: command.credential_ref } : {}),
+            ...(command.password_ref !== undefined ? { passwordRef: command.password_ref } : {}),
             ...(command.read_only !== undefined ? { readOnly: command.read_only } : {}),
           });
         case "profile.list":
@@ -3598,9 +3662,40 @@ export class StateQL {
     access: CredentialAccess,
     context: AdapterContext,
   ): Promise<string> {
+    const references = [connection.secret_env, connection.credential_ref, connection.password_ref]
+      .filter((value) => value !== null);
+    if (references.length > 1) {
+      throw new StateQLError("STATE_CORRUPTED", "Connection has ambiguous credential references.");
+    }
+    if (connection.password_ref !== null) {
+      validateCredentialRef(connection.password_ref);
+      const driver = validatePasswordReferenceTarget(connection.source);
+      if (driver !== connection.driver) {
+        throw new StateQLError("STATE_CORRUPTED", "Password-reference target driver does not match the stored connection.");
+      }
+      const password = await this.resolveCredential(
+        connection.password_ref,
+        "password_ref",
+        session,
+        operation,
+        access,
+        context,
+        {
+          connection: {
+            id: connection.id,
+            name: connection.name,
+            driver: connection.driver,
+            database: connection.database_name,
+            readOnly: Boolean(connection.read_only),
+          },
+        },
+        connection.source,
+      );
+      return injectPassword(connection.source, password).source;
+    }
     const reference = connection.secret_env ?? connection.credential_ref;
     if (!reference) return connection.source;
-    const source: CredentialSource = connection.secret_env
+    const source: Exclude<CredentialSource, "password_ref"> = connection.secret_env
       ? "secret_env"
       : "credential_ref";
     const value = await this.resolveCredential(
@@ -3634,6 +3729,7 @@ export class StateQL {
       CredentialRequest,
       "profile" | "requestedReadOnly" | "connection"
     > = {},
+    passwordTarget?: string,
   ): Promise<string> {
     const resolver = this.credentialResolver;
     const credentialContext = createAdapterContext(
@@ -3656,9 +3752,8 @@ export class StateQL {
       }
       if (source === "secret_env") value = env[reference];
     } else {
-      const request: CredentialRequest = {
+      const baseRequest = {
         reference,
-        source,
         actorId: this.actorId,
         session: { id: session.id, name: session.name },
         operation,
@@ -3666,6 +3761,9 @@ export class StateQL {
         ...(context.signal ? { signal: context.signal } : {}),
         ...details,
       };
+      const request: CredentialRequest = source === "password_ref"
+        ? { ...baseRequest, source, target: passwordTarget! }
+        : { ...baseRequest, source };
       try {
         value = await resolveCredentialBeforeDeadline(
           resolver,
@@ -3676,7 +3774,7 @@ export class StateQL {
         throw credentialStateQLError(reference, error);
       }
     }
-    if (!value) {
+    if (value === undefined || (source !== "password_ref" && value === "")) {
       throw credentialStateQLError(
         reference,
         new CredentialResolutionError("unavailable"),
@@ -3798,8 +3896,8 @@ export class StateQL {
     const category = historyCategory(command);
     const internal = commandContext?.internal ?? false;
     let session = this.store.ensureSession(this.sessionName);
-    const commandId = this.store.nextId("cmd");
     if (!this.store.isSessionMember(session.id, this.actorId)) {
+      const commandId = this.store.randomId("cmd");
       const error = new StateQLError(
         "PERMISSION_DENIED",
         `Actor "${this.actorId}" is not attached to session "${session.name}".`,
@@ -3818,8 +3916,7 @@ export class StateQL {
       const result = await action(session);
       const responseSession = result.session ?? session;
       const sqlText = resolveHistorySql(historySql);
-      this.store.addHistory({
-        id: commandId,
+      const history = this.store.addHistory({
         sessionId: session.id,
         actorId: this.actorId,
         origin,
@@ -3835,7 +3932,7 @@ export class StateQL {
       });
       return {
         ok: true,
-        command_id: commandId,
+        command_id: history.id,
         session_id: responseSession.id,
         data: result.data,
         warnings: result.warnings ?? [],
@@ -3852,8 +3949,7 @@ export class StateQL {
     } catch (error) {
       const stateqlError = asStateQLError(error);
       const sqlText = resolveHistorySql(historySql);
-      this.store.addHistory({
-        id: commandId,
+      const history = this.store.addHistory({
         sessionId: session.id,
         actorId: this.actorId,
         origin,
@@ -3869,7 +3965,7 @@ export class StateQL {
       });
       return {
         ok: false,
-        command_id: commandId,
+        command_id: history.id,
         session_id: session.id,
         error: stateqlError.details,
         meta: {
@@ -4277,7 +4373,19 @@ function credentialStateQLError(
 }
 
 function safeCredentialErrorMessage(error: unknown, source: string): string {
-  return redact(errorMessage(error).split(source).join("[credential redacted]"))
+  let message = errorMessage(error).split(source).join("[credential redacted]");
+  const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(source)?.[1];
+  if (authority) {
+    const at = authority.lastIndexOf("@");
+    const colon = at < 0 ? -1 : authority.slice(0, at).indexOf(":");
+    const password = colon < 0 ? "" : authority.slice(colon + 1, at);
+    const secrets = new Set([password]);
+    try { secrets.add(decodeURIComponent(password)); } catch { /* malformed values stay encoded */ }
+    for (const secret of secrets) {
+      if (secret) message = message.split(secret).join("[credential redacted]");
+    }
+  }
+  return redact(message)
     .replace(
       /\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+(?::[^\s\/@]*)?@/giu,
       "$1***@",
@@ -4306,20 +4414,41 @@ function stoppedStateQLError(
   );
 }
 
-function validatedProfileSource(input: { target?: string; secretEnv?: string; credentialRef?: string }): { target: string | null; secretEnv: string | null; credentialRef: string | null } {
+function validatedProfileSource(input: {
+  target?: string;
+  secretEnv?: string;
+  credentialRef?: string;
+  passwordRef?: string;
+}): {
+  target: string | null;
+  secretEnv: string | null;
+  credentialRef: string | null;
+  passwordRef: string | null;
+} {
   const sourceCount = [input.target, input.secretEnv, input.credentialRef].filter((value) => value !== undefined).length;
   if (sourceCount !== 1 || input.target === "" || input.secretEnv === "" || input.credentialRef === "") {
     throw new StateQLError("INVALID_COMMAND", "Profile requires exactly one target, secret environment variable, or credential reference.");
   }
   if (input.secretEnv !== undefined && !isEnvironmentName(input.secretEnv)) throw new StateQLError("INVALID_COMMAND", "Secret environment variable name is invalid.");
   if (input.credentialRef !== undefined) validateCredentialRef(input.credentialRef);
+  if (input.passwordRef !== undefined) validateCredentialRef(input.passwordRef);
   let target = input.target ?? null;
+  if (input.passwordRef !== undefined && target === null) {
+    throw new StateQLError("INVALID_COMMAND", "A password reference requires a literal remote profile target.");
+  }
   if (target) {
-    const driver = detectDriver(target);
-    if (driver !== "sqlite" && databaseUrlHasSecret(target)) throw new StateQLError("PERMISSION_DENIED", `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`);
+    const driver = input.passwordRef !== undefined
+      ? validatePasswordReferenceTarget(target)
+      : detectDriver(target);
+    if (input.passwordRef === undefined && driver !== "sqlite" && databaseUrlHasSecret(target)) throw new StateQLError("PERMISSION_DENIED", `Credential-bearing ${databaseDisplayName(driver)} URLs must use --env or --credential-ref.`);
     if (driver === "sqlite") target = normalizeSqliteSource(target);
   }
-  return { target, secretEnv: input.secretEnv ?? null, credentialRef: input.credentialRef ?? null };
+  return {
+    target,
+    secretEnv: input.secretEnv ?? null,
+    credentialRef: input.credentialRef ?? null,
+    passwordRef: input.passwordRef ?? null,
+  };
 }
 
 function historyCategory(command: string): HistoryCategory {

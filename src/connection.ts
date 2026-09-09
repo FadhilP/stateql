@@ -10,6 +10,7 @@ export function databaseIdentity(connection: ConnectionRecord): unknown {
     source: connection.source,
     secretEnvironment: connection.secret_env,
     credentialReference: connection.credential_ref,
+    passwordReference: connection.password_ref,
   };
 }
 
@@ -26,25 +27,23 @@ export function detectDriver(target: string): Driver {
   }
   return "sqlite";
 }
-
 export function mongoDatabaseName(target: string): string {
-  let url: URL;
+  let pathname: string;
   try {
-    url = new URL(target);
+    const url = new URL(target);
+    if (!["mongodb:", "mongodb+srv:"].includes(url.protocol.toLowerCase()) || !url.hostname) throw new Error();
+    pathname = url.pathname;
   } catch {
-    throw new StateQLError("INVALID_COMMAND", "Invalid MongoDB URL.");
-  }
-  if (
-    !["mongodb:", "mongodb+srv:"].includes(url.protocol.toLowerCase()) ||
-    !url.hostname
-  ) {
-    throw new StateQLError("INVALID_COMMAND", "Invalid MongoDB URL.");
+    const match = /^mongodb(?:\+srv)?:\/\/([^/?#]+)(\/[^?#]*)?(?:[?#]|$)/i.exec(target);
+    if (!match) throw new StateQLError("INVALID_COMMAND", "Invalid MongoDB URL.");
+    const authority = match[1]!;
+    const at = authority.lastIndexOf("@");
+    validateMongoHosts(authority.slice(at + 1), /^mongodb\+srv:/i.test(target));
+    pathname = match[2] ?? "";
   }
   try {
-    const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
-    if (database && !database.includes("/") && !database.includes("\0")) {
-      return database;
-    }
+    const database = decodeURIComponent(pathname.replace(/^\//, ""));
+    if (database && !database.includes("/") && !database.includes("\0")) return database;
   } catch {
     // Report malformed escaping as an invalid explicit database name.
   }
@@ -70,7 +69,7 @@ export function redisDatabaseName(target: string): string {
 export function credentialSource(
   value: string,
   expectedDriver?: Driver,
-  referenceSource: CredentialSource = "secret_env",
+  referenceSource: Exclude<CredentialSource, "password_ref"> = "secret_env",
 ): { driver: Driver; source: string } {
   const sourceLabel = referenceSource === "credential_ref"
     ? "Credential reference"
@@ -123,9 +122,15 @@ export function normalizeSqliteSource(target: string): string {
 
 export function databaseUrlHasSecret(target: string): boolean {
   try {
-    const url = new URL(target);
+    const match = /^([a-z][a-z\d+.-]*:\/\/)([^/?#]*)([\s\S]*)$/i.exec(target);
+    if (!match) throw new Error();
+    const authority = match[2]!;
+    const at = authority.lastIndexOf("@");
+    const url = /^mongodb(?:\+srv)?:\/\//i.test(target)
+      ? new URL(`http://placeholder${match[3]}`)
+      : new URL(target);
     return (
-      Boolean(url.username) ||
+      (at >= 0 && authority.slice(0, at).includes(":")) ||
       Boolean(url.password) ||
       [...url.searchParams.keys()].some((key) =>
         /pass|token|secret|private[_-]?key|api[_-]?key/i.test(key),
@@ -134,6 +139,101 @@ export function databaseUrlHasSecret(target: string): boolean {
   } catch {
     throw new StateQLError("INVALID_COMMAND", "Invalid database URL.");
   }
+}
+
+const AMBIGUOUS_PASSWORD_TARGET_PARAMETERS = new Set([
+  "host",
+  "hostaddr",
+  "hostname",
+  "port",
+  "socket",
+  "socketpath",
+  "user",
+  "username",
+]);
+
+export function validatePasswordReferenceTarget(target: string): Driver {
+  if (/\s/.test(target)) {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target must not contain whitespace.");
+  }
+  const driver = detectDriver(target);
+  if (driver === "sqlite") {
+    throw new StateQLError("INVALID_COMMAND", "Password references require a remote PostgreSQL, MySQL, MongoDB, or Redis target.");
+  }
+
+  const authorityMatch = /^([a-z][a-z\d+.-]*:\/\/)([^/?#]*)([\s\S]*)$/i.exec(target);
+  if (!authorityMatch) {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target must be a valid remote database URL.");
+  }
+  const authority = authorityMatch[2]!;
+  const at = authority.lastIndexOf("@");
+  const userinfo = at >= 0 ? authority.slice(0, at) : "";
+  if (userinfo.includes(":") || userinfo.includes("@")) {
+    throw new StateQLError("PERMISSION_DENIED", "Password-reference target must not contain an embedded password.");
+  }
+  if (/%(?![0-9a-f]{2})/i.test(userinfo)) {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target contains malformed username escaping.");
+  }
+  try { if (userinfo) decodeURIComponent(userinfo); } catch {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target contains malformed username escaping.");
+  }
+
+  let url: URL;
+  try {
+    if (driver === "mongodb") {
+      validateMongoHosts(authority.slice(at + 1), /^mongodb\+srv:/i.test(target));
+      url = new URL(`http://placeholder${authorityMatch[3]}`);
+    } else {
+      url = new URL(target);
+      if (!url.hostname || url.password) throw new Error();
+    }
+  } catch {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target must be a valid remote database URL.");
+  }
+  for (const key of url.searchParams.keys()) {
+    const normalized = key.toLowerCase().replaceAll("_", "").replaceAll("-", "");
+    if (
+      AMBIGUOUS_PASSWORD_TARGET_PARAMETERS.has(normalized) ||
+      /pass|token|secret|privatekey|apikey/.test(normalized)
+    ) {
+      throw new StateQLError(
+        "PERMISSION_DENIED",
+        "Password-reference target must not contain endpoint or credential query overrides.",
+      );
+    }
+  }
+  if (driver === "mongodb" && !userinfo) {
+    throw new StateQLError("INVALID_COMMAND", "MongoDB password-reference targets require a username.");
+  }
+  return driver;
+}
+
+function validateMongoHosts(hosts: string, srv: boolean): void {
+  const entries = hosts.split(",");
+  if (!hosts || (srv && entries.length !== 1) || entries.some((host) => {
+    if (srv) return !/^[^:[\],%]+$/u.test(host);
+    return !(/^[^:[\],%]+(?::\d+)?$/u.test(host) || /^\[[0-9a-f:.]+\](?::\d+)?$/iu.test(host));
+  })) {
+    throw new StateQLError("INVALID_COMMAND", "Password-reference target must be a valid remote database URL.");
+  }
+}
+
+/** Injects only password userinfo while retaining every nonsecret target byte. */
+export function injectPassword(target: string, password: string): { driver: Driver; source: string } {
+  const driver = validatePasswordReferenceTarget(target);
+  let encoded: string;
+  try {
+    encoded = encodeURIComponent(password);
+  } catch {
+    throw new StateQLError("CREDENTIAL_RESOLUTION_FAILED", "Resolved password could not be encoded.");
+  }
+  const match = /^([a-z][a-z\d+.-]*:\/\/)([^/?#]*)([\s\S]*)$/i.exec(target)!;
+  const authority = match[2]!;
+  const at = authority.lastIndexOf("@");
+  const injectedAuthority = at >= 0
+    ? `${authority.slice(0, at)}:${encoded}${authority.slice(at)}`
+    : `:${encoded}@${authority}`;
+  return { driver, source: `${match[1]}${injectedAuthority}${match[3]}` };
 }
 
 export function version(connection: ConnectionRecord): string {

@@ -47,6 +47,7 @@ export interface ConnectionRecord {
   source: string;
   secret_env: string | null;
   credential_ref: string | null;
+  password_ref: string | null;
   read_only: number;
   version: number;
   created_at: string;
@@ -57,6 +58,7 @@ export interface ProfileRecord {
   target: string | null;
   secret_env: string | null;
   credential_ref: string | null;
+  password_ref: string | null;
   read_only: number;
   created_at: string;
   updated_at: string;
@@ -197,14 +199,25 @@ export class StateStore {
     this.db.close();
   }
 
-  nextId(prefix: string): string {
-    this.db
-      .prepare("INSERT OR IGNORE INTO counters(prefix, value) VALUES (?, 0)")
-      .run(prefix);
-    const row = this.db
-      .prepare("UPDATE counters SET value = value + 1 WHERE prefix = ? RETURNING value")
-      .get(prefix) as { value: number };
-    return `${prefix}_${row.value}`;
+  randomId(prefix: string): string {
+    return `${prefix}_${randomBase32Id()}`;
+  }
+
+  private insertWithRandomId(
+    prefix: string,
+    table: string,
+    insert: (id: string) => void,
+  ): string {
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const id = this.randomId(prefix);
+      try {
+        insert(id);
+        return id;
+      } catch (error) {
+        if (!isIdCollision(error, table)) throw error;
+      }
+    }
+    throw new Error(`Could not allocate a unique ${prefix} ID.`);
   }
 
   ensureSession(name = "default"): SessionRecord {
@@ -239,14 +252,15 @@ export class StateStore {
         .get(name) as { id: string; status: string } | undefined;
       const created = !row;
       if (!row) {
-        const id = this.nextId("s");
-        this.db
-          .prepare(
-            `INSERT INTO sessions
-              (id, name, status, created_at, updated_at)
-             VALUES (?, ?, 'active', ?, ?)`,
-          )
-          .run(id, name, timestamp, timestamp);
+        const id = this.insertWithRandomId("s", "sessions", (candidate) => {
+          this.db
+            .prepare(
+              `INSERT INTO sessions
+                (id, name, status, created_at, updated_at)
+               VALUES (?, ?, 'active', ?, ?)`,
+            )
+            .run(candidate, name, timestamp, timestamp);
+        });
         row = { id, status: "active" };
       } else if (row.status !== "active") {
         this.db
@@ -432,20 +446,22 @@ export class StateStore {
     target?: string;
     secretEnv?: string;
     credentialRef?: string;
+    passwordRef?: string;
     readOnly: boolean;
   }): ProfileRecord {
     const timestamp = this.now().toISOString();
     this.db
       .prepare(
         `INSERT INTO profiles
-          (name, target, secret_env, credential_ref, read_only, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          (name, target, secret_env, credential_ref, password_ref, read_only, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.name,
         input.target ?? null,
         input.secretEnv ?? null,
         input.credentialRef ?? null,
+        input.passwordRef ?? null,
         input.readOnly ? 1 : 0,
         timestamp,
         timestamp,
@@ -458,16 +474,18 @@ export class StateStore {
     target: string | null;
     secretEnv: string | null;
     credentialRef: string | null;
+    passwordRef: string | null;
     readOnly: boolean;
   }): ProfileRecord | undefined {
     const result = this.db.prepare(
       `UPDATE profiles
-       SET target = ?, secret_env = ?, credential_ref = ?, read_only = ?, updated_at = ?
+       SET target = ?, secret_env = ?, credential_ref = ?, password_ref = ?, read_only = ?, updated_at = ?
        WHERE name = ?`,
     ).run(
       input.target,
       input.secretEnv,
       input.credentialRef,
+      input.passwordRef,
       input.readOnly ? 1 : 0,
       this.now().toISOString(),
       input.name,
@@ -504,6 +522,7 @@ export class StateStore {
     source: string;
     secretEnv?: string;
     credentialRef?: string;
+    passwordRef?: string;
     readOnly: boolean;
   }): ConnectionRecord | undefined {
     this.db.exec("BEGIN IMMEDIATE");
@@ -520,27 +539,29 @@ export class StateStore {
         this.db.exec("COMMIT");
         return undefined;
       }
-      const id = this.nextId("conn");
       const timestamp = this.now().toISOString();
-      this.db
-        .prepare(
-          `INSERT INTO connections
-            (id, session_id, name, driver, database_name, source, secret_env,
-             credential_ref, read_only, version, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-        )
-        .run(
-          id,
-          input.sessionId,
-          input.name,
-          input.driver,
-          input.databaseName,
-          input.source,
-          input.secretEnv ?? null,
-          input.credentialRef ?? null,
-          input.readOnly ? 1 : 0,
-          timestamp,
-        );
+      const id = this.insertWithRandomId("conn", "connections", (candidate) => {
+        this.db
+          .prepare(
+            `INSERT INTO connections
+              (id, session_id, name, driver, database_name, source, secret_env,
+               credential_ref, password_ref, read_only, version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+          )
+          .run(
+            candidate,
+            input.sessionId,
+            input.name,
+            input.driver,
+            input.databaseName,
+            input.source,
+            input.secretEnv ?? null,
+            input.credentialRef ?? null,
+            input.passwordRef ?? null,
+            input.readOnly ? 1 : 0,
+            timestamp,
+          );
+      });
       this.allocateConnectionAlias(id);
       this.db
         .prepare(
@@ -640,33 +661,34 @@ export class StateStore {
     stateConfidence: StateConfidence;
     expiresAt: string;
   }): ResultRecord {
-    const id = this.nextId("q");
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db
-        .prepare(
-          `INSERT INTO results
-            (id, session_id, connection_id, fingerprint, sql, parameters,
-             rows_json, columns_json, row_count, state_version, state_signature,
-             state_confidence, expires_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          id,
-          input.sessionId,
-          input.connectionId,
-          input.fingerprint,
-          input.sql,
-          JSON.stringify(toJsonSafe(input.parameters)),
-          JSON.stringify(toJsonSafe(input.rows)),
-          JSON.stringify(input.columns),
-          input.rows.length,
-          input.stateVersion,
-          input.stateSignature,
-          input.stateConfidence,
-          input.expiresAt,
-          this.now().toISOString(),
-        );
+      const id = this.insertWithRandomId("q", "results", (candidate) => {
+        this.db
+          .prepare(
+            `INSERT INTO results
+              (id, session_id, connection_id, fingerprint, sql, parameters,
+               rows_json, columns_json, row_count, state_version, state_signature,
+               state_confidence, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            candidate,
+            input.sessionId,
+            input.connectionId,
+            input.fingerprint,
+            input.sql,
+            JSON.stringify(toJsonSafe(input.parameters)),
+            JSON.stringify(toJsonSafe(input.rows)),
+            JSON.stringify(input.columns),
+            input.rows.length,
+            input.stateVersion,
+            input.stateSignature,
+            input.stateConfidence,
+            input.expiresAt,
+            this.now().toISOString(),
+          );
+      });
       this.enforceResultQuota(id);
       this.allocateGeneratedAlias(input.sessionId, id);
       const result = this.getResult(id)!;
@@ -803,33 +825,34 @@ export class StateStore {
     stateVersionBefore: string;
     stateVersionAfter?: string;
   }): OperationRecord {
-    const id = this.nextId("op");
-    this.db
-      .prepare(
-        `INSERT INTO operations
-          (id, session_id, actor_id, connection_id, fingerprint, sql, parameters,
-           statement_type, affected_rows, status, transaction_id, replay_of,
-           idempotency_key, state_version_before, state_version_after, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.sessionId,
-        input.actorId,
-        input.connectionId,
-        input.fingerprint,
-        input.sql,
-        JSON.stringify(toJsonSafe(input.parameters)),
-        input.statementType,
-        input.affectedRows ?? null,
-        input.status,
-        input.transactionId ?? null,
-        input.replayOf ?? null,
-        input.idempotencyKey ?? null,
-        input.stateVersionBefore,
-        input.stateVersionAfter ?? null,
-        this.now().toISOString(),
-      );
+    const id = this.insertWithRandomId("op", "operations", (candidate) => {
+      this.db
+        .prepare(
+          `INSERT INTO operations
+            (id, session_id, actor_id, connection_id, fingerprint, sql, parameters,
+             statement_type, affected_rows, status, transaction_id, replay_of,
+             idempotency_key, state_version_before, state_version_after, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          candidate,
+          input.sessionId,
+          input.actorId,
+          input.connectionId,
+          input.fingerprint,
+          input.sql,
+          JSON.stringify(toJsonSafe(input.parameters)),
+          input.statementType,
+          input.affectedRows ?? null,
+          input.status,
+          input.transactionId ?? null,
+          input.replayOf ?? null,
+          input.idempotencyKey ?? null,
+          input.stateVersionBefore,
+          input.stateVersionAfter ?? null,
+          this.now().toISOString(),
+        );
+    });
     return this.getOperation(id)!;
   }
 
@@ -998,7 +1021,6 @@ export class StateStore {
     connectionId: string;
     isolation: string;
   }): TransactionRecord | undefined {
-    const id = this.nextId("tx");
     const timestamp = this.now().toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1022,22 +1044,24 @@ export class StateStore {
         this.db.exec("COMMIT");
         return undefined;
       }
-      this.db
-        .prepare(
-          `INSERT INTO transactions
-            (id, session_id, owner_actor_id, connection_id, state,
-             isolation_level, start_version, created_at)
-           VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
-        )
-        .run(
-          id,
-          input.sessionId,
-          input.actorId,
-          input.connectionId,
-          input.isolation,
-          `sv_${eligible.version}`,
-          timestamp,
-        );
+      const id = this.insertWithRandomId("tx", "transactions", (candidate) => {
+        this.db
+          .prepare(
+            `INSERT INTO transactions
+              (id, session_id, owner_actor_id, connection_id, state,
+               isolation_level, start_version, created_at)
+             VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+          )
+          .run(
+            candidate,
+            input.sessionId,
+            input.actorId,
+            input.connectionId,
+            input.isolation,
+            `sv_${eligible.version}`,
+            timestamp,
+          );
+      });
       this.db
         .prepare(
           `UPDATE sessions
@@ -1062,7 +1086,7 @@ export class StateStore {
   transactionOperations(transactionId: string): OperationRecord[] {
     return this.db
       .prepare(
-        "SELECT * FROM operations WHERE transaction_id = ? ORDER BY created_at",
+        "SELECT * FROM operations WHERE transaction_id = ? ORDER BY created_at, rowid",
       )
       .all(transactionId) as unknown as OperationRecord[];
   }
@@ -1322,31 +1346,32 @@ export class StateStore {
     allowDestructive: boolean;
     expiresAt: string;
   }): PlanRecord {
-    const id = this.nextId("p");
-    this.db
-      .prepare(
-        `INSERT INTO plans
-          (id, session_id, owner_actor_id, connection_id, sql, parameters,
-           statement_type, state_version, state_signature, destructive,
-           allow_unbounded, allow_destructive, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        input.sessionId,
-        input.ownerActorId,
-        input.connectionId,
-        input.sql,
-        JSON.stringify(toJsonSafe(input.parameters)),
-        input.statementType,
-        input.stateVersion,
-        input.stateSignature,
-        input.destructive ? 1 : 0,
-        input.allowUnbounded ? 1 : 0,
-        input.allowDestructive ? 1 : 0,
-        input.expiresAt,
-        this.now().toISOString(),
-      );
+    const id = this.insertWithRandomId("p", "plans", (candidate) => {
+      this.db
+        .prepare(
+          `INSERT INTO plans
+            (id, session_id, owner_actor_id, connection_id, sql, parameters,
+             statement_type, state_version, state_signature, destructive,
+             allow_unbounded, allow_destructive, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          candidate,
+          input.sessionId,
+          input.ownerActorId,
+          input.connectionId,
+          input.sql,
+          JSON.stringify(toJsonSafe(input.parameters)),
+          input.statementType,
+          input.stateVersion,
+          input.stateSignature,
+          input.destructive ? 1 : 0,
+          input.allowUnbounded ? 1 : 0,
+          input.allowDestructive ? 1 : 0,
+          input.expiresAt,
+          this.now().toISOString(),
+        );
+    });
     return this.getPlan(id)!;
   }
 
@@ -1463,31 +1488,34 @@ export class StateStore {
     errorCode?: string;
     id?: string;
   }): HistoryRecord {
-    const id = input.id ?? this.nextId("cmd");
-    this.db
-      .prepare(
-        `INSERT INTO history
-          (id, timestamp, session_id, actor_id, origin, category, internal, command, sql, target, handle,
-           executed, cached, success, error_code)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        id,
-        this.now().toISOString(),
-        input.sessionId,
-        input.actorId,
-        input.origin ?? "legacy",
-        input.category ?? "management",
-        input.internal ? 1 : 0,
-        input.command,
-        boundedHistorySql(input.sql),
-        input.target?.slice(0, 1024) ?? null,
-        input.handle ?? null,
-        input.executed ? 1 : 0,
-        input.cached ? 1 : 0,
-        input.success ? 1 : 0,
-        input.errorCode ?? null,
-      );
+    const insert = (id: string): void => {
+      this.db
+        .prepare(
+          `INSERT INTO history
+            (id, timestamp, session_id, actor_id, origin, category, internal, command, sql, target, handle,
+             executed, cached, success, error_code)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          this.now().toISOString(),
+          input.sessionId,
+          input.actorId,
+          input.origin ?? "legacy",
+          input.category ?? "management",
+          input.internal ? 1 : 0,
+          input.command,
+          boundedHistorySql(input.sql),
+          input.target?.slice(0, 1024) ?? null,
+          input.handle ?? null,
+          input.executed ? 1 : 0,
+          input.cached ? 1 : 0,
+          input.success ? 1 : 0,
+          input.errorCode ?? null,
+        );
+    };
+    const id = input.id ?? this.insertWithRandomId("cmd", "history", insert);
+    if (input.id !== undefined) insert(id);
     this.db
       .prepare(
         `DELETE FROM history
@@ -1792,8 +1820,21 @@ function outcomeJson(outcome: MongoWriteOutcome | undefined): string | null {
 }
 
 function randomBase32Alias(): string {
+  return randomBase32(10);
+}
+
+function randomBase32Id(): string {
+  return randomBase32(26);
+}
+
+function randomBase32(length: number): string {
   const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
-  return [...randomBytes(10)].map((value) => alphabet[value & 31]).join("");
+  return [...randomBytes(length)].map((value) => alphabet[value & 31]).join("");
+}
+
+function isIdCollision(error: unknown, table: string): boolean {
+  return error instanceof Error &&
+    error.message.includes(`UNIQUE constraint failed: ${table}.id`);
 }
 
 

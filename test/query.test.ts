@@ -31,7 +31,7 @@ test("durable handles, normalized cache reuse, parameters, and compact rows", as
       { params: ["a@example.com"] },
     ),
   );
-  assert.equal(first.result_id, "q_1");
+  assert.match(first.result_id, /^q_[a-z2-7]{26}$/);
   assert.equal(first.cached, false);
   assert.deepEqual(first.preview[0].note, {
     type: "text",
@@ -56,16 +56,16 @@ test("durable handles, normalized cache reuse, parameters, and compact rows", as
   );
   assert.notEqual(otherParameter.result_id, first.result_id);
 
-  const rows = await succeed(fixture.stateql.rows("q_1", { limit: 1 }));
+  const rows = await succeed(fixture.stateql.rows(first.result_id, { limit: 1 }));
   assert.equal(rows.returned, 1);
   assert.equal(rows.truncated, false);
-  assert.equal((await succeed(fixture.stateql.count("q_1"))).rows, 1);
+  assert.equal((await succeed(fixture.stateql.count(first.result_id))).rows, 1);
   assert.equal(
-    (await succeed(fixture.stateql.columns("q_1"))).columns.length,
+    (await succeed(fixture.stateql.columns(first.result_id))).columns.length,
     3,
   );
   assertFailure(
-    await fixture.stateql.rows("q_1", { limit: 1_001 }),
+    await fixture.stateql.rows(first.result_id, { limit: 1_001 }),
     "OUTPUT_LIMIT_EXCEEDED",
   );
 
@@ -263,7 +263,8 @@ test("filters materialized handles locally into durable derived results", async 
       params: ["%@example.com", 1],
     }),
   );
-  assert.equal(filtered.result_id, "q_2");
+  assert.match(filtered.result_id, /^q_[a-z2-7]{26}$/);
+  assert.notEqual(filtered.result_id, source.result_id);
   assert.equal(filtered.rows, 2);
   assert.deepEqual(
     filtered.preview.map((row: Record<string, unknown>) => row.id),

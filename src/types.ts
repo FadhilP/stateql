@@ -22,7 +22,7 @@ export type CredentialOperation =
   | "apply"
   | "transaction.commit";
 
-export type CredentialSource = "secret_env" | "credential_ref";
+export type CredentialSource = "secret_env" | "credential_ref" | "password_ref";
 
 interface CredentialRequestBase {
   reference: string;
@@ -51,6 +51,7 @@ interface CredentialRequestBase {
 export type CredentialRequest = CredentialRequestBase & (
   | { source?: "secret_env" }
   | { source: "credential_ref" }
+  | { source: "password_ref"; target: string }
 );
 
 export type CredentialResolver = (
@@ -371,18 +372,21 @@ export interface ConnectOptions extends ExecutionOptions {
   secretEnv?: string;
   profile?: string;
   credentialRef?: string;
+  passwordRef?: string;
 }
 
 export interface ProfileOptions {
   readOnly?: boolean;
   secretEnv?: string;
   credentialRef?: string;
+  passwordRef?: string;
 }
 
 export interface ProfileUpdateOptions {
   target?: string | null;
   secretEnv?: string | null;
   credentialRef?: string | null;
+  passwordRef?: string | null;
   readOnly?: boolean;
 }
 
@@ -475,6 +479,7 @@ export interface BatchCommand {
   read_only?: boolean;
   secret_env?: string;
   credential_ref?: string;
+  password_ref?: string | null;
   profile?: string;
   replay?: boolean;
   idempotency_key?: string;
@@ -525,6 +530,7 @@ export interface ProfileData {
   target: string | null;
   secret_env: string | null;
   credential_ref: string | null;
+  password_ref: string | null;
   read_only: boolean;
 }
 
