@@ -17,7 +17,12 @@ export type StatementType =
   | "create"
   | "alter"
   | "drop"
-  | "truncate";
+  | "truncate"
+  | "explain"
+  | "vacuum"
+  | "analyze"
+  | "reindex"
+  | "cluster";
 
 const SUPPORTED_STATEMENTS = new Set<StatementType>([
   "select",
@@ -39,93 +44,583 @@ export interface SqlAnalysis {
   unboundedMutation: boolean;
   destructive: boolean;
   ordered: boolean;
+  wrapForLimit: boolean;
+  cacheable: boolean;
+  requiresAutocommit: boolean;
 }
 
 export function analyzeSql(sql: string, driver: SqlDriver): SqlAnalysis;
 /** @internal Compatibility for existing connection records during Mongo rollout. */
 export function analyzeSql(sql: string, driver: Driver): SqlAnalysis;
 export function analyzeSql(sql: string, driver: Driver): SqlAnalysis {
-  if (driver === "mongodb") {
-    throw new StateQLError("INVALID_SQL", "SQL is not supported for MongoDB connections.");
+  if (driver === "mongodb" || driver === "redis") {
+    throw new StateQLError("INVALID_SQL", `SQL is not supported for ${driver} connections.`);
   }
   const trimmed = sql.trim();
   if (!trimmed) throw new StateQLError("INVALID_SQL", "SQL is empty.");
 
   try {
-    const database =
-      driver === "postgres"
-        ? "Postgresql"
-        : driver === "mysql"
-          ? "MySQL"
-          : "Sqlite";
-    const parserSql = driver === "postgres"
-      ? postgresParserSql(trimmed)
-      : trimmed;
-    const parsed = parser.astify(parserSql, { database });
-    if (Array.isArray(parsed)) {
-      if (parsed.length !== 1) {
-        throw new StateQLError(
-          "INVALID_SQL",
-          "Exactly one SQL statement is required.",
-        );
-      }
+    if (driver === "postgres") {
+      const postgresCommand = analyzePostgresCommand(trimmed);
+      if (postgresCommand) return postgresCommand;
     }
-    const ast = (Array.isArray(parsed) ? parsed[0] : parsed) as AST | undefined;
-    if (!ast) throw new StateQLError("INVALID_SQL", "SQL is empty.");
-
-    const rawType = String(ast.type);
-    if (!SUPPORTED_STATEMENTS.has(rawType as StatementType)) {
-      throw new StateQLError(
-        "INVALID_SQL",
-        `Unsupported SQL statement type "${rawType}".`,
-      );
-    }
-    const statementType = rawType as StatementType;
-    if (statementType === "select" && selectContainsWrite(ast)) {
-      throw new StateQLError(
-        "INVALID_SQL",
-        "Read statements cannot contain writes or SELECT INTO.",
-      );
-    }
-    const normalized = parserSql === trimmed
-      ? parser
-        .sqlify(ast, { database })
-        .replace(/;\s*$/, "")
-        .replace(/\s+/g, " ")
-        .trim()
-      // Keep the exact ordering modifiers in cache and idempotency fingerprints.
-      // The parser copy is analysis-only; adapters execute the original SQL.
-      : trimmed.replace(/;\s*$/, "");
-    const details = ast as unknown as Record<string, unknown>;
-    const read = statementType === "select";
-    const mutation =
-      statementType === "update" ||
-      statementType === "delete" ||
-      statementType === "truncate";
-    const destructive =
-      statementType === "drop" ||
-      statementType === "alter" ||
-      statementType === "delete" ||
-      statementType === "replace" ||
-      statementType === "truncate" ||
-      (driver === "sqlite" &&
-        /^(?:INSERT|UPDATE) OR REPLACE\b/i.test(normalized));
-
-    return {
-      ast,
-      normalized,
-      statementType,
-      read,
-      unboundedMutation:
-        statementType === "truncate" || (mutation && !details.where),
-      destructive,
-      ordered: read && Boolean(details.orderby),
-    };
+    return analyzeParsedSql(trimmed, driver);
   } catch (error) {
     if (error instanceof StateQLError) throw error;
     const message = error instanceof Error ? error.message : "Invalid SQL.";
     throw new StateQLError("INVALID_SQL", message);
   }
+}
+
+function analyzeParsedSql(sql: string, driver: Exclude<Driver, "mongodb" | "redis">): SqlAnalysis {
+  const database =
+    driver === "postgres"
+      ? "Postgresql"
+      : driver === "mysql"
+        ? "MySQL"
+        : "Sqlite";
+  const parserSql = driver === "postgres" ? postgresParserSql(sql) : sql;
+  const parsed = parser.astify(parserSql, { database });
+  if (Array.isArray(parsed) && parsed.length !== 1) {
+    throw new StateQLError(
+      "INVALID_SQL",
+      "Exactly one SQL statement is required.",
+    );
+  }
+  const ast = (Array.isArray(parsed) ? parsed[0] : parsed) as AST | undefined;
+  if (!ast) throw new StateQLError("INVALID_SQL", "SQL is empty.");
+
+  const rawType = String(ast.type);
+  if (!SUPPORTED_STATEMENTS.has(rawType as StatementType)) {
+    throw new StateQLError(
+      "INVALID_SQL",
+      `Unsupported SQL statement type "${rawType}".`,
+    );
+  }
+  const statementType = rawType as StatementType;
+  if (statementType === "select" && selectContainsWrite(ast)) {
+    throw new StateQLError(
+      "INVALID_SQL",
+      "Read statements cannot contain writes or SELECT INTO.",
+    );
+  }
+  const normalized = parserSql === sql
+    ? parser
+      .sqlify(ast, { database })
+      .replace(/;\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+    // Keep the exact ordering modifiers in cache and idempotency fingerprints.
+    // The parser copy is analysis-only; adapters execute the original SQL.
+    : sql.replace(/;\s*$/, "");
+  const details = ast as unknown as Record<string, unknown>;
+  const read = statementType === "select";
+  const mutation =
+    statementType === "update" ||
+    statementType === "delete" ||
+    statementType === "truncate";
+  const destructive =
+    statementType === "drop" ||
+    statementType === "alter" ||
+    statementType === "delete" ||
+    statementType === "replace" ||
+    statementType === "truncate" ||
+    (driver === "sqlite" &&
+      /^(?:INSERT|UPDATE) OR REPLACE\b/i.test(normalized));
+
+  return {
+    ast,
+    normalized,
+    statementType,
+    read,
+    unboundedMutation:
+      statementType === "truncate" || (mutation && !details.where),
+    destructive,
+    ordered: read && Boolean(details.orderby),
+    wrapForLimit: read,
+    cacheable: true,
+    requiresAutocommit: false,
+  };
+}
+
+const EXPLAIN_INNER_STATEMENTS = new Set<StatementType>([
+  "select",
+  "insert",
+  "update",
+  "delete",
+]);
+const EXPLAIN_BOOLEAN_OPTIONS = new Set([
+  "ANALYZE",
+  "VERBOSE",
+  "COSTS",
+  "SETTINGS",
+  "GENERIC_PLAN",
+  "BUFFERS",
+  "WAL",
+  "TIMING",
+  "SUMMARY",
+  "MEMORY",
+]);
+const EXPLAIN_FORMATS = new Set(["TEXT", "XML", "JSON", "YAML"]);
+const EXPLAIN_SERIALIZE = new Set(["NONE", "TEXT", "BINARY"]);
+const BOOLEAN_VALUES = new Set(["TRUE", "FALSE", "ON", "OFF"]);
+
+function analyzePostgresCommand(sql: string): SqlAnalysis | undefined {
+  const scanner = new PostgresPrefixScanner(sql);
+  const command = scanner.readWord();
+  if (!command) return undefined;
+  switch (command.value) {
+    case "EXPLAIN":
+      return analyzePostgresExplain(sql, scanner);
+    case "VACUUM":
+    case "ANALYZE":
+    case "REINDEX":
+    case "CLUSTER":
+      return analyzePostgresMaintenance(sql, command.value);
+    default:
+      return undefined;
+  }
+}
+
+function analyzePostgresExplain(
+  sql: string,
+  scanner: PostgresPrefixScanner,
+): SqlAnalysis {
+  let analyze = false;
+  const seen = new Set<string>();
+  if (scanner.consume("(")) {
+    while (true) {
+      const option = scanner.readWord();
+      if (!option || seen.has(option.value)) invalidPostgresSyntax("EXPLAIN");
+      seen.add(option.value);
+      const next = scanner.peek();
+      let value: string | undefined;
+      if (next !== "," && next !== ")") {
+        value = scanner.readWord()?.value;
+        if (!value) invalidPostgresSyntax("EXPLAIN");
+      }
+      validateExplainOption(option.value, value);
+      if (option.value === "ANALYZE") {
+        analyze = value === undefined || value === "TRUE" || value === "ON";
+      }
+      if (scanner.consume(")")) break;
+      if (!scanner.consume(",")) invalidPostgresSyntax("EXPLAIN");
+    }
+  } else {
+    while (true) {
+      const option = scanner.peekWord();
+      if (option !== "ANALYZE" && option !== "VERBOSE") break;
+      scanner.readWord();
+      if (seen.has(option)) invalidPostgresSyntax("EXPLAIN");
+      seen.add(option);
+      if (option === "ANALYZE") analyze = true;
+    }
+  }
+
+  const innerSql = sql.slice(scanner.triviaEnd());
+  if (!innerSql) invalidPostgresSyntax("EXPLAIN");
+  const inner = analyzeParsedSql(innerSql, "postgres");
+  if (!EXPLAIN_INNER_STATEMENTS.has(inner.statementType)) {
+    throw new StateQLError(
+      "INVALID_SQL",
+      `EXPLAIN does not support ${inner.statementType.toUpperCase()} statements.`,
+    );
+  }
+  if (analyze && inner.statementType !== "select") {
+    throw new StateQLError(
+      "INVALID_SQL",
+      "EXPLAIN ANALYZE accepts read-only SELECT statements only.",
+    );
+  }
+  return {
+    ast: inner.ast,
+    normalized: sql.replace(/;\s*$/, ""),
+    statementType: "explain",
+    read: true,
+    unboundedMutation: false,
+    destructive: false,
+    ordered: false,
+    wrapForLimit: false,
+    cacheable: false,
+    requiresAutocommit: false,
+  };
+}
+
+function validateExplainOption(option: string, value?: string): void {
+  if (EXPLAIN_BOOLEAN_OPTIONS.has(option)) {
+    if (value !== undefined && !BOOLEAN_VALUES.has(value)) invalidPostgresSyntax("EXPLAIN");
+    return;
+  }
+  if (option === "FORMAT" && value && EXPLAIN_FORMATS.has(value)) return;
+  if (option === "SERIALIZE" && value && EXPLAIN_SERIALIZE.has(value)) return;
+  invalidPostgresSyntax("EXPLAIN");
+}
+
+type UtilityToken = {
+  kind: "word" | "identifier" | "number" | "punctuation";
+  value: string;
+};
+
+type UtilityOptionKind = "boolean" | "number" | "identifier" | ReadonlySet<string>;
+type UtilityOptions = ReadonlyMap<string, UtilityOptionKind>;
+
+const VACUUM_OPTIONS: UtilityOptions = new Map<string, UtilityOptionKind>([
+  ["FULL", "boolean"],
+  ["FREEZE", "boolean"],
+  ["VERBOSE", "boolean"],
+  ["ANALYZE", "boolean"],
+  ["DISABLE_PAGE_SKIPPING", "boolean"],
+  ["SKIP_LOCKED", "boolean"],
+  ["INDEX_CLEANUP", new Set(["AUTO", "ON", "OFF"])],
+  ["PROCESS_MAIN", "boolean"],
+  ["PROCESS_TOAST", "boolean"],
+  ["TRUNCATE", "boolean"],
+  ["PARALLEL", "number"],
+  ["SKIP_DATABASE_STATS", "boolean"],
+  ["ONLY_DATABASE_STATS", "boolean"],
+]);
+const ANALYZE_OPTIONS: UtilityOptions = new Map<string, UtilityOptionKind>([
+  ["VERBOSE", "boolean"],
+  ["SKIP_LOCKED", "boolean"],
+]);
+const REINDEX_OPTIONS: UtilityOptions = new Map<string, UtilityOptionKind>([
+  ["VERBOSE", "boolean"],
+  ["TABLESPACE", "identifier"],
+]);
+const CLUSTER_OPTIONS: UtilityOptions = new Map<string, UtilityOptionKind>([
+  ["VERBOSE", "boolean"],
+]);
+
+function analyzePostgresMaintenance(
+  sql: string,
+  command: "VACUUM" | "ANALYZE" | "REINDEX" | "CLUSTER",
+): SqlAnalysis {
+  const parser = new UtilityParser(tokenizePostgresMaintenance(sql), command);
+  parser.expectWord(command);
+  switch (command) {
+    case "VACUUM":
+      parser.options(VACUUM_OPTIONS, ["FULL", "FREEZE", "VERBOSE", "ANALYZE"]);
+      parser.optionalTargets();
+      break;
+    case "ANALYZE":
+      parser.options(ANALYZE_OPTIONS, ["VERBOSE"]);
+      parser.optionalTargets();
+      break;
+    case "REINDEX": {
+      parser.options(REINDEX_OPTIONS);
+      const target = parser.expectOneOf([
+        "INDEX",
+        "TABLE",
+        "SCHEMA",
+        "DATABASE",
+        "SYSTEM",
+      ]);
+      if (target !== "SYSTEM") parser.consumeWord("CONCURRENTLY");
+      if (target === "INDEX" || target === "TABLE") {
+        parser.qualifiedIdentifier();
+      } else {
+        parser.identifier();
+      }
+      break;
+    }
+    case "CLUSTER":
+      parser.options(CLUSTER_OPTIONS, ["VERBOSE"]);
+      if (!parser.done()) {
+        parser.qualifiedIdentifier();
+        if (parser.consumeWord("USING")) parser.identifier();
+      }
+      break;
+  }
+  parser.expectDone();
+  return {
+    ast: { type: command.toLowerCase() } as unknown as AST,
+    normalized: sql.replace(/;\s*$/, ""),
+    statementType: command.toLowerCase() as StatementType,
+    read: false,
+    unboundedMutation: false,
+    destructive: true,
+    ordered: false,
+    wrapForLimit: false,
+    cacheable: false,
+    requiresAutocommit: true,
+  };
+}
+
+function tokenizePostgresMaintenance(sql: string): UtilityToken[] {
+  const scanner = new PostgresPrefixScanner(sql);
+  const tokens: UtilityToken[] = [];
+  while (scanner.triviaEnd() < sql.length) {
+    const character = sql[scanner.position]!;
+    if (character === ";") {
+      scanner.position += 1;
+      if (scanner.triviaEnd() !== sql.length) {
+        throw new StateQLError("INVALID_SQL", "Exactly one SQL statement is required.");
+      }
+      break;
+    }
+    const word = scanner.readWord(false);
+    if (word) {
+      tokens.push({ kind: "word", value: word.value });
+      continue;
+    }
+    if (character === '"') {
+      const end = postgresQuotedIdentifierEnd(sql, scanner.position);
+      if (end === undefined) invalidPostgresSyntax("maintenance");
+      tokens.push({ kind: "identifier", value: sql.slice(scanner.position, end) });
+      scanner.position = end;
+      continue;
+    }
+    if (/[0-9]/u.test(character)) {
+      const start = scanner.position;
+      scanner.position += 1;
+      while (/[0-9]/u.test(sql[scanner.position] ?? "")) scanner.position += 1;
+      tokens.push({ kind: "number", value: sql.slice(start, scanner.position) });
+      continue;
+    }
+    if (["(", ")", ",", "."].includes(character)) {
+      tokens.push({ kind: "punctuation", value: character });
+      scanner.position += 1;
+      continue;
+    }
+    invalidPostgresSyntax("maintenance");
+  }
+  return tokens;
+}
+
+class UtilityParser {
+  private index = 0;
+
+  constructor(
+    private readonly tokens: UtilityToken[],
+    private readonly command: string,
+  ) {}
+
+  done(): boolean {
+    return this.index >= this.tokens.length;
+  }
+
+  expectDone(): void {
+    if (!this.done()) invalidPostgresSyntax(this.command);
+  }
+
+  expectWord(word: string): void {
+    if (!this.consumeWord(word)) invalidPostgresSyntax(this.command);
+  }
+
+  consumeWord(word: string): boolean {
+    const token = this.tokens[this.index];
+    if (token?.kind !== "word" || token.value !== word) return false;
+    this.index += 1;
+    return true;
+  }
+
+  expectOneOf(words: string[]): string {
+    const token = this.tokens[this.index];
+    if (token?.kind !== "word" || !words.includes(token.value)) {
+      invalidPostgresSyntax(this.command);
+    }
+    this.index += 1;
+    return token.value;
+  }
+
+  options(options: UtilityOptions, legacy: string[] = []): Set<string> {
+    if (this.consumePunctuation("(")) {
+      const seen = new Set<string>();
+      while (true) {
+        const option = this.tokens[this.index];
+        if (option?.kind !== "word" || seen.has(option.value)) {
+          invalidPostgresSyntax(this.command);
+        }
+        const kind = options.get(option.value);
+        if (!kind) invalidPostgresSyntax(this.command);
+        seen.add(option.value);
+        this.index += 1;
+        const next = this.tokens[this.index];
+        if (next?.value !== "," && next?.value !== ")") {
+          this.optionValue(kind);
+        } else if (kind !== "boolean") {
+          invalidPostgresSyntax(this.command);
+        }
+        if (this.consumePunctuation(")")) return seen;
+        if (!this.consumePunctuation(",")) invalidPostgresSyntax(this.command);
+      }
+    }
+    const seen = new Set<string>();
+    while (true) {
+      const option = this.tokens[this.index];
+      if (option?.kind !== "word" || !legacy.includes(option.value)) return seen;
+      if (seen.has(option.value)) invalidPostgresSyntax(this.command);
+      seen.add(option.value);
+      this.index += 1;
+    }
+  }
+
+  optionalTargets(): void {
+    if (this.done()) return;
+    while (true) {
+      this.qualifiedIdentifier();
+      if (this.consumePunctuation("(")) {
+        this.identifier();
+        while (this.consumePunctuation(",")) this.identifier();
+        if (!this.consumePunctuation(")")) invalidPostgresSyntax(this.command);
+      }
+      if (!this.consumePunctuation(",")) return;
+    }
+  }
+
+  qualifiedIdentifier(): void {
+    this.identifier();
+    while (this.consumePunctuation(".")) this.identifier();
+  }
+
+  identifier(): void {
+    const token = this.tokens[this.index];
+    if (token?.kind !== "word" && token?.kind !== "identifier") {
+      invalidPostgresSyntax(this.command);
+    }
+    this.index += 1;
+  }
+
+  private optionValue(kind: UtilityOptionKind): void {
+    const token = this.tokens[this.index];
+    if (!token) invalidPostgresSyntax(this.command);
+    if (kind === "boolean") {
+      if (token.kind !== "word" || !BOOLEAN_VALUES.has(token.value)) {
+        invalidPostgresSyntax(this.command);
+      }
+    } else if (kind === "number") {
+      if (token.kind !== "number") invalidPostgresSyntax(this.command);
+    } else if (kind === "identifier") {
+      if (token.kind !== "word" && token.kind !== "identifier") {
+        invalidPostgresSyntax(this.command);
+      }
+    } else if (token.kind !== "word" || !kind.has(token.value)) {
+      invalidPostgresSyntax(this.command);
+    }
+    this.index += 1;
+  }
+
+  private consumePunctuation(value: string): boolean {
+    const token = this.tokens[this.index];
+    if (token?.kind !== "punctuation" || token.value !== value) return false;
+    this.index += 1;
+    return true;
+  }
+}
+
+class PostgresPrefixScanner {
+  position = 0;
+
+  constructor(private readonly sql: string) {}
+
+  triviaEnd(): number {
+    while (this.position < this.sql.length) {
+      if (/\s/u.test(this.sql[this.position]!)) {
+        this.position += 1;
+      } else if (this.sql.startsWith("--", this.position)) {
+        this.position = lineCommentEnd(this.sql, this.position + 2);
+      } else if (this.sql.startsWith("/*", this.position)) {
+        const end = postgresBlockCommentEnd(this.sql, this.position + 2);
+        if (end === undefined) {
+          throw new StateQLError("INVALID_SQL", "Unterminated SQL comment.");
+        }
+        this.position = end;
+      } else {
+        break;
+      }
+    }
+    return this.position;
+  }
+
+  readWord(skipTrivia = true): { value: string; start: number; end: number } | undefined {
+    if (skipTrivia) this.triviaEnd();
+    const start = this.position;
+    if (!identifierStart(this.sql[start])) return undefined;
+    this.position += 1;
+    while (identifierPart(this.sql[this.position])) this.position += 1;
+    return {
+      value: this.sql.slice(start, this.position).toUpperCase(),
+      start,
+      end: this.position,
+    };
+  }
+
+  peekWord(): string | undefined {
+    const position = this.position;
+    const value = this.readWord()?.value;
+    this.position = position;
+    return value;
+  }
+
+  peek(): string | undefined {
+    this.triviaEnd();
+    return this.sql[this.position];
+  }
+
+  consume(value: string): boolean {
+    this.triviaEnd();
+    if (!this.sql.startsWith(value, this.position)) return false;
+    this.position += value.length;
+    return true;
+  }
+}
+
+function invalidPostgresSyntax(command: string): never {
+  throw new StateQLError("INVALID_SQL", `Unsupported or invalid PostgreSQL ${command} syntax.`);
+}
+
+function postgresQuotedIdentifierEnd(
+  sql: string,
+  start: number,
+): number | undefined {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] !== '"') {
+      index += 1;
+    } else if (sql[index + 1] === '"') {
+      index += 2;
+    } else {
+      return index + 1;
+    }
+  }
+  return undefined;
+}
+
+function postgresQuotedStringScanEnd(sql: string, start: number): number {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] === "\\") {
+      index += 2;
+    } else if (sql[index] !== "'") {
+      index += 1;
+    } else if (sql[index + 1] === "'") {
+      index += 2;
+    } else {
+      return index + 1;
+    }
+  }
+  return index;
+}
+
+function postgresBlockCommentEnd(
+  sql: string,
+  start: number,
+): number | undefined {
+  let depth = 1;
+  let index = start;
+  while (index < sql.length) {
+    if (sql.startsWith("/*", index)) {
+      depth += 1;
+      index += 2;
+    } else if (sql.startsWith("*/", index)) {
+      depth -= 1;
+      index += 2;
+      if (depth === 0) return index;
+    } else {
+      index += 1;
+    }
+  }
+  return undefined;
 }
 
 function postgresParserSql(sql: string): string {
@@ -142,13 +637,26 @@ function postgresParserSql(sql: string): string {
       continue;
     }
     if (sql.startsWith("/*", index)) {
-      index = blockCommentEnd(sql, index + 2);
+      const end = postgresBlockCommentEnd(sql, index + 2);
+      if (end === undefined) {
+        throw new StateQLError("INVALID_SQL", "Unterminated SQL comment.");
+      }
+      index = end;
       continue;
     }
     const character = sql[index];
-    if (character === "'" || character === '"') {
+    if (character === "'") {
       previousWord = undefined;
-      index = quotedEnd(sql, index + 1, character);
+      index = postgresQuotedStringScanEnd(sql, index);
+      continue;
+    }
+    if (character === '"') {
+      previousWord = undefined;
+      const end = postgresQuotedIdentifierEnd(sql, index);
+      if (end === undefined) {
+        throw new StateQLError("INVALID_SQL", "Unterminated quoted SQL identifier.");
+      }
+      index = end;
       continue;
     }
     if (character === "$") {
@@ -156,7 +664,10 @@ function postgresParserSql(sql: string): string {
       if (delimiter) {
         previousWord = undefined;
         const end = sql.indexOf(delimiter, index + delimiter.length);
-        index = end < 0 ? sql.length : end + delimiter.length;
+        if (end < 0) {
+          throw new StateQLError("INVALID_SQL", "Unterminated dollar-quoted SQL value.");
+        }
+        index = end + delimiter.length;
         continue;
       }
     }
@@ -246,21 +757,6 @@ function blockCommentEnd(sql: string, start: number): number {
   return index;
 }
 
-function quotedEnd(sql: string, start: number, quote: string): number {
-  let index = start;
-  while (index < sql.length) {
-    if (sql[index] === "\\" && quote === "'") {
-      index += 2;
-    } else if (sql[index] !== quote) {
-      index += 1;
-    } else if (sql[index + 1] === quote) {
-      index += 2;
-    } else {
-      return index + 1;
-    }
-  }
-  return index;
-}
 
 function identifierStart(value: string | undefined): boolean {
   return value !== undefined && /[A-Za-z_\u0080-\uFFFF]/u.test(value);
@@ -271,19 +767,30 @@ function identifierPart(value: string | undefined): boolean {
 }
 
 function selectContainsWrite(ast: AST): boolean {
-  const details = ast as unknown as Record<string, unknown>;
-  const into = details.into as Record<string, unknown> | undefined;
-  if (into?.type === "into" || into?.expr) return true;
-
-  const withStatements = details.with;
-  if (!Array.isArray(withStatements)) return false;
-  return withStatements.some((entry: unknown) => {
-    if (!entry || typeof entry !== "object") return false;
-    const statement = (entry as Record<string, unknown>).stmt;
-    if (!statement || typeof statement !== "object") return false;
-    const wrapper = statement as Record<string, unknown>;
-    const child = (wrapper.ast ?? statement) as AST;
-    if (child.type !== "select") return true;
-    return selectContainsWrite(child);
-  });
+  const visited = new Set<object>();
+  const writeTypes = new Set([
+    "insert",
+    "replace",
+    "update",
+    "delete",
+    "create",
+    "alter",
+    "drop",
+    "truncate",
+  ]);
+  const visit = (value: unknown): boolean => {
+    if (!value || typeof value !== "object") return false;
+    if (visited.has(value)) return false;
+    visited.add(value);
+    if (Array.isArray(value)) return value.some(visit);
+    const details = value as Record<string, unknown>;
+    const type = typeof details.type === "string" ? details.type : undefined;
+    if (type && writeTypes.has(type)) return true;
+    if (type === "select") {
+      const into = details.into as Record<string, unknown> | undefined;
+      if (into?.type === "into" || into?.expr) return true;
+    }
+    return Object.values(details).some(visit);
+  };
+  return visit(ast);
 }

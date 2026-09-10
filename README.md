@@ -216,6 +216,37 @@ Use `--params JSON` for a JSON array or named parameters. Use
 `--params-file FILE` when JSON is awkward to quote; `--params-file -` reads
 JSON from standard input.
 
+### PostgreSQL diagnostics and maintenance
+
+Run PostgreSQL plans through `query`:
+
+```bash
+stql query "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM jobs WHERE id = 42"
+```
+
+Plain `EXPLAIN` may plan a structurally validated `SELECT`, `INSERT`, `UPDATE`,
+or `DELETE`. Because `EXPLAIN ANALYZE` executes its inner statement, StateQL
+accepts only a validated read-only `SELECT`; `SELECT INTO`, writing CTEs, and
+mutations are rejected. Diagnostics execute inside PostgreSQL `BEGIN READ ONLY`
+and are never reused from cache. `--cache require` therefore returns
+`CACHE_MISS` without executing the diagnostic.
+
+`VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER` are PostgreSQL maintenance writes:
+
+```bash
+stql exec "VACUUM (ANALYZE) public.jobs" --allow-destructive
+stql plan "REINDEX TABLE public.jobs" --allow-destructive
+```
+
+They require a read-write connection and `--allow-destructive`, reject StateQL
+parameters, and run as individually tracked autocommit operations. They cannot
+be staged in a StateQL transaction. A timeout or cancellation after dispatch is
+reported as `OUTCOME_UNKNOWN`; inspect database state before replaying it. Raw
+`BEGIN`, `COMMIT`, `ROLLBACK`, savepoint, and other transaction-control SQL
+remain unsupported—use `stql transaction` commands instead. See
+[`SQL_COMMAND_ROADMAP.md`](SQL_COMMAND_ROADMAP.md) for the exact implemented
+boundary and deferred command categories.
+
 ### Native MongoDB
 
 MongoDB commands use official Extended JSON (EJSON), so BSON values survive the

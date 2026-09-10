@@ -1009,6 +1009,13 @@ export class StateQL {
           "query accepts read statements only; use exec for writes.",
         );
       }
+      const cacheMode = options.cache ?? "auto";
+      if (!analysis.cacheable && cacheMode === "require") {
+        throw new StateQLError("CACHE_MISS", "This statement is not cacheable.", {
+          retryable: true,
+          suggestedAction: "Run with --cache auto or --cache bypass.",
+        });
+      }
       const parameters = options.params ?? [];
       const context = this.executionContext(options);
       const adapterSource = await this.resolveConnectionSource(
@@ -1036,8 +1043,8 @@ export class StateQL {
           stateVersion,
         });
         const cached = this.store.findResult(fingerprint);
-        const cacheMode = options.cache ?? "auto";
         if (
+          analysis.cacheable &&
           cacheMode !== "bypass" &&
           cached &&
           cached.row_count <= this.maxResultRows &&
@@ -1060,7 +1067,9 @@ export class StateQL {
         }
 
         const result = await adapter.read(
-          boundedReadSql(sql, this.maxResultRows + 1),
+          analysis.wrapForLimit
+            ? boundedReadSql(sql, this.maxResultRows + 1)
+            : sql,
           parameters,
         );
         if (result.rows.length > this.maxResultRows) {
@@ -2901,12 +2910,28 @@ export class StateQL {
       );
     }
     const parameters = options.params ?? [];
+    if (
+      analysis.requiresAutocommit &&
+      (options.expectedRows !== undefined || sqlParametersLength(parameters) > 0)
+    ) {
+      throw new StateQLError(
+        "INVALID_SQL",
+        "PostgreSQL maintenance statements do not accept StateQL parameters or row-count preconditions.",
+      );
+    }
+    const transactionId = session.active_transaction_id ?? undefined;
+    if (analysis.requiresAutocommit && transactionId) {
+      throw new StateQLError(
+        "TRANSACTION_FAILED",
+        `${analysis.statementType.toUpperCase()} cannot be staged in a transaction.`,
+        { suggestedAction: "Rollback or commit the staged transaction, then run the maintenance statement separately." },
+      );
+    }
     const fingerprint = hash({
       sql: analysis.normalized,
       parameters,
       database: databaseIdentity(connection),
     });
-    const transactionId = session.active_transaction_id ?? undefined;
     if (transactionId) {
       const transaction = this.store.getTransaction(transactionId);
       if (
@@ -3048,7 +3073,15 @@ export class StateQL {
     }
 
     try {
-      const write = await adapter.write(sql, parameters, options.expectedRows);
+      if (analysis.requiresAutocommit && !adapter.writeAutocommit) {
+        throw new AdapterWriteError(
+          `${analysis.statementType.toUpperCase()} requires PostgreSQL autocommit execution.`,
+          false,
+        );
+      }
+      const write = analysis.requiresAutocommit
+        ? await adapter.writeAutocommit!(sql, parameters)
+        : await adapter.write(sql, parameters, options.expectedRows);
       try {
         const finalized = planClaim
           ? this.store.finishPlannedOperation({
@@ -4097,6 +4130,12 @@ function markTransactionOutcomeUnknown(
   } catch {
     // A stale committing transaction is recovered as unknown after five minutes.
   }
+}
+
+function sqlParametersLength(parameters: SqlParameters): number {
+  return Array.isArray(parameters)
+    ? parameters.length
+    : Object.keys(parameters).length;
 }
 
 function boundedReadSql(sql: string, limit: number): string {

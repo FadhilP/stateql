@@ -68,6 +68,7 @@ export interface Adapter {
   ping(): Promise<void>;
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
   write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult>;
+  writeAutocommit?(sql: string, params: SqlParameters): Promise<WriteResult>;
   writeBatch(
     operations: BatchWriteOperation[],
     isolation: string,
@@ -332,6 +333,13 @@ export function normalizePostgresConnectionString(source: string): string {
   }
 }
 
+const POSTGRES_AUTOCOMMIT_STATEMENTS = new Set([
+  "vacuum",
+  "analyze",
+  "reindex",
+  "cluster",
+]);
+
 class PostgresAdapter implements Adapter {
   readonly confidence = "ttl_based" as const;
   private readonly client: Client;
@@ -410,11 +418,39 @@ class PostgresAdapter implements Adapter {
     }
   }
 
+  async writeAutocommit(sql: string, params: SqlParameters): Promise<WriteResult> {
+    if (this.readOnly) throw new Error("Connection is read-only.");
+    let values: unknown[];
+    try {
+      values = postgresParams(params);
+      await this.connect();
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), false);
+    }
+    try {
+      const result = await this.query(sql, values, true, false);
+      return { affectedRows: result.rowCount ?? 0 };
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), true);
+    }
+  }
+
   async writeBatch(
     operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]> {
     if (this.readOnly) throw new Error("Connection is read-only.");
+    const unsupported = operations.find((operation) =>
+      POSTGRES_AUTOCOMMIT_STATEMENTS.has(operation.statement_type)
+    );
+    if (unsupported) {
+      throw new BatchWriteError(
+        `PostgreSQL transactions cannot include ${unsupported.statement_type.toUpperCase()} maintenance statements.`,
+        false,
+      );
+    }
     await this.connect();
     const level = isolation.toUpperCase();
     if (!POSTGRES_ISOLATION_LEVELS.has(level)) {
@@ -653,8 +689,9 @@ class PostgresAdapter implements Adapter {
     sql: string,
     params: unknown[],
     outcomeUnknown: boolean,
+    preDispatchOutcomeUnknown = outcomeUnknown,
   ): Promise<QueryResult> {
-    throwIfStopped(this.context, outcomeUnknown);
+    throwIfStopped(this.context, preDispatchOutcomeUnknown);
     try {
       return await withContext(
         this.client.query(sql, params),
