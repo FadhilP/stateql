@@ -144,6 +144,7 @@ import type {
   StateConfidence,
   StateQLActorOptions,
   StateQLOptions,
+  StateQLWorkspaceOptions,
   StateQLSnapshot,
   StateQLSnapshotOptions,
   StatusData,
@@ -166,6 +167,11 @@ import {
 const DEFAULT_SNAPSHOT_HISTORY_LIMIT = 50;
 const MAX_SNAPSHOT_HISTORY_LIMIT = 100;
 const DEFAULT_CREDENTIAL_RESOLUTION_TIMEOUT_MS = 120_000;
+const WORKSPACE_BOOTSTRAP = Symbol("StateQL.workspaceBootstrap");
+
+type StateQLInternalOptions = StateQLOptions & {
+  [WORKSPACE_BOOTSTRAP]?: true;
+};
 
 interface ActionResult<T> {
   data: T;
@@ -196,6 +202,22 @@ export class StateQL {
     } finally {
       store.close();
     }
+  }
+
+  /** Opens one actor in a named shared workspace for a trusted library host. */
+  static forWorkspace(options: StateQLWorkspaceOptions): StateQL {
+    if (!options.workspace.trim()) {
+      throw new StateQLError("INVALID_COMMAND", "Workspace name is required.");
+    }
+    if (!options.actor.trim()) {
+      throw new StateQLError("INVALID_COMMAND", "Actor ID is required.");
+    }
+    const { workspace, ...actorOptions } = options;
+    return new StateQL({
+      ...actorOptions,
+      session: workspace,
+      [WORKSPACE_BOOTSTRAP]: true,
+    } as StateQLInternalOptions);
   }
 
   private readonly store: StateStore;
@@ -273,11 +295,15 @@ export class StateQL {
       maxStateBytes,
     );
     try {
-      store.bootstrapSession(
-        this.sessionName,
-        this.actorId,
-        options.actor === undefined,
-      );
+      if ((options as StateQLInternalOptions)[WORKSPACE_BOOTSTRAP]) {
+        store.bootstrapWorkspace(this.sessionName, this.actorId);
+      } else {
+        store.bootstrapSession(
+          this.sessionName,
+          this.actorId,
+          options.actor === undefined,
+        );
+      }
     } catch (error) {
       store.close();
       throw error;

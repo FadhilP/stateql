@@ -479,16 +479,40 @@ context as `options.executionContext` for all commands in that batch.
 
 ### Actor workspaces
 
-`StateQL.forActor(...)` resolves the actor's attached session directly from
-StateQL storage, avoiding a duplicate actor-to-session mapping in integrations.
-On first use, it creates a legacy-compatible session named after the actor. Use
-`new StateQL({ session, actor })` when the session is already known.
+`StateQL.forWorkspace(...)` is a trusted-host primitive that atomically creates
+or reopens a durable workspace, attaches the requested actor, and returns a
+client bound to that actor:
 
-Membership is managed only through the library API, not batch commands:
-`linkActor(session, actorId)`, `unlinkActor(session, actorId)`,
-`listActors(session)`, and `resolveActor(actorId)`. An existing member must link
-an actor before that actor opens an existing workspace. Integrations should ask
-for user confirmation before changing membership or the shared connection.
+```ts
+const stateql = StateQL.forWorkspace({
+  home: "./.stql",
+  workspace: "pylon-global",
+  actor: "pylon-session:abc123",
+  credentialResolver,
+  signal,
+});
+```
+
+Repeated opens of the same actor and workspace are idempotent. An actor already
+attached elsewhere fails with a `StateQLError` whose code is
+`PERMISSION_DENIED`; StateQL never moves or merges it. All actor options,
+including limits, credential resolution, cancellation, `home`, and `now`, are
+preserved. The workspace name also reserves a same-named actor identity for
+legacy compatibility, so workspace and actor identifiers must be globally
+collision-free. The returned client is still bound only to `actor`, preserving
+plan, transaction, operation, and history ownership.
+
+`StateQL.forActor(...)` retains its existing behavior: it resolves the actor's
+attached session directly from StateQL storage and creates a legacy-compatible
+session named after the actor on first use. Use `new StateQL({ session, actor })`
+when the session and membership are already known.
+
+Membership management and `forWorkspace` are library-only host capabilities,
+not batch or CLI commands. Existing member-authorized management remains
+available through `linkActor(session, actorId)`, `unlinkActor(session, actorId)`,
+`listActors(session)`, and `resolveActor(actorId)`. Integrations should ask for
+user confirmation before changing membership or the shared connection; a host
+calling `forWorkspace` is responsible for authorizing that workspace access.
 
 ### Harness credential resolution
 

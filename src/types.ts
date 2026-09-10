@@ -338,6 +338,11 @@ export type StateQLActorOptions = Omit<StateQLOptions, "session" | "actor"> & {
   actor: string;
 };
 
+/** Trusted-host options for opening one actor in a named shared workspace. */
+export type StateQLWorkspaceOptions = StateQLActorOptions & {
+  workspace: string;
+};
+
 export interface QueryOptions extends ExecutionOptions {
   params?: SqlParameters;
   cache?: "auto" | "bypass" | "require";

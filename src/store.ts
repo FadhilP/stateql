@@ -295,6 +295,64 @@ export class StateStore {
     }
   }
 
+  bootstrapWorkspace(name: string, actorId: string): SessionRecord {
+    const timestamp = this.now().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      let row = this.db
+        .prepare("SELECT id, status FROM sessions WHERE name = ? LIMIT 1")
+        .get(name) as { id: string; status: string } | undefined;
+      const identities = actorId === name ? [actorId] : [name, actorId];
+      for (const identity of identities) {
+        const existing = this.resolveActor(identity);
+        if (existing && existing.id !== row?.id) {
+          throw new StateQLError(
+            "PERMISSION_DENIED",
+            `Actor "${identity}" is already attached to workspace "${existing.name}" and cannot be attached to workspace "${name}".`,
+          );
+        }
+      }
+
+      if (!row) {
+        const id = this.insertWithRandomId("s", "sessions", (candidate) => {
+          this.db
+            .prepare(
+              `INSERT INTO sessions
+                (id, name, status, created_at, updated_at)
+               VALUES (?, ?, 'active', ?, ?)`,
+            )
+            .run(candidate, name, timestamp, timestamp);
+        });
+        row = { id, status: "active" };
+      } else if (row.status !== "active") {
+        this.db
+          .prepare(
+            `UPDATE sessions
+             SET status = 'active', updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(timestamp, row.id);
+      }
+
+      for (const identity of identities) {
+        if (this.isSessionMember(row.id, identity)) continue;
+        this.db
+          .prepare(
+            `INSERT INTO session_members(session_id, actor_id, attached_at)
+             VALUES (?, ?, ?)`,
+          )
+          .run(row.id, identity, timestamp);
+      }
+      const session = this.getSessionByName(name);
+      if (!session) throw new Error(`Could not open workspace "${name}".`);
+      this.db.exec("COMMIT");
+      return session;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   createSession(name: string): SessionRecord {
     return this.bootstrapSession(name, name, true);
   }

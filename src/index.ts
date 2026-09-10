@@ -92,6 +92,7 @@ export type {
   StateConfidence,
   StateQLSnapshot,
   StateQLSnapshotOptions,
+  StateQLWorkspaceOptions,
   StatusConnectionData,
   StatusData,
   Success,

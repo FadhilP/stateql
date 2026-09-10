@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
   StateQL,
+  StateQLError,
   type HistoryEntry,
   type StateQLSnapshot,
 } from "../src/index.js";
@@ -710,6 +711,104 @@ test("actor-first opening resolves linked workspaces and bootstraps first use", 
   assert.equal(resolved.session.name, "actor-c");
   firstUse.close();
   owner.close();
+});
+
+test("trusted workspace opening is actor-bound, shared, and idempotent", async () => {
+  const root = createTemporaryDirectory();
+  const home = join(root, "state");
+  const database = join(root, "global.sqlite");
+  const user = StateQL.forWorkspace({
+    home,
+    workspace: "global",
+    actor: "pylon-user",
+  });
+  await succeed(user.connect(database, { readOnly: false }));
+  await succeed(user.exec("CREATE TABLE shared_rows (value TEXT)"));
+  await succeed(user.exec("INSERT INTO shared_rows (value) VALUES ('user')"));
+  const result = await succeed(user.query("SELECT * FROM shared_rows"));
+
+  const sessionActor = StateQL.forWorkspace({
+    home,
+    workspace: "global",
+    actor: "pi-session-1",
+    maxResultRows: 1,
+  });
+  assert.equal(sessionActor.snapshot().session.name, "global");
+  assert.equal(sessionActor.snapshot().actor_id, "pi-session-1");
+  assert.equal(
+    (await succeed(sessionActor.show(String(result.result_id)))).result_id,
+    result.result_id,
+  );
+  const operation = await succeed(
+    sessionActor.exec("INSERT INTO shared_rows (value) VALUES ('session')"),
+  );
+  assert.equal(operation.actor_id, "pi-session-1");
+  assertFailure(
+    await sessionActor.query("SELECT * FROM shared_rows", { cache: "bypass" }),
+    "OUTPUT_LIMIT_EXCEEDED",
+  );
+
+  const plan = await succeed(
+    sessionActor.plan("INSERT INTO shared_rows (value) VALUES ('planned')"),
+  );
+  assertFailure(await user.apply(String(plan.plan_id)), "PERMISSION_DENIED");
+  const history = await succeed(user.history(50));
+  assert.ok(
+    history.history.some(
+      (entry: HistoryEntry) =>
+        entry.actor_id === "pi-session-1" && entry.command === "exec",
+    ),
+  );
+  const actors = await succeed(user.listActors("global"));
+  assert.deepEqual(
+    actors.actors.map((actor: { actor_id: string }) => actor.actor_id).sort(),
+    ["global", "pi-session-1", "pylon-user"],
+  );
+
+  sessionActor.close();
+  const reopened = StateQL.forWorkspace({
+    home,
+    workspace: "global",
+    actor: "pi-session-1",
+  });
+  assert.equal(reopened.snapshot().actor_id, "pi-session-1");
+  reopened.close();
+
+  const resolved = StateQL.forActor({ home, actor: "pi-session-1" });
+  assert.equal(resolved.snapshot().session.name, "global");
+  assert.equal(resolved.snapshot().actor_id, "pi-session-1");
+  resolved.close();
+  user.close();
+});
+
+test("trusted workspace opening rejects actor reassignment atomically", () => {
+  const home = join(createTemporaryDirectory(), "state");
+  const original = StateQL.forWorkspace({
+    home,
+    workspace: "workspace-a",
+    actor: "shared-actor",
+  });
+
+  assert.throws(
+    () =>
+      StateQL.forWorkspace({
+        home,
+        workspace: "workspace-b",
+        actor: "shared-actor",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof StateQLError);
+      assert.equal(error.details.code, "PERMISSION_DENIED");
+      assert.match(error.message, /already attached to workspace "workspace-a"/);
+      return true;
+    },
+  );
+
+  const store = new StateStore(home, () => new Date());
+  assert.equal(store.getSessionByName("workspace-b"), undefined);
+  assert.equal(store.resolveActor("shared-actor")?.name, "workspace-a");
+  store.close();
+  original.close();
 });
 
 test("actors share workspace handles, aliases, history, and restarts", async () => {
