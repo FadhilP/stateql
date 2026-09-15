@@ -292,6 +292,90 @@ test("SQL analysis rejects multi-statement and hidden-write forms and classifies
   );
 });
 
+test("dialect upserts are explicit, bounded by source, and reject hidden writes", () => {
+  for (const sql of [
+    "INSERT INTO items (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+    "INSERT INTO items (id, value) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+  ]) {
+    const analysis = analyzeSql(sql, "postgres");
+    assert.equal(analysis.statementType, "upsert");
+    assert.equal(analysis.unboundedMutation, false);
+    assert.equal(analysis.destructive, false);
+  }
+  for (const sql of [
+    "INSERT INTO items (id, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    "INSERT INTO items (id, value) VALUES (?, ?), (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    "INSERT INTO items SET id = 1 ON DUPLICATE KEY UPDATE id = 1",
+    "INSERT INTO items SET id = ?, value = ? ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    "INSERT INTO items SET id = (SELECT id FROM source_items LIMIT 1) ON DUPLICATE KEY UPDATE id = VALUES(id)",
+  ]) {
+    const analysis = analyzeSql(sql, "mysql");
+    assert.equal(analysis.statementType, "upsert");
+    assert.equal(analysis.unboundedMutation, false);
+    assert.equal(analysis.destructive, false);
+  }
+
+  assert.equal(
+    analyzeSql(
+      "INSERT INTO items (id, value) SELECT id, value FROM source_items ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+      "postgres",
+    ).unboundedMutation,
+    true,
+  );
+  assert.equal(
+    analyzeSql(
+      "INSERT INTO items (id, value) SELECT id, value FROM source_items ON DUPLICATE KEY UPDATE value = VALUES(value)",
+      "mysql",
+    ).unboundedMutation,
+    true,
+  );
+  assert.equal(
+    analyzeSql("INSERT IGNORE INTO items (id) VALUES (?)", "mysql").statementType,
+    "insert",
+  );
+  assert.equal(
+    analyzeSql(
+      "EXPLAIN INSERT INTO items (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      "postgres",
+    ).statementType,
+    "explain",
+  );
+
+  for (const [sql, driver] of [
+    [
+      "INSERT INTO items SET id = (SELECT id INTO OUTFILE '/not-executed' FROM source_items) ON DUPLICATE KEY UPDATE id = VALUES(id)",
+      "mysql",
+    ],
+    [
+      "INSERT INTO items SET id = 1 ON DUPLICATE KEY UPDATE id = 1; DELETE FROM items",
+      "mysql",
+    ],
+    [
+      "INSERT INTO items (id) WITH changed AS (UPDATE source_items SET id = 1 RETURNING id) SELECT id FROM changed ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      "postgres",
+    ],
+    [
+      "EXPLAIN ANALYZE INSERT INTO items (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      "postgres",
+    ],
+    [
+      "INSERT INTO items (id) VALUES (?) ON CONFLICT (id) DO UPDATE SET id = excluded.id",
+      "sqlite",
+    ],
+    [
+      "MERGE INTO items USING source_items ON items.id = source_items.id WHEN MATCHED THEN UPDATE SET value = source_items.value",
+      "postgres",
+    ],
+  ] as const) {
+    assert.throws(
+      () => analyzeSql(sql, driver),
+      (error: unknown) =>
+        error instanceof StateQLError && error.details.code === "INVALID_SQL",
+      sql,
+    );
+  }
+});
+
 test("idempotency conflicts are rejected while the first write is pending", async () => {
   const fixture = await createFixture();
   await succeed(fixture.stateql.exec("CREATE TABLE keyed_rows (value TEXT)"));

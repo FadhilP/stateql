@@ -1017,6 +1017,12 @@ export class StateQL {
         });
       }
       const parameters = options.params ?? [];
+      if (analysis.requiresAutocommit && sqlParametersLength(parameters) > 0) {
+        throw new StateQLError(
+          "INVALID_SQL",
+          "Autocommit diagnostic statements do not accept StateQL parameters.",
+        );
+      }
       const context = this.executionContext(options);
       const adapterSource = await this.resolveConnectionSource(
         connection,
@@ -1066,12 +1072,18 @@ export class StateQL {
           });
         }
 
-        const result = await adapter.read(
-          analysis.wrapForLimit
-            ? boundedReadSql(sql, this.maxResultRows + 1)
-            : sql,
-          parameters,
-        );
+        const executionSql = analysis.wrapForLimit
+          ? boundedReadSql(analysis.limitSql ?? sql, this.maxResultRows + 1)
+          : sql;
+        if (analysis.requiresAutocommit && !adapter.readAutocommit) {
+          throw new StateQLError(
+            "UNSUPPORTED_DRIVER",
+            `${analysis.statementType.toUpperCase()} requires adapter autocommit reads.`,
+          );
+        }
+        const result = analysis.requiresAutocommit
+          ? await adapter.readAutocommit!(executionSql, parameters)
+          : await adapter.read(executionSql, parameters);
         if (result.rows.length > this.maxResultRows) {
           throw new StateQLError(
             "OUTPUT_LIMIT_EXCEEDED",
@@ -2916,7 +2928,7 @@ export class StateQL {
     ) {
       throw new StateQLError(
         "INVALID_SQL",
-        "PostgreSQL maintenance statements do not accept StateQL parameters or row-count preconditions.",
+        "Autocommit maintenance statements do not accept StateQL parameters or row-count preconditions.",
       );
     }
     const transactionId = session.active_transaction_id ?? undefined;
@@ -3075,7 +3087,7 @@ export class StateQL {
     try {
       if (analysis.requiresAutocommit && !adapter.writeAutocommit) {
         throw new AdapterWriteError(
-          `${analysis.statementType.toUpperCase()} requires PostgreSQL autocommit execution.`,
+          `${analysis.statementType.toUpperCase()} requires adapter autocommit execution.`,
           false,
         );
       }

@@ -38,11 +38,15 @@ jobs:
           ./node_modules/.bin/stql --help
 
   postgres:
-    name: PostgreSQL integration
+    name: PostgreSQL ${{ matrix.postgres }} integration
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [14, 15, 16, 17, 18]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: stql_ci
           POSTGRES_PASSWORD: stql_ci_password

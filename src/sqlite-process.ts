@@ -8,7 +8,7 @@ interface Request {
   id: number;
   source: string;
   readOnly: boolean;
-  operation: "read" | "write" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject";
+  operation: "read" | "write" | "writeAutocommit" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject";
   args: unknown[];
   busyTimeoutMs: number;
 }
@@ -99,6 +99,25 @@ function execute(request: Request): unknown {
           if (rollbackError instanceof SQLiteBatchError) throw rollbackError;
           throw new SQLiteBatchError(errorText(error), true);
         }
+      }
+    }
+    case "writeAutocommit": {
+      if (readOnly) throw new SQLiteBatchError("Connection is read-only.", false);
+      const [sql, params] = request.args as [string, SqlParameters];
+      if (
+        (Array.isArray(params) && params.length > 0) ||
+        (!Array.isArray(params) && Object.keys(params).length > 0)
+      ) {
+        throw new SQLiteBatchError(
+          "SQLite maintenance statements do not accept parameters.",
+          false,
+        );
+      }
+      try {
+        database.exec(sql);
+        return { affectedRows: 0 };
+      } catch (error) {
+        throw new SQLiteBatchError(errorText(error), true);
       }
     }
     case "writeBatch": {

@@ -17,6 +17,7 @@ import { analyzeSql } from "../src/sql.js";
 import { StateQL } from "../src/stateql.js";
 import {
   assertFailure,
+  assertOutcomeUnknown,
   createTemporaryDirectory,
   succeed,
 } from "./helpers.js";
@@ -117,6 +118,37 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     assert.equal(analysis.wrapForLimit, false);
   }
   for (const sql of [
+    "EXPLAIN (ANALYZE FALSE, VERBOSE, COSTS, SETTINGS, GENERIC_PLAN OFF, BUFFERS, WAL, TIMING, SUMMARY, MEMORY, FORMAT YAML, SERIALIZE TEXT) SELECT 1",
+    "EXPLAIN ANALYZE SELECT 1 UNION SELECT 2",
+    "/* outer /* nested */ still */ EXPLAIN SELECT '$tag$;not a terminator$tag$'",
+  ]) {
+    assert.equal(analyzeSql(sql, "postgres").statementType, "explain");
+  }
+  for (const sql of [
+    "SHOW server_version",
+    "SHOW server_version_num",
+    "SHOW transaction_read_only",
+    "SHOW transaction_isolation",
+    "SHOW default_transaction_isolation",
+  ]) {
+    const analysis = analyzeSql(sql, "postgres");
+    assert.equal(analysis.statementType, "show");
+    assert.equal(analysis.read, true);
+    assert.equal(analysis.wrapForLimit, false);
+    assert.equal(analysis.cacheable, false);
+  }
+  for (const sql of [
+    "VALUES (1), (2)",
+    "/* lead */ VALUES ($1), ($2); -- trailing",
+    "VALUES ('$tag$;not a terminator$tag$')",
+  ]) {
+    const analysis = analyzeSql(sql, "postgres");
+    assert.equal(analysis.statementType, "values");
+    assert.equal(analysis.read, true);
+    assert.equal(analysis.wrapForLimit, true);
+    assert.equal(analysis.cacheable, false);
+  }
+  for (const sql of [
     "VACUUM",
     "/* lead */ VACUUM \"items;archive\"; -- trailing",
     "VACUUM (ANALYZE, SKIP_LOCKED TRUE) public.items(id)",
@@ -125,6 +157,15 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     "REINDEX (TABLESPACE fastspace) INDEX public.items_idx",
     "REINDEX TABLE CONCURRENTLY public.items",
     "REINDEX DATABASE CONCURRENTLY app",
+    "VACUUM (BUFFER_USAGE_LIMIT 256, PROCESS_MAIN 0) ONLY public.items * (id)",
+    "VACUUM (BUFFER_USAGE_LIMIT '256 MB', PROCESS_TOAST 1) public.items",
+    "ANALYZE (BUFFER_USAGE_LIMIT '128kB') ONLY public.items * (id)",
+    "ANALYZE (BUFFER_USAGE_LIMIT 0) public.items",
+    "REINDEX (CONCURRENTLY, VERBOSE 0) TABLE public.items",
+    "REINDEX SYSTEM CONCURRENTLY app",
+    "REINDEX (CONCURRENTLY) SYSTEM app",
+    "REINDEX DATABASE",
+    "REINDEX SYSTEM CONCURRENTLY",
     "CLUSTER (VERBOSE) public.items USING items_id_idx",
   ]) {
     const analysis = analyzeSql(sql, "postgres");
@@ -147,13 +188,27 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     "VACUUM /* outer /* inner */",
     "VACUUM \"items\" trailing",
     "REINDEX items",
-    "REINDEX SYSTEM CONCURRENTLY app",
-    "REINDEX (CONCURRENTLY) SYSTEM app",
-    "REINDEX (CONCURRENTLY) TABLE public.items",
-    "REINDEX (VERBOSE, CONCURRENTLY) TABLE public.items",
+    "VACUUM (BUFFER_USAGE_LIMIT) items",
+    "VACUUM (BUFFER_USAGE_LIMIT '256 XB') items",
+    "VACUUM (BUFFER_USAGE_LIMIT '256 MB''; DROP TABLE items') items",
+    "ANALYZE (BUFFER_USAGE_LIMIT 1.5) items",
+    "VACUUM (BUFFER_USAGE_LIMIT 127) items",
+    "ANALYZE (BUFFER_USAGE_LIMIT '17 GB') items",
+    "VACUUM ONLY",
+    "VACUUM items. *",
+    "REINDEX (CONCURRENTLY) TABLE CONCURRENTLY public.items",
     "REINDEX DATABASE app.extra",
     "REINDEX SCHEMA public.extra",
     "CLUSTER public.items USING public.items_idx",
+    "SHOW ALL",
+    "SHOW ssl_passphrase_command",
+    "SHOW server.version",
+    "SHOW server_version; SELECT 1",
+    "VALUES (1); DELETE FROM items",
+    "VALUES ((SELECT value FROM changed)), (2); UPDATE items SET value = 1",
+    "EXPLAIN WITH changed AS (DELETE FROM items RETURNING *) SELECT * FROM changed",
+    "EXPLAIN ANALYZE SELECT 1 UNION SELECT * FROM changed INTO copied",
+
     "BEGIN",
     "START TRANSACTION",
     "SAVEPOINT guarded",
@@ -203,6 +258,20 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
         rowCount: 1,
       };
     }
+    if (/^SHOW\b/i.test(sql)) {
+      return {
+        rows: [{ server_version_num: "160000" }],
+        fields: [{ name: "server_version_num", dataTypeID: 25 }],
+        rowCount: 1,
+      };
+    }
+    if (/^SELECT \* FROM \(VALUES\b/i.test(sql)) {
+      return {
+        rows: [{ column1: 1 }, { column1: 2 }],
+        fields: [{ name: "column1", dataTypeID: 23 }],
+        rowCount: 2,
+      };
+    }
     return {
       rows: /^SELECT 1$/i.test(sql) ? [{ value: 1 }] : [],
       fields: /^SELECT 1$/i.test(sql)
@@ -249,6 +318,32 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
     ["EXPLAIN UPDATE guarded_table SET value = 1"],
   );
 
+  const valuesStart = calls.length;
+  const values = await succeed(
+    stateql.query("VALUES (1), (2); -- trailing", { cache: "bypass" }),
+  );
+  assert.equal(values.rows, 2);
+  assert.deepEqual(
+    calls.slice(valuesStart).filter((sql) => /^SELECT \* FROM \(VALUES\b/i.test(sql)),
+    ["SELECT * FROM (VALUES (1), (2)) AS _stateql_bounded LIMIT 10001"],
+  );
+  const valuesRequireStart = calls.length;
+  assertFailure(
+    await stateql.query("VALUES (1), (2)", { cache: "require" }),
+    "CACHE_MISS",
+  );
+  assert.equal(calls.length, valuesRequireStart);
+
+  const showStart = calls.length;
+  const shown = await succeed(
+    stateql.query("SHOW server_version_num", { cache: "bypass" }),
+  );
+  assert.equal(shown.preview[0]?.server_version_num, "160000");
+  assert.deepEqual(
+    calls.slice(showStart).filter((sql) => /^SHOW\b/i.test(sql)),
+    ["SHOW server_version_num"],
+  );
+
   const repeatedSql = "EXPLAIN (FORMAT JSON) SELECT 2 AS value";
   const repeatedStart = calls.length;
   const firstDiagnostic = await succeed(stateql.query(repeatedSql));
@@ -269,6 +364,48 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   assert.equal(calls.length, requireStart);
   assert.equal(closeCount, requireCloseCount);
 
+  const directUpsert = await succeed(
+    stateql.exec(
+      "INSERT INTO upsert_direct (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+      { params: [1, "updated"] },
+    ),
+  );
+  assert.equal(directUpsert.statement_type, "upsert");
+
+  const unboundedUpsert =
+    "INSERT INTO upsert_select (id, value) SELECT id, value FROM upsert_source ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value";
+  const unboundedStart = calls.length;
+  assertFailure(await stateql.exec(unboundedUpsert), "UNBOUNDED_MUTATION");
+  assert.equal(calls.length, unboundedStart);
+  const allowedUpsert = await succeed(
+    stateql.exec(unboundedUpsert, { allowUnbounded: true }),
+  );
+  assert.equal(allowedUpsert.statement_type, "upsert");
+
+  const upsertPlan = await succeed(
+    stateql.plan(
+      "INSERT INTO upsert_planned (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+      { params: [1, "planned"] },
+    ),
+  );
+  assert.equal(upsertPlan.statement_type, "upsert");
+  assert.equal(upsertPlan.requires_confirmation, false);
+  const appliedUpsert = await succeed(
+    stateql.apply(String(upsertPlan.plan_id)),
+  );
+  assert.equal(appliedUpsert.statement_type, "upsert");
+
+  await succeed(stateql.beginTransaction());
+  const stagedUpsert = await succeed(
+    stateql.exec(
+      "INSERT INTO upsert_staged (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+      { params: [1, "staged"] },
+    ),
+  );
+  assert.equal(stagedUpsert.statement_type, "upsert");
+  assert.equal(stagedUpsert.status, "pending");
+  await succeed(stateql.rollbackTransaction());
+
   for (const sql of [
     "VACUUM guarded_table",
     "ANALYZE guarded_table",
@@ -288,7 +425,7 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   }
   const invalidReindexStart = calls.length;
   assertFailure(
-    await stateql.exec("REINDEX (CONCURRENTLY) TABLE guarded_table", {
+    await stateql.exec("REINDEX (CONCURRENTLY) TABLE CONCURRENTLY guarded_table", {
       allowDestructive: true,
     }),
     "INVALID_SQL",
@@ -420,6 +557,10 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
     await stateql.exec("ANALYZE guarded_table", { allowDestructive: true }),
     "READ_ONLY_CONNECTION",
   );
+  await succeed(
+    stateql.query("SHOW transaction_read_only", { cache: "bypass" }),
+  );
+  await succeed(stateql.query("VALUES (1)", { cache: "bypass" }));
   stateql.close();
 });
 
@@ -470,6 +611,23 @@ test(
           params: ["first"],
         }),
       );
+      const upserted = await succeed(
+        stateql.exec(
+          `INSERT INTO ${identifier} (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name`,
+          { params: ["first"] },
+        ),
+      );
+      assert.equal(upserted.statement_type, "upsert");
+      const selectUpsert =
+        `INSERT INTO ${identifier} (name) SELECT name FROM ${identifier} ` +
+        "ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name";
+      assertFailure(await stateql.exec(selectUpsert), "UNBOUNDED_MUTATION");
+      assert.equal(
+        (await succeed(
+          stateql.exec(selectUpsert, { allowUnbounded: true }),
+        )).statement_type,
+        "upsert",
+      );
       const queried = await succeed(
         stateql.query(
           `SELECT id, name FROM ${identifier} WHERE name = $1 ORDER BY id`,
@@ -486,6 +644,59 @@ test(
         ),
       );
       assert.equal(explained.rows, 1);
+      const values = await succeed(
+        stateql.query("VALUES ($1), ($2)", {
+          params: [1, 2],
+          cache: "bypass",
+        }),
+      );
+      assert.equal(values.rows, 2);
+      const serverVersion = await succeed(
+        stateql.query("SHOW server_version_num", { cache: "bypass" }),
+      );
+      const serverVersionNumber = Number(
+        serverVersion.preview[0]?.server_version_num,
+      );
+      assert.match(String(serverVersionNumber), /^1[4-8]\d{4}$/);
+      const serverMajor = Math.floor(serverVersionNumber / 10_000);
+      const transactionMode = await succeed(
+        stateql.query("SHOW transaction_read_only", { cache: "bypass" }),
+      );
+      assert.equal(transactionMode.rows, 1);
+      for (const [minimumMajor, sql, params] of [
+        [16, "EXPLAIN (GENERIC_PLAN) SELECT $1", [1]],
+        [17, "EXPLAIN (ANALYZE, MEMORY, SERIALIZE TEXT) SELECT 1", []],
+      ] as const) {
+        const response = await stateql.query(sql, {
+          params: [...params],
+          cache: "bypass",
+        });
+        if (serverMajor >= minimumMajor) {
+          await succeed(response);
+        } else {
+          assert.equal(response.ok, false);
+          if (!response.ok) {
+            assert.equal(response.error.code, "QUERY_FAILED");
+            assert.equal(response.error.executed, true);
+          }
+        }
+      }
+      for (const [minimumMajor, sql] of [
+        [16, `ANALYZE (BUFFER_USAGE_LIMIT '128 kB') ${identifier}`],
+        [18, `ANALYZE ONLY ${identifier} *`],
+      ] as const) {
+        const response = await stateql.exec(sql, { allowDestructive: true });
+        if (serverMajor >= minimumMajor) {
+          await succeed(response);
+        } else {
+          assertOutcomeUnknown(response);
+        }
+      }
+      await succeed(
+        stateql.exec(`REINDEX (CONCURRENTLY) INDEX ${indexIdentifier}`, {
+          allowDestructive: true,
+        }),
+      );
       await succeed(
         stateql.exec(`VACUUM (ANALYZE) ${identifier}`, {
           allowDestructive: true,
@@ -521,8 +732,14 @@ test(
           params: ["second"],
         }),
       );
+      await succeed(
+        stateql.exec(
+          `INSERT INTO ${identifier} (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name`,
+          { params: ["second"] },
+        ),
+      );
       const committed = await succeed(stateql.commitTransaction());
-      assert.equal(committed.statements_executed, 1);
+      assert.equal(committed.statements_executed, 2);
 
       await succeed(stateql.beginTransaction());
       await succeed(

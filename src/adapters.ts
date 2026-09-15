@@ -67,6 +67,7 @@ export interface Adapter {
   readonly confidence: StateConfidence;
   ping(): Promise<void>;
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
+  readAutocommit?(sql: string, params: SqlParameters): Promise<ReadResult>;
   write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult>;
   writeAutocommit?(sql: string, params: SqlParameters): Promise<WriteResult>;
   writeBatch(
@@ -132,6 +133,9 @@ interface PendingSQLiteCall {
   reject(error: unknown): void;
 }
 
+const SQLITE_AUTOCOMMIT_STATEMENTS = new Set(["vacuum", "analyze", "reindex"]);
+
+
 class SQLiteAdapter implements Adapter {
   readonly confidence = "database_reported" as const;
   private readonly child: ChildProcess;
@@ -195,10 +199,24 @@ class SQLiteAdapter implements Adapter {
     return this.call<WriteResult>("write", [sql, params, expectedRows], true, false);
   }
 
+  async writeAutocommit(sql: string, params: SqlParameters): Promise<WriteResult> {
+    return this.call<WriteResult>("writeAutocommit", [sql, params], true, false);
+  }
+
   async writeBatch(
     operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]> {
+    const unsupported = operations.find((operation) =>
+      SQLITE_AUTOCOMMIT_STATEMENTS.has(operation.statement_type)
+    );
+    if (unsupported) {
+      throw new BatchWriteError(
+        `SQLite transactions cannot include ${unsupported.statement_type.toUpperCase()} maintenance statements.`,
+        false,
+      );
+    }
+
     return this.call<WriteResult[]>(
       "writeBatch",
       [operations, isolation],
@@ -255,7 +273,7 @@ class SQLiteAdapter implements Adapter {
   }
 
   private async call<T>(
-    operation: "read" | "write" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject",
+    operation: "read" | "write" | "writeAutocommit" | "writeBatch" | "signature" | "inspect" | "listObjects" | "describeObject",
     args: unknown[],
     outcomeUnknown: boolean,
     batch: boolean,
@@ -765,6 +783,22 @@ class MySqlAdapter implements Adapter {
     }
   }
 
+  async readAutocommit(sql: string, params: SqlParameters): Promise<ReadResult> {
+    const [result, fields] = await this.query(
+      sql,
+      mysqlParams(params),
+      false,
+      false,
+    );
+    return {
+      rows: toJsonSafe(mysqlRows(result)),
+      columns: fields.map((field) => ({
+        name: field.name,
+        type: mysqlFieldType(field),
+      })),
+    };
+  }
+
   async write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult> {
     if (this.readOnly) throw new Error("Connection is read-only.");
     let values: ExecuteValues[];
@@ -793,6 +827,31 @@ class MySqlAdapter implements Adapter {
         throw new AdapterWriteError(errorText(error), false);
       }
       if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), true);
+    }
+  }
+
+  async writeAutocommit(sql: string, params: SqlParameters): Promise<WriteResult> {
+    if (this.readOnly) throw new AdapterWriteError("Connection is read-only.", false);
+    let values: ExecuteValues[];
+    try {
+      values = mysqlParams(params);
+      await this.connect();
+    } catch (error) {
+      if (error instanceof AdapterExecutionError) throw error;
+      throw new AdapterWriteError(errorText(error), false);
+    }
+    try {
+      const [result] = await this.runQuery(sql, values, true, false);
+      const maintenanceError = mysqlMaintenanceError(result);
+      if (maintenanceError) throw new AdapterWriteError(maintenanceError, false);
+      return {
+        affectedRows: Array.isArray(result) ? 0 : mysqlAffectedRows(result),
+      };
+    } catch (error) {
+      if (error instanceof AdapterExecutionError || error instanceof AdapterWriteError) {
+        throw error;
+      }
       throw new AdapterWriteError(errorText(error), true);
     }
   }
@@ -1127,6 +1186,7 @@ const MYSQL_ISOLATION_LEVELS = new Set([
 const MYSQL_TRANSACTIONAL_STATEMENTS = new Set([
   "delete",
   "insert",
+  "upsert",
   "replace",
   "update",
 ]);
@@ -1157,6 +1217,22 @@ function mysqlRows(result: MySqlQueryResult): Row[] {
   }
   return result as MySqlRowDataPacket[] as Row[];
 }
+
+function mysqlMaintenanceError(result: MySqlQueryResult): string | undefined {
+  if (!Array.isArray(result)) return undefined;
+  for (const row of result as MySqlRowDataPacket[] as Row[]) {
+    const typeEntry = Object.entries(row).find(
+      ([key]) => key.toLowerCase() === "msg_type",
+    );
+    if (String(typeEntry?.[1] ?? "").toLowerCase() !== "error") continue;
+    const textEntry = Object.entries(row).find(
+      ([key]) => key.toLowerCase() === "msg_text",
+    );
+    return String(textEntry?.[1] ?? "MySQL maintenance failed.");
+  }
+  return undefined;
+}
+
 
 function mysqlAffectedRows(result: MySqlQueryResult): number {
   if (Array.isArray(result) || !("affectedRows" in result)) {

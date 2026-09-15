@@ -216,6 +216,20 @@ Use `--params JSON` for a JSON array or named parameters. Use
 `--params-file FILE` when JSON is awkward to quote; `--params-file -` reads
 JSON from standard input.
 
+### Dialect upserts
+
+PostgreSQL `INSERT ... ON CONFLICT DO NOTHING|UPDATE` and MySQL `INSERT ... ON
+DUPLICATE KEY UPDATE` are structurally validated and recorded with statement
+type `upsert`. Finite `VALUES` and MySQL `INSERT ... SET` sources use normal
+write policy. An update-upsert fed by `SELECT` requires `--allow-unbounded`
+because its candidate row count is not statically bounded. Upserts support direct
+`exec`, `plan`/`apply`, and staged transactions; hidden additional writes are rejected.
+
+MySQL `INSERT IGNORE` remains a non-overwriting `insert`. SQLite `INSERT OR
+REPLACE` retains destructive-operation approval, while SQLite modern `ON
+CONFLICT ... DO UPDATE` and every `MERGE` form remain blocked until the parser
+can expose their complete mutation structure.
+
 ### PostgreSQL diagnostics and maintenance
 
 Run PostgreSQL plans through `query`:
@@ -231,12 +245,28 @@ mutations are rejected. Diagnostics execute inside PostgreSQL `BEGIN READ ONLY`
 and are never reused from cache. `--cache require` therefore returns
 `CACHE_MISS` without executing the diagnostic.
 
+StateQL supports PostgreSQL 14–18. Top-level `VALUES` is a bounded read and
+accepts normal PostgreSQL positional parameters. It is conservatively
+non-cacheable because expressions may be volatile. The following narrow `SHOW`
+allowlist is also available as non-cacheable diagnostics:
+`server_version`, `server_version_num`, `transaction_read_only`,
+`transaction_isolation`, and `default_transaction_isolation`. `SHOW ALL` and
+other settings remain blocked. Syntax accepted by StateQL but introduced by a
+newer PostgreSQL release may be rejected safely by an older server.
+
 `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER` are PostgreSQL maintenance writes:
 
 ```bash
 stql exec "VACUUM (ANALYZE) public.jobs" --allow-destructive
 stql plan "REINDEX TABLE public.jobs" --allow-destructive
 ```
+
+The PostgreSQL 14–18 grammar includes parenthesized `REINDEX CONCURRENTLY`,
+PostgreSQL 16 `BUFFER_USAGE_LIMIT` for `VACUUM`/`ANALYZE`, optional
+`DATABASE`/`SYSTEM` reindex names, and PostgreSQL 18 `ONLY table *` maintenance
+targets. Memory sizes accept an integer number of kilobytes or a quoted
+`B|kB|MB|GB|TB` value. Older servers may reject newer forms after dispatch, so
+StateQL retains conservative unknown-outcome handling.
 
 They require a read-write connection and `--allow-destructive`, reject StateQL
 parameters, and run as individually tracked autocommit operations. They cannot
@@ -246,6 +276,55 @@ reported as `OUTCOME_UNKNOWN`; inspect database state before replaying it. Raw
 remain unsupported—use `stql transaction` commands instead. See
 [`SQL_COMMAND_ROADMAP.md`](SQL_COMMAND_ROADMAP.md) for the exact implemented
 boundary and deferred command categories.
+
+### SQLite and MySQL diagnostics and maintenance
+
+SQLite supports `EXPLAIN QUERY PLAN` for structurally read-only `SELECT`
+statements. MySQL supports `EXPLAIN SELECT` plus bare `SHOW TABLES`,
+`SHOW COLUMNS FROM table`, and `SHOW INDEX|INDEXES FROM table`. Broader
+`EXPLAIN`, `SHOW`, and write-bearing forms remain blocked.
+
+MySQL executable comments (`/*! ... */`) are rejected throughout SQL. Because
+StateQL does not assume a server `sql_mode`, quoting that could expose these
+comments under `ANSI_QUOTES` or `NO_BACKSLASH_ESCAPES` is also rejected.
+
+These diagnostics use `query`, work with read-only connections, preserve the
+original statement instead of applying StateQL's limiting SQL wrapper, and are
+never reused from cache. Materialized results still receive StateQL's row and
+byte checks.
+
+SQLite also supports bare `VACUUM`, plus `ANALYZE [target]` and
+`REINDEX [target]` with at most one unqualified or double-quoted target:
+
+```bash
+stql exec "ANALYZE jobs" --allow-destructive
+stql exec "REINDEX jobs_created_at_idx" --allow-destructive
+stql exec "VACUUM" --allow-destructive
+```
+
+These commands require a read-write connection, reject parameters, run as
+individually tracked autocommit operations, and cannot be staged. A timeout,
+cancellation, or error after dispatch is reported as `OUTCOME_UNKNOWN`.
+`VACUUM INTO`, schema-qualified targets, paths, `ATTACH`, and arbitrary `PRAGMA`
+remain blocked.
+
+MySQL supports one optionally qualified bare or backtick-quoted target for
+`ANALYZE TABLE`, `OPTIMIZE TABLE`, and `CHECK TABLE`:
+
+```bash
+stql exec "ANALYZE TABLE jobs" --allow-destructive
+stql plan "OPTIMIZE TABLE jobs" --allow-destructive
+stql query "CHECK TABLE jobs"
+```
+
+`ANALYZE` and `OPTIMIZE` are durable autocommit writes requiring a read-write
+connection and destructive approval; server-reported error rows become known
+failed operations, while timeout or cancellation after dispatch remains
+`OUTCOME_UNKNOWN`. `CHECK TABLE` is an unwrapped, non-cacheable autocommit read
+that works on read-only connections and retains normal result limits. All three
+reject StateQL parameters, options, multiple targets, and additional
+statements, and none can run during a staged transaction.
+
 
 ### Native MongoDB
 
