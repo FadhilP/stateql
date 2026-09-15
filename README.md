@@ -85,7 +85,6 @@ See [write safety](docs/usage.md#write-safety),
 | [Usage](docs/usage.md) | Connections, CLI reference, results, sessions, limits, writes, transactions, batch and pipes |
 | [Database support](docs/databases.md) | SQL dialects, diagnostics, maintenance, native MongoDB and Redis commands |
 | [TypeScript library](docs/library.md) | Connection setup, response handling, cleanup, actors, workspaces, and credential resolution |
-| [SQL command roadmap](SQL_COMMAND_ROADMAP.md) | Development priorities and requirements for extending SQL support |
 
 Run `stql --help` for command syntax or `stql capabilities` for capability details.
 

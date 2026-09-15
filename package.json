@@ -22,7 +22,6 @@
     "dist/src",
     "README.md",
     "docs",
-    "SQL_COMMAND_ROADMAP.md",
     "LICENSE"
   ],
   "scripts": {

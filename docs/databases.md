@@ -40,9 +40,7 @@ transaction-control SQL is unsupported: use
 [staged transactions](usage.md#transactions), not `BEGIN` or `COMMIT` statements.
 MongoDB and Redis use separate native command APIs.
 
-Unrecognized or parser-unsupported forms remain blocked. The
-[SQL command roadmap](../SQL_COMMAND_ROADMAP.md) describes future categories,
-not permission to execute them.
+Unrecognized or parser-unsupported forms remain blocked.
 
 ## Dialect upserts
 
