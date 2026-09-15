@@ -93,7 +93,7 @@ for source-replacement and downgrade restrictions.
 
 ## CLI reference
 
-```text
+```bash
 stql connect <target> [--name NAME] [--read-only|--read-write]
 stql connect --env ENV [--name NAME] [--read-only|--read-write]
 stql connect --credential-ref REF [--name NAME] [--read-only|--read-write]
@@ -105,6 +105,7 @@ stql profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
 stql profile list|show|remove
 stql session start|list|show|summary|close
 stql query <sql> [--params JSON | --param VALUE...] [--cache auto|bypass|require]
+                 [--preview-rows 0..200]
 stql filter <result-handle> <predicate> [--params JSON | --param VALUE...]
 stql exec <sql> [--params JSON | --param VALUE...] [--idempotency-key KEY] [--replay]
               [--allow-unbounded] [--allow-destructive]
@@ -138,7 +139,7 @@ stql pipe [--continue-on-error]
 For shell-safe positional parameters, repeat `--param`. JSON scalars become
 their native types; other values remain strings.
 
-```powershell
+```bash
 stql exec "INSERT INTO users (name, status) VALUES (?, ?)" `
   --param Ada --param trial
 ```
@@ -237,6 +238,10 @@ before persistence. Narrow the `WHERE` clause, add `LIMIT`, or select fewer
 columns. These caps bound persisted materialization; the independent deadline
 bounds execution time. Native commands may impose stricter
 [database-specific limits](databases.md).
+
+Query responses preview five rows by default. Use `--preview-rows N` to return
+between 0 and 200 preview rows without rerunning or changing the stored result.
+Additional rows remain available through `stql rows <result-handle>`.
 
 Command history keeps the latest 10,000 entries per session. SQLite cache reuse
 also checks the database file signature. PostgreSQL, MySQL, and MongoDB cache
@@ -346,7 +351,8 @@ stql batch commands.json
 
 Batch fields use snake case. Supported command names match CLI paths, such as
 `filter`, `transaction.begin`, `session.summary`, `alias.set`, `plan`, and
-`apply`. Native MongoDB batches use `mongo.query`, `mongo.exec`, or `mongo.plan`
-with the command object in `mongo`; the same cache, replay, idempotency, safety,
-and timeout fields apply. Database commands may set `timeout_ms`; otherwise they
-use the 30-second default.
+`apply`. Query commands may set `preview_rows` from 0 to 200. Native MongoDB
+batches use `mongo.query`, `mongo.exec`, or `mongo.plan` with the command object
+in `mongo`; the same cache, replay, idempotency, safety, and timeout fields
+apply. Database commands may set `timeout_ms`; otherwise they use the 30-second
+default.

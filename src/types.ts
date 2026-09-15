@@ -346,6 +346,7 @@ export type StateQLWorkspaceOptions = StateQLActorOptions & {
 export interface QueryOptions extends ExecutionOptions {
   params?: SqlParameters;
   cache?: "auto" | "bypass" | "require";
+  previewRows?: number;
 }
 
 export interface MongoQueryOptions extends ExecutionOptions {
@@ -481,6 +482,7 @@ export interface BatchCommand {
   redis?: RedisCommand;
   object?: CatalogObject;
   cache?: "auto" | "bypass" | "require";
+  preview_rows?: number;
   read_only?: boolean;
   secret_env?: string;
   credential_ref?: string;

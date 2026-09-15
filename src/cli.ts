@@ -35,6 +35,7 @@ const parsed = parseArgs({
     param: { type: "string", multiple: true },
     "params-file": { type: "string" },
     cache: { type: "string" },
+    "preview-rows": { type: "string" },
     replay: { type: "boolean" },
     "idempotency-key": { type: "string" },
     "allow-unbounded": { type: "boolean" },
@@ -192,6 +193,9 @@ async function dispatch(): Promise<Response<unknown>> {
       return stateql.query(sql, {
         params,
         cache: cacheMode(values.cache),
+        ...(values["preview-rows"] === undefined
+          ? {}
+          : { previewRows: Number(values["preview-rows"]) }),
       });
     case "filter":
       return stateql.filter(
@@ -763,6 +767,7 @@ Commands:
   pipe
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
+Query preview: --preview-rows N (default: 5, maximum: 200).
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
 Credential refs require a trusted host CredentialResolver; the standalone CLI cannot resolve them.
 State: --max-state-bytes N, --cache-ttl-seconds N, --result-ttl-seconds N.

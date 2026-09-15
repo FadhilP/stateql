@@ -29,7 +29,7 @@ try {
 
   const result = await stateql.query(
     "SELECT id, email FROM users WHERE status = ? ORDER BY id LIMIT 50",
-    { params: ["active"], timeoutMs: 5_000 },
+    { params: ["active"], timeoutMs: 5_000, previewRows: 20 },
   );
   if (!result.ok) throw new Error(result.error.message);
 
@@ -62,6 +62,10 @@ output mode. Check `response.ok` before reading `response.data`; failures expose
 `response.error`. Queries return typed `ResultData` with `result_id`, `preview`,
 and result metadata. Reuse `result_id` with methods such as `filter`, `rows`,
 `count`, and `exportResult`; the CLI instead presents its primary ID as `handle`.
+Queries preview five rows by default. Set `previewRows` from 0 to 200 on an
+individual query to control its response without changing or rerunning the
+materialized result. The constructor-level `previewRows` option changes the
+client default.
 
 The following snippets assume an open client and an appropriate connection.
 

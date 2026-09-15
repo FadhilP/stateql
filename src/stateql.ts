@@ -999,6 +999,9 @@ export class StateQL {
 
   async query(sql: string, options: QueryOptions = {}): Promise<Response<ResultData>> {
     return this.run("query", async (session) => {
+      const previewRows = options.previewRows === undefined
+        ? this.previewRows
+        : queryPreviewRows(options.previewRows);
       const connection = this.requireConnection(session);
       this.rejectMongoSql(connection, "mongoQuery");
       this.rejectDuringStagedTransaction(session, "Queries");
@@ -1057,7 +1060,7 @@ export class StateQL {
           this.cacheValid(cached, stateVersion, stateSignature)
         ) {
           return {
-            data: this.resultData(cached, true),
+            data: this.resultData(cached, true, previewRows),
             handle: cached.id,
             cached: true,
             warnings: paginationWarnings(analysis.ordered),
@@ -1119,7 +1122,7 @@ export class StateQL {
           expiresAt,
         });
         return {
-          data: this.resultData(saved, false),
+          data: this.resultData(saved, false, previewRows),
           handle: saved.id,
           executed: true,
           warnings: paginationWarnings(analysis.ordered),
@@ -2688,6 +2691,7 @@ export class StateQL {
           const response = await this.query(batchString(command.sql, "sql"), {
             params: command.params ?? [],
             cache: command.cache ?? "auto",
+            previewRows: command.preview_rows,
             timeoutMs: command.timeout_ms,
           });
           if (!response.ok || !command.as) return response;
@@ -3915,10 +3919,14 @@ export class StateQL {
     );
   }
 
-  private resultData(result: ResultRecord, cached: boolean): ResultData {
+  private resultData(
+    result: ResultRecord,
+    cached: boolean,
+    previewRows = this.previewRows,
+  ): ResultData {
     const rows = this.store.resultRows(result);
     const preview = compactRows(
-      rows.slice(0, this.previewRows),
+      rows.slice(0, previewRows),
       this.maxCellCharacters,
     );
     return {
@@ -4355,6 +4363,15 @@ function nonNegativeInteger(value: number, name: string): number {
   throw new StateQLError(
     "INVALID_COMMAND",
     `${name} must be a non-negative integer.`,
+  );
+}
+
+function queryPreviewRows(value: number): number {
+  const previewRows = nonNegativeInteger(value, "previewRows");
+  if (previewRows <= 200) return previewRows;
+  throw new StateQLError(
+    "OUTPUT_LIMIT_EXCEEDED",
+    "previewRows cannot exceed 200 rows.",
   );
 }
 

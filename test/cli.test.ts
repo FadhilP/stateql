@@ -243,6 +243,8 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
       "dist/src/cli.js",
       "query",
       "SELECT id, name FROM output_rows ORDER BY id",
+      "--preview-rows",
+      "2",
     ],
     {
       cwd: process.cwd(),
@@ -256,8 +258,9 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   assert.equal(compact.ok, true);
   assert.match(compact.handle, /^q_[a-z2-7]{26}$/);
   assert.equal(compact.total, 3);
-  assert.equal(compact.rows.length, 3);
-  assert.equal(compact.next_offset, null);
+  assert.equal(compact.rows.length, 2);
+  assert.equal(compact.truncated, true);
+  assert.equal(compact.next_offset, 2);
   assert.equal("data" in compact, false);
   assert.equal("command_id" in compact, false);
   assert.equal("session_id" in compact, false);

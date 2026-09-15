@@ -95,6 +95,52 @@ test("durable handles, normalized cache reuse, parameters, and compact rows", as
   fixture.stateql.close();
 });
 
+test("query preview rows can be overridden per response", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE preview_rows (id INTEGER)"));
+  await succeed(
+    fixture.stateql.exec(
+      "INSERT INTO preview_rows (id) VALUES (1), (2), (3), (4), (5), (6), (7)",
+    ),
+  );
+  const sql = "SELECT id FROM preview_rows ORDER BY id";
+
+  const initial = await succeed(fixture.stateql.query(sql, { cache: "bypass" }));
+  assert.equal(initial.preview_count, 5);
+  assert.equal(initial.truncated, true);
+
+  const cached = await succeed(fixture.stateql.query(sql, { previewRows: 2 }));
+  assert.equal(cached.cached, true);
+  assert.equal(cached.preview_count, 2);
+  assert.deepEqual(
+    cached.preview.map((row: Record<string, unknown>) => row.id),
+    [1, 2],
+  );
+
+  const empty = await succeed(fixture.stateql.query(sql, { previewRows: 0 }));
+  assert.equal(empty.preview_count, 0);
+  assert.equal(empty.truncated, true);
+
+  const batchResponses = [];
+  for await (const response of fixture.stateql.batch([
+    { command: "query", sql, preview_rows: 3 },
+  ])) {
+    batchResponses.push(response);
+  }
+  assert.equal(batchResponses[0]?.ok, true);
+  if (batchResponses[0]?.ok) {
+    const data = batchResponses[0].data as Record<string, unknown>;
+    assert.equal(data.preview_count, 3);
+  }
+
+  assertFailure(await fixture.stateql.query(sql, { previewRows: -1 }), "INVALID_COMMAND");
+  assertFailure(
+    await fixture.stateql.query(sql, { previewRows: 201 }),
+    "OUTPUT_LIMIT_EXCEEDED",
+  );
+  fixture.stateql.close();
+});
+
 test("history records bounded SQL for query, exec, plan, apply, and batch", async () => {
   const fixture = await createFixture();
   const querySql = "SELECT ? AS value";
