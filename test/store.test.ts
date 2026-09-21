@@ -662,11 +662,12 @@ test("history keeps the latest 10,000 entries per session", () => {
       SELECT value + 1 FROM sequence WHERE value < 10001
     )
     INSERT INTO history
-      (id, timestamp, session_id, actor_id, command, executed, cached, success)
+      (id, timestamp, session_id, actor_id, actor_name, command, executed, cached, success)
     SELECT
       'seed_' || value,
       '2026-01-01T00:00:00Z',
       '${session.id}',
+      'default',
       'default',
       'seed',
       0,
@@ -828,6 +829,11 @@ test("actors share workspace handles, aliases, history, and restarts", async () 
   });
   assertFailure(await stranger.status(), "PERMISSION_DENIED");
   await succeed(owner.linkActor("workspace", "actor-b"));
+  const renamed = await succeed(stranger.setActorName("  migration reviewer  "));
+  assert.equal(renamed.actor_id, "actor-b");
+  assert.equal(renamed.actor_name, "migration reviewer");
+  assert.equal((await succeed(stranger.status())).actor_name, "migration reviewer");
+  assertFailure(await stranger.setActorName("invalid\nname"), "INVALID_COMMAND");
 
   assert.equal(
     (await succeed(stranger.show(String(result.result_id)))).result_id,
@@ -852,6 +858,10 @@ test("actors share workspace handles, aliases, history, and restarts", async () 
     actors.actors.map((actor: { actor_id: string }) => actor.actor_id).sort(),
     ["actor-b", "workspace"],
   );
+  assert.equal(
+    actors.actors.find((actor: { actor_id: string; actor_name: string }) => actor.actor_id === "actor-b")?.actor_name,
+    "migration reviewer",
+  );
   const resolved = await succeed(owner.resolveActor("actor-b"));
   assert.equal(resolved.session.name, "workspace");
   const history = await succeed(owner.history(50));
@@ -861,7 +871,18 @@ test("actors share workspace handles, aliases, history, and restarts", async () 
         entry.actor_id === "actor-b" && entry.command === "exec",
     ),
   );
+  const renameEntry = history.history.find(
+    (entry: HistoryEntry) => entry.command === "actor.set-name" && entry.success,
+  );
+  assert.equal(renameEntry?.actor_id, "actor-b");
+  assert.equal(renameEntry?.actor_name, "actor-b");
+  assert.equal(renameEntry?.target, "migration reviewer");
+  const actorWrite = history.history.find(
+    (entry: HistoryEntry) => entry.actor_id === "actor-b" && entry.command === "exec",
+  );
+  assert.equal(actorWrite?.actor_name, "migration reviewer");
   assert.equal(stranger.snapshot().actor_id, "actor-b");
+  assert.equal(stranger.snapshot().actor_name, "migration reviewer");
 
   stranger.close();
   const restarted = new StateQL({
@@ -869,6 +890,7 @@ test("actors share workspace handles, aliases, history, and restarts", async () 
     session: "workspace",
     actor: "actor-b",
   });
+  assert.equal((await succeed(restarted.showActor())).actor_name, "migration reviewer");
   assert.equal(
     (await succeed(restarted.show("shared"))).result_id,
     result.result_id,
@@ -1140,6 +1162,7 @@ test("migrations retain their registry and repair a migration/schema mismatch", 
       "history_classification_v1",
       "connection_aliases_v1",
       "password_refs_v1",
+      "actor_display_names_v1",
     ],
   );
   database.exec("DELETE FROM schema_migrations WHERE name = 'shared_session_actors_v1'");
@@ -1285,6 +1308,7 @@ test("legacy sessions migrate actor attribution without losing artifacts", async
     ALTER TABLE plans DROP COLUMN owner_actor_id;
     ALTER TABLE plans DROP COLUMN claim_token;
     ALTER TABLE history DROP COLUMN actor_id;
+    ALTER TABLE history DROP COLUMN actor_name;
   `);
   state.close();
 
@@ -1307,7 +1331,8 @@ test("legacy sessions migrate actor attribution without losing artifacts", async
   await succeed(migrated.apply(String(plan.plan_id)));
   assert.ok(
     (await succeed(migrated.history(100))).history.every(
-      (entry: HistoryEntry) => entry.actor_id === "default",
+      (entry: HistoryEntry) =>
+        entry.actor_id === "default" && entry.actor_name === "default",
     ),
   );
   migrated.close();

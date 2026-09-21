@@ -3,10 +3,15 @@ import type { AST } from "node-sql-parser";
 import { StateQLError } from "./errors.js";
 import type { Driver, SqlDriver } from "./types.js";
 
-const { Parser } = createRequire(import.meta.url)(
-  "node-sql-parser",
-) as typeof import("node-sql-parser");
-const parser = new Parser();
+const require = createRequire(import.meta.url);
+let parser: import("node-sql-parser").Parser | undefined;
+function sqlParser(): import("node-sql-parser").Parser {
+  if (!parser) {
+    const { Parser } = require("node-sql-parser") as typeof import("node-sql-parser");
+    parser = new Parser();
+  }
+  return parser;
+}
 
 export type StatementType =
   | "select"
@@ -93,6 +98,7 @@ function parseSqlStatement(
   sql: string,
   driver: Exclude<Driver, "mongodb" | "redis">,
 ): ParsedSql {
+  const parser = sqlParser();
   const database =
     driver === "postgres"
       ? "Postgresql"

@@ -181,6 +181,8 @@ async function dispatch(): Promise<Response<unknown>> {
       return stateql.disconnect();
     case "status":
       return stateql.status();
+    case "actor":
+      return dispatchActor(subcommand, rest);
     case "profile":
       return dispatchProfile(subcommand, rest);
     case "session":
@@ -350,6 +352,22 @@ function parseMongoCommand(value: string): unknown {
     throw new Error("Invalid MongoDB EJSON command.");
   }
 }
+async function dispatchActor(
+  action: string | undefined,
+  args: string[],
+): Promise<Response<unknown>> {
+  switch (action) {
+    case "show":
+      return stateql.showActor();
+    case "set-name":
+      return stateql.setActorName(
+        requireValue(args.join(" ").trim(), "actor name"),
+      );
+    default:
+      throw new Error(`Unknown actor command "${action ?? ""}".`);
+  }
+}
+
 async function dispatchSession(
   action: string | undefined,
   args: string[],
@@ -752,6 +770,7 @@ Usage: stql <command> [arguments] [options]
 Commands:
   connect TARGET | --env ENV | --credential-ref REF | --profile NAME
   disconnect, status
+  actor show | set-name NAME
   profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
   profile list|show|remove
   query, filter, exec, show, rows, count, columns, export

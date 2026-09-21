@@ -144,6 +144,28 @@ const MIGRATIONS: Migration[] = [
     validate: validatePasswordRefs,
   },
 
+  {
+    name: "actor_display_names_v1",
+    apply(db) {
+      addColumn(db, "session_members", "actor_name", "TEXT");
+      addColumn(db, "history", "actor_name", "TEXT");
+      db.exec(`
+        UPDATE session_members SET actor_name = actor_id WHERE actor_name IS NULL;
+        UPDATE history SET actor_name = actor_id WHERE actor_name IS NULL;
+      `);
+    },
+    validate(db) {
+      requireColumns(db, "session_members", ["actor_name"]);
+      requireColumns(db, "history", ["actor_name"]);
+      for (const table of ["session_members", "history"] as const) {
+        const row = db.prepare(
+          `SELECT COUNT(*) AS count FROM ${table} WHERE actor_name IS NULL OR actor_name = ''`,
+        ).get() as { count: number };
+        if (row.count) throw new Error(`State migration left ${table}.actor_name empty.`);
+      }
+    },
+  },
+
 ];
 
 export function runMigrations(db: DatabaseSync, now: () => Date): void {
@@ -196,6 +218,7 @@ function createInitialSchema(db: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS session_members (
       session_id TEXT NOT NULL,
       actor_id TEXT NOT NULL UNIQUE,
+      actor_name TEXT NOT NULL,
       attached_at TEXT NOT NULL,
       PRIMARY KEY(session_id, actor_id),
       FOREIGN KEY(session_id) REFERENCES sessions(id)
@@ -312,6 +335,7 @@ function createInitialSchema(db: DatabaseSync): void {
       timestamp TEXT NOT NULL,
       session_id TEXT NOT NULL,
       actor_id TEXT NOT NULL,
+      actor_name TEXT NOT NULL,
       command TEXT NOT NULL,
       origin TEXT NOT NULL DEFAULT 'legacy',
       category TEXT NOT NULL DEFAULT 'management',
@@ -332,19 +356,22 @@ function migrateSharedSessionActors(db: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS session_members (
       session_id TEXT NOT NULL,
       actor_id TEXT NOT NULL UNIQUE,
+      actor_name TEXT,
       attached_at TEXT NOT NULL,
       PRIMARY KEY(session_id, actor_id),
       FOREIGN KEY(session_id) REFERENCES sessions(id)
     )
   `);
+  addColumn(db, "session_members", "actor_name", "TEXT");
   addColumn(db, "operations", "actor_id", "TEXT");
   addColumn(db, "transactions", "owner_actor_id", "TEXT");
   addColumn(db, "plans", "owner_actor_id", "TEXT");
   addColumn(db, "plans", "claim_token", "TEXT");
   addColumn(db, "history", "actor_id", "TEXT");
   db.exec(`
-    INSERT OR IGNORE INTO session_members(session_id, actor_id, attached_at)
-    SELECT id, name, created_at FROM sessions;
+    INSERT OR IGNORE INTO session_members(session_id, actor_id, actor_name, attached_at)
+    SELECT id, name, name, created_at FROM sessions;
+    UPDATE session_members SET actor_name = actor_id WHERE actor_name IS NULL;
     UPDATE operations SET actor_id = (
       SELECT name FROM sessions WHERE sessions.id = operations.session_id
     ) WHERE actor_id IS NULL;

@@ -1,19 +1,25 @@
 import { fork, type ChildProcess } from "node:child_process";
-import {
-  createConnection as createMySqlConnection,
-  type Connection as MySqlCoreConnection,
-  type ExecuteValues,
-  type FieldPacket as MySqlFieldPacket,
-  type QueryResult as MySqlQueryResult,
-  type ResultSetHeader as MySqlResultSetHeader,
-  type RowDataPacket as MySqlRowDataPacket,
+import { createRequire } from "node:module";
+import type {
+  Connection as MySqlCoreConnection,
+  ExecuteValues,
+  FieldPacket as MySqlFieldPacket,
+  QueryResult as MySqlQueryResult,
+  ResultSetHeader as MySqlResultSetHeader,
+  RowDataPacket as MySqlRowDataPacket,
 } from "mysql2";
 import type { Connection as MySqlConnection } from "mysql2/promise";
-import { Client, types as pgTypes, type QueryResult } from "pg";
+import type { Client, QueryResult } from "pg";
 import { StateQLError } from "./errors.js";
 import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
 import { isSqlParameters, parseJson, toJsonSafe } from "./util.js";
+
+const require = createRequire(import.meta.url);
+let mysqlModule: typeof import("mysql2") | undefined;
+let postgresModule: typeof import("pg") | undefined;
+const mysql = () => (mysqlModule ??= require("mysql2") as typeof import("mysql2"));
+const postgres = () => (postgresModule ??= require("pg") as typeof import("pg"));
 
 export interface ReadResult {
   rows: Row[];
@@ -361,6 +367,7 @@ const POSTGRES_AUTOCOMMIT_STATEMENTS = new Set([
 class PostgresAdapter implements Adapter {
   readonly confidence = "ttl_based" as const;
   private readonly client: Client;
+  private readonly pgTypes: typeof import("pg")["types"];
   private connected = false;
   private ending: Promise<void> | undefined;
 
@@ -369,6 +376,8 @@ class PostgresAdapter implements Adapter {
     private readonly readOnly: boolean,
     private readonly context: AdapterContext,
   ) {
+    const { Client, types } = postgres();
+    this.pgTypes = types;
     const timeout = Math.min(
       2_147_483_647,
       remainingMilliseconds(context),
@@ -396,7 +405,7 @@ class PostgresAdapter implements Adapter {
         columns: result.fields.map((field) => ({
           name: field.name,
           type:
-            pgTypes.getTypeParser(field.dataTypeID).name ||
+            this.pgTypes.getTypeParser(field.dataTypeID).name ||
             `oid_${field.dataTypeID}`,
         })),
       };
@@ -1096,7 +1105,7 @@ class MySqlAdapter implements Adapter {
     if (this.connected) return;
     throwIfStopped(this.context, false);
     if (this.closed) throw new Error("MySQL adapter is closed.");
-    const rawClient = createMySqlConnection({
+    const rawClient = mysql().createConnection({
       uri: this.source,
       connectTimeout: remainingMilliseconds(this.context),
       multipleStatements: false,

@@ -138,6 +138,7 @@ export interface HistoryRecord {
   timestamp: string;
   session_id: string;
   actor_id: string;
+  actor_name: string;
   origin: CommandOrigin;
   category: HistoryCategory;
   internal: number;
@@ -154,6 +155,7 @@ export interface HistoryRecord {
 export interface SessionMemberRecord {
   session_id: string;
   actor_id: string;
+  actor_name: string;
   attached_at: string;
 }
 
@@ -274,18 +276,18 @@ export class StateStore {
       if (created) {
         this.db
           .prepare(
-            `INSERT INTO session_members(session_id, actor_id, attached_at)
-             VALUES (?, ?, ?)`,
+            `INSERT INTO session_members(session_id, actor_id, actor_name, attached_at)
+             VALUES (?, ?, ?, ?)`,
           )
-          .run(row.id, actorId, timestamp);
+          .run(row.id, actorId, actorId, timestamp);
       } else if (ensureLegacyMembership) {
         this.db
           .prepare(
             `INSERT OR IGNORE INTO session_members
-              (session_id, actor_id, attached_at)
-             VALUES (?, ?, ?)`,
+              (session_id, actor_id, actor_name, attached_at)
+             VALUES (?, ?, ?, ?)`,
           )
-          .run(row.id, actorId, timestamp);
+          .run(row.id, actorId, actorId, timestamp);
       }
       this.db.exec("COMMIT");
       return this.getSession(row.id)!;
@@ -338,10 +340,10 @@ export class StateStore {
         if (this.isSessionMember(row.id, identity)) continue;
         this.db
           .prepare(
-            `INSERT INTO session_members(session_id, actor_id, attached_at)
-             VALUES (?, ?, ?)`,
+            `INSERT INTO session_members(session_id, actor_id, actor_name, attached_at)
+             VALUES (?, ?, ?, ?)`,
           )
-          .run(row.id, identity, timestamp);
+          .run(row.id, identity, identity, timestamp);
       }
       const session = this.getSessionByName(name);
       if (!session) throw new Error(`Could not open workspace "${name}".`);
@@ -386,10 +388,10 @@ export class StateStore {
       }
       this.db
         .prepare(
-          `INSERT INTO session_members(session_id, actor_id, attached_at)
-           VALUES (?, ?, ?)`,
+          `INSERT INTO session_members(session_id, actor_id, actor_name, attached_at)
+           VALUES (?, ?, ?, ?)`,
         )
-        .run(sessionId, actorId, this.now().toISOString());
+        .run(sessionId, actorId, actorId, this.now().toISOString());
       this.db.exec("COMMIT");
       return "linked";
     } catch (error) {
@@ -433,6 +435,30 @@ export class StateStore {
       throw error;
     }
   }
+
+  getActor(sessionId: string, actorId: string): SessionMemberRecord | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM session_members
+         WHERE session_id = ? AND actor_id = ?`,
+      )
+      .get(sessionId, actorId) as SessionMemberRecord | undefined;
+  }
+
+  setActorName(
+    sessionId: string,
+    actorId: string,
+    actorName: string,
+  ): SessionMemberRecord | undefined {
+    return this.db
+      .prepare(
+        `UPDATE session_members SET actor_name = ?
+         WHERE session_id = ? AND actor_id = ?
+         RETURNING *`,
+      )
+      .get(actorName, sessionId, actorId) as SessionMemberRecord | undefined;
+  }
+
 
   listActors(sessionId: string): SessionMemberRecord[] {
     return this.db
@@ -1533,6 +1559,7 @@ export class StateStore {
   addHistory(input: {
     sessionId: string;
     actorId: string;
+    actorName?: string;
     origin?: CommandOrigin;
     category?: HistoryCategory;
     internal?: boolean;
@@ -1550,15 +1577,16 @@ export class StateStore {
       this.db
         .prepare(
           `INSERT INTO history
-            (id, timestamp, session_id, actor_id, origin, category, internal, command, sql, target, handle,
+            (id, timestamp, session_id, actor_id, actor_name, origin, category, internal, command, sql, target, handle,
              executed, cached, success, error_code)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
           this.now().toISOString(),
           input.sessionId,
           input.actorId,
+          input.actorName ?? this.getActor(input.sessionId, input.actorId)?.actor_name ?? input.actorId,
           input.origin ?? "legacy",
           input.category ?? "management",
           input.internal ? 1 : 0,

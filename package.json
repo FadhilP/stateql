@@ -1,6 +1,6 @@
 {
   "name": "@fadhilp/stateql",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "Stateful, agent-oriented database CLI for safe result reuse",
   "repository": {
     "type": "git",
@@ -26,7 +26,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/cli.test.js dist/test/credential.test.js dist/test/mongodb.test.js dist/test/mysql.test.js dist/test/postgres.test.js dist/test/query.test.js dist/test/redis.test.js dist/test/sqlite.test.js dist/test/store.test.js dist/test/terminal.test.js dist/test/transaction.test.js dist/test/write.test.js dist/test/panel.test.js",
+    "test": "npm run build && node --test dist/test/cli.test.js dist/test/credential.test.js dist/test/import.test.js dist/test/mongodb.test.js dist/test/mysql.test.js dist/test/postgres.test.js dist/test/query.test.js dist/test/redis.test.js dist/test/sqlite.test.js dist/test/store.test.js dist/test/terminal.test.js dist/test/transaction.test.js dist/test/write.test.js dist/test/panel.test.js",
     "release": "npm version",
     "version": "npm install",
     "prepack": "npm test"
@@ -47,6 +47,7 @@
   },
   "dependencies": {
     "@redis/client": "^5.12.1",
+    "bson": "^6.10.4",
     "mongodb": "^6.21.0",
     "mysql2": "^3.23.1",
     "node-sql-parser": "^5.4.0",

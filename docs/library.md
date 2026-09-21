@@ -130,6 +130,14 @@ available through `linkActor(session, actorId)`, `unlinkActor(session, actorId)`
 user confirmation before changing membership or the shared connection; a host
 calling `forWorkspace` is responsible for authorizing that workspace access.
 
+An actor can inspect itself with `showActor()` and set its own contextual display
+name with `setActorName(name)`. The display name is trimmed, limited to 80
+characters, and rejects control characters. It never replaces `actor_id` in
+membership, authorization, plan ownership, or transaction ownership. History
+snapshots the display name at command start, so later renames do not alter prior
+audit entries; the corresponding batch commands are `actor.show` and
+`actor.set-name` (using the `name` field).
+
 ## Credential resolution
 
 Library integrations can resolve environment-variable names, opaque full-URL

@@ -1,4 +1,4 @@
-import { BSON } from "mongodb";
+import { BSON } from "bson";
 import { StateQLError } from "./errors.js";
 import type { Driver, MongoWriteCommand, Row, SqlParameters } from "./types.js";
 

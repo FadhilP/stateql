@@ -74,6 +74,7 @@ import {
   type SessionRecord,
 } from "./store.js";
 import type {
+  ActorData,
   ActorLinkData,
   ActorResolutionData,
   ActorsData,
@@ -705,6 +706,7 @@ export class StateQL {
         `Actor "${this.actorId}" is not attached to session "${session.name}".`,
       );
     }
+    const actor = this.store.getActor(session.id, this.actorId)!;
     const connection = this.store.activeConnection(session);
     const transaction = session.active_transaction_id
       ? this.store.getTransaction(session.active_transaction_id)
@@ -734,6 +736,7 @@ export class StateQL {
         status: session.status,
       },
       actor_id: this.actorId,
+      actor_name: actor.actor_name,
       connection: connection
         ? {
             connection_id: connection.id,
@@ -781,11 +784,13 @@ export class StateQL {
       const transaction = session.active_transaction_id
         ? this.store.getTransaction(session.active_transaction_id)
         : undefined;
+      const actor = this.store.getActor(session.id, this.actorId)!;
       return {
         data: {
           session_id: session.id,
           session_name: session.name,
           actor_id: this.actorId,
+          actor_name: actor.actor_name,
           connection: connection
             ? {
                 connection_id: connection.id,
@@ -862,6 +867,44 @@ export class StateQL {
     });
   }
 
+  async showActor(): Promise<Response<ActorData>> {
+    return this.run("actor.show", async (current) => {
+      const actor = this.store.getActor(current.id, this.actorId)!;
+      return {
+        data: {
+          actor_id: actor.actor_id,
+          actor_name: actor.actor_name,
+          attached_at: actor.attached_at,
+        },
+      };
+    });
+  }
+
+  async setActorName(name: string): Promise<Response<ActorData>> {
+    return this.run("actor.set-name", async (current) => {
+      const actorName = this.validateActorName(name);
+      const existing = this.store.getActor(current.id, this.actorId)!;
+      if (existing.actor_name === actorName) {
+        return {
+          data: {
+            actor_id: existing.actor_id,
+            actor_name: existing.actor_name,
+            attached_at: existing.attached_at,
+          },
+        };
+      }
+      const actor = this.store.setActorName(current.id, this.actorId, actorName)!;
+      return {
+        data: {
+          actor_id: actor.actor_id,
+          actor_name: actor.actor_name,
+          attached_at: actor.attached_at,
+        },
+        executed: true,
+      };
+    }, undefined, actorNameHistoryTarget(name));
+  }
+
   async listActors(session: string): Promise<Response<ActorsData>> {
     return this.run("actor.list", async (current) => {
       this.requireSelectedSession(current, session);
@@ -870,6 +913,7 @@ export class StateQL {
           session_id: current.id,
           actors: this.store.listActors(current.id).map((member) => ({
             actor_id: member.actor_id,
+            actor_name: member.actor_name,
             attached_at: member.attached_at,
           })),
         },
@@ -2592,6 +2636,7 @@ export class StateQL {
           generated_aliases: true,
           multi_row_table_plans: true,
           history_classification: true,
+          actor_display_names: true,
         },
         driver_features: {
           mongodb: {
@@ -2652,6 +2697,10 @@ export class StateQL {
           return this.disconnect();
         case "status":
           return this.status();
+        case "actor.show":
+          return this.showActor();
+        case "actor.set-name":
+          return this.setActorName(batchString(command.name, "name"));
         case "profile.add":
           return this.addProfile(
             batchString(command.name, "name"),
@@ -3723,6 +3772,21 @@ export class StateQL {
     }
   }
 
+  private validateActorName(value: unknown): string {
+    if (typeof value !== "string") {
+      throw new StateQLError("INVALID_COMMAND", "Actor name must be a string.");
+    }
+    const name = value.trim();
+    if (!name) throw new StateQLError("INVALID_COMMAND", "Actor name is required.");
+    if ([...name].length > 80) {
+      throw new StateQLError("INVALID_COMMAND", "Actor name cannot exceed 80 characters.");
+    }
+    if (/[\u0000-\u001f\u007f]/u.test(name)) {
+      throw new StateQLError("INVALID_COMMAND", "Actor name cannot contain control characters.");
+    }
+    return name;
+  }
+
   private throwMembershipDenied(session: SessionRecord): never {
     throw new StateQLError(
       "PERMISSION_DENIED",
@@ -3991,6 +4055,7 @@ export class StateQL {
         },
       } satisfies Failure;
     }
+    const actorName = this.store.getActor(session.id, this.actorId)!.actor_name;
     try {
       const result = await action(session);
       const responseSession = result.session ?? session;
@@ -3998,6 +4063,7 @@ export class StateQL {
       const history = this.store.addHistory({
         sessionId: session.id,
         actorId: this.actorId,
+        actorName,
         origin,
         category,
         internal,
@@ -4031,6 +4097,7 @@ export class StateQL {
       const history = this.store.addHistory({
         sessionId: session.id,
         actorId: this.actorId,
+        actorName,
         origin,
         category,
         internal,
@@ -4067,6 +4134,7 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     timestamp: item.timestamp,
     session_id: item.session_id,
     actor_id: item.actor_id,
+    actor_name: item.actor_name,
     origin: item.origin,
     category: item.category,
     internal: Boolean(item.internal),
@@ -4079,6 +4147,12 @@ function historyEntry(item: HistoryRecord): HistoryEntry {
     success: Boolean(item.success),
     error_code: item.error_code,
   };
+}
+
+function actorNameHistoryTarget(value: unknown): string | undefined {
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+  const name = value.trim();
+  return name ? [...name].slice(0, 80).join("") : undefined;
 }
 
 const COMMAND_ORIGINS = new Set<CommandOrigin>([

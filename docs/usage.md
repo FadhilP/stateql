@@ -100,6 +100,8 @@ stql connect --credential-ref REF [--name NAME] [--read-only|--read-write]
 stql connect --profile NAME
 stql disconnect
 stql status
+stql actor show
+stql actor set-name <display-name>
 stql profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
                            [--read-only|--read-write]
 stql profile list|show|remove
@@ -227,6 +229,17 @@ transactions remain owned by the actor that created them.
 Callers that omit `actor` keep the legacy behavior where the actor ID is the
 session name.
 
+Actor IDs are immutable authorization and ownership identities. Each actor also
+has a mutable display name, initially equal to its ID. The selected actor may
+change only its own display name with `stql actor set-name <display-name>`;
+names are trimmed, limited to 80 characters, and cannot contain control
+characters. Display names are contextual metadata and must not be used for
+authorization.
+
+History records both the stable `actor_id` and the `actor_name` in effect when
+the command began. Renaming therefore does not rewrite earlier attribution; the
+rename is itself recorded as an `actor.set-name` management command.
+
 ### Result lifetime and limits
 
 Result rows are materialized locally for durable access. By default, read cache
@@ -350,8 +363,9 @@ stql batch commands.json
 ```
 
 Batch fields use snake case. Supported command names match CLI paths, such as
-`filter`, `transaction.begin`, `session.summary`, `alias.set`, `plan`, and
-`apply`. Query commands may set `preview_rows` from 0 to 200. Native MongoDB
+`actor.show`, `actor.set-name`, `filter`, `transaction.begin`, `session.summary`,
+`alias.set`, `plan`, and `apply`. `actor.set-name` takes the display name in the
+`name` field. Query commands may set `preview_rows` from 0 to 200. Native MongoDB
 batches use `mongo.query`, `mongo.exec`, or `mongo.plan` with the command object
 in `mongo`; the same cache, replay, idempotency, safety, and timeout fields
 apply. Database commands may set `timeout_ms`; otherwise they use the 30-second

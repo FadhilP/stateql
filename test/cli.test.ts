@@ -113,6 +113,38 @@ test("local profiles persist and connect by bare or explicit name", async () => 
   assert.equal(addedCredentialProfile.credential_ref, opaqueReference);
 });
 
+test("CLI actor display names persist without changing actor identity", () => {
+  const home = createTemporaryDirectory("stateql-actor-name-test-");
+  const env = {
+    ...process.env,
+    STQL_HOME: home,
+    STQL_SESSION: "audit-workspace",
+    STQL_ACTOR: "agent-stable-id",
+  };
+  const renamed = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "actor", "set-name", "migration reviewer"],
+    { cwd: process.cwd(), env, encoding: "utf8" },
+  );
+  assert.equal(renamed.status, 0, renamed.stderr);
+  const renamedActor = JSON.parse(renamed.stdout) as {
+    actor_id: string;
+    actor_name: string;
+  };
+  assert.equal(renamedActor.actor_id, "agent-stable-id");
+  assert.equal(renamedActor.actor_name, "migration reviewer");
+
+  const shown = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "actor", "show"],
+    { cwd: process.cwd(), env, encoding: "utf8" },
+  );
+  assert.equal(shown.status, 0, shown.stderr);
+  const actor = JSON.parse(shown.stdout) as { actor_id: string; actor_name: string };
+  assert.equal(actor.actor_id, "agent-stable-id");
+  assert.equal(actor.actor_name, "migration reviewer");
+});
+
 test("profiles update source references and read-only state atomically without leaking secrets", async () => {
   const stateql = new StateQL({ home: createTemporaryDirectory() });
   try {

@@ -1,18 +1,19 @@
-import {
-  BSON,
+import { createRequire } from "node:module";
+import { BSON } from "bson";
+import type {
+  Abortable,
+  AggregateOptions,
+  BulkWriteOptions,
+  ClientSession,
+  CollationOptions,
+  DeleteOptions,
+  Document,
+  FindOptions,
+  Hint,
   MongoClient,
-  type Abortable,
-  type AggregateOptions,
-  type BulkWriteOptions,
-  type ClientSession,
-  type CollationOptions,
-  type DeleteOptions,
-  type Document,
-  type FindOptions,
-  type Hint,
-  type ReplaceOptions,
-  type Sort,
-  type UpdateOptions,
+  ReplaceOptions,
+  Sort,
+  UpdateOptions,
 } from "mongodb";
 import {
   AdapterExecutionError,
@@ -33,6 +34,10 @@ import type {
   MongoWriteOutcome,
   Row,
 } from "./types.js";
+
+const require = createRequire(import.meta.url);
+let mongodbModule: typeof import("mongodb") | undefined;
+const mongodb = () => (mongodbModule ??= require("mongodb") as typeof import("mongodb"));
 
 const MAX_INSPECTION_ITEMS = 1_000;
 const FIND_OPTIONS = new Set([
@@ -229,7 +234,7 @@ export class MongoAdapter {
     this.databaseName = connection.database_name;
     this.readOnly = Boolean(connection.read_only);
     const timeout = remainingMilliseconds(context);
-    this.client = new MongoClient(input.source, {
+    this.client = new (mongodb().MongoClient)(input.source, {
       connectTimeoutMS: timeout,
       serverSelectionTimeoutMS: timeout,
       waitQueueTimeoutMS: timeout,

@@ -1,4 +1,4 @@
-import { createClient, RESP_TYPES, WatchError } from "@redis/client";
+import { createRequire } from "node:module";
 import { AdapterExecutionError, AdapterWriteError, type AdapterContext } from "./adapters.js";
 import type {
   CatalogObject,
@@ -11,6 +11,10 @@ import type {
   Column,
 } from "./types.js";
 import { hash, toJsonSafe } from "./util.js";
+
+const require = createRequire(import.meta.url);
+let redisModule: typeof import("@redis/client") | undefined;
+const redis = () => (redisModule ??= require("@redis/client") as typeof import("@redis/client"));
 
 const MAX_ARGUMENTS = 100;
 const MAX_ARGUMENT_BYTES = 256 * 1024;
@@ -94,12 +98,12 @@ export function deserializeRedisCommand(value: string): RedisCommand {
 
 export class RedisAdapter {
   readonly confidence = "ttl_based" as const;
-  private readonly client;
+  private readonly client: ReturnType<typeof import("@redis/client")["createClient"]>;
   private connected = false;
   private closed = false;
 
   constructor(source: string, private readonly readOnly: boolean, private readonly context: AdapterContext) {
-    this.client = createClient({
+    this.client = redis().createClient({
       url: source,
       socket: {
         connectTimeout: remainingMilliseconds(context),
@@ -175,7 +179,7 @@ export class RedisAdapter {
       };
     } catch (error) {
       if (error instanceof AdapterWriteError) throw error;
-      if (error instanceof WatchError) throw new AdapterWriteError("ROW_CONFLICT: The Redis key changed. Reload before editing.", false);
+      if (error instanceof redis().WatchError) throw new AdapterWriteError("ROW_CONFLICT: The Redis key changed. Reload before editing.", false);
       if (error instanceof AdapterExecutionError) throw error;
       throw new AdapterWriteError(errorText(error), dispatched);
     }
@@ -255,7 +259,7 @@ export class RedisAdapter {
     const [type, dump] = await Promise.all([
       this.execute(["TYPE", key], false),
       withDeadline(
-        this.client.sendCommand<Buffer | null>(["DUMP", key], { typeMapping: { [RESP_TYPES.BLOB_STRING]: Buffer } }),
+        this.client.sendCommand<Buffer | null>(["DUMP", key], { typeMapping: { [redis().RESP_TYPES.BLOB_STRING]: Buffer } }),
         this.context,
         false,
         () => this.stop(),

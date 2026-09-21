@@ -110,6 +110,7 @@ export interface HistoryEntry {
   timestamp: string;
   session_id: string;
   actor_id: string;
+  actor_name: string;
   origin: CommandOrigin;
   category: HistoryCategory;
   internal: boolean;
@@ -137,6 +138,7 @@ export interface StateQLSnapshot {
     status: string;
   };
   actor_id: string;
+  actor_name: string;
   connection: {
     connection_id: string;
     /** Generated display identity; optional for older snapshot producers. */
@@ -428,6 +430,8 @@ export type BatchCommandName =
   | "connect"
   | "disconnect"
   | "status"
+  | "actor.show"
+  | "actor.set-name"
   | "profile.add"
   | "profile.list"
   | "profile.show"
@@ -563,6 +567,7 @@ export interface StatusData {
   session_id: string;
   session_name: string;
   actor_id: string;
+  actor_name: string;
   connection: StatusConnectionData | null;
   transaction: TransactionReferenceData | null;
   state_version: string | null;
@@ -582,6 +587,7 @@ export interface ActorUnlinkData {
 
 export interface ActorData {
   actor_id: string;
+  actor_name: string;
   attached_at: string;
 }
 
