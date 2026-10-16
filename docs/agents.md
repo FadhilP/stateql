@@ -25,6 +25,9 @@ stql query "SELECT id, name FROM users WHERE status = ? ORDER BY id" --param act
 {"ok":true,"handle":"katcitg6un","total":333,"next_offset":5,"columns":["id","name"],"rows":[[2,"Ada"],[3,"Grace"],[5,"Linus"],[6,"Alan"],[8,"Edsger"]]}
 ```
 
+- Placeholders are `?` for SQLite and MySQL, and `$1`, `$2` for PostgreSQL. In
+  a shell, put SQL that contains `$1` in single quotes. `filter` predicates
+  always use `?`.
 - Rows are arrays in `columns` order. If rows have different keys, they stay
   objects and `columns` is omitted.
 - `next_offset` is present only when more rows exist.
