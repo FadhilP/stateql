@@ -222,13 +222,13 @@ function scenario(): TerminalStep[] {
       ),
       commandId: "query",
       capture: "result",
-      expect: /"name":"Ada"/,
+      expect: /"Ada"/,
     },
     {
       label: "show result",
       command: (state) => stql("show", required(state, "result")),
       commandId: "show",
-      expect: /"name":"Grace"/,
+      expect: /"Grace"/,
     },
     {
       label: "page result rows",
@@ -346,7 +346,7 @@ function scenario(): TerminalStep[] {
         "query",
         "SELECT status FROM terminal_items WHERE name = 'Ada' ORDER BY id",
       ),
-      expect: /"status":"reviewed"/,
+      expect: /"reviewed"/,
     },
     {
       label: "begin committed transaction",
@@ -394,7 +394,7 @@ function scenario(): TerminalStep[] {
         "exec",
         "INSERT INTO terminal_items (name, status) VALUES ('Linus', 'committed')",
       ),
-      expect: /"committed":false/,
+      expect: /"status":"pending"/,
     },
     {
       label: "reject query during staged transaction",
@@ -418,7 +418,7 @@ function scenario(): TerminalStep[] {
         "query",
         "SELECT name FROM terminal_items WHERE name = 'Linus' ORDER BY id",
       ),
-      expect: /"name":"Linus"/,
+      expect: /"Linus"/,
     },
     {
       label: "begin rolled-back transaction",
@@ -432,7 +432,7 @@ function scenario(): TerminalStep[] {
         "exec",
         "INSERT INTO terminal_items (name, status) VALUES ('Temporary', 'pending')",
       ),
-      expect: /"committed":false/,
+      expect: /"status":"pending"/,
     },
     {
       label: "roll back transaction",
@@ -447,7 +447,7 @@ function scenario(): TerminalStep[] {
         "query",
         "SELECT COUNT(*) AS rolled_back FROM terminal_items WHERE name = 'Temporary' ORDER BY rolled_back",
       ),
-      expect: /"rolled_back":0/,
+      expect: /"columns":\["rolled_back"\],"rows":\[\[0\]\]/,
     },
     {
       label: "read history",
@@ -475,7 +475,7 @@ function scenario(): TerminalStep[] {
       label: "query MongoDB in terminal",
       command: stql("mongo", "query", JSON.stringify(mongoQuery)),
       commandId: "mongo.query",
-      expect: /"name":"Mongo Ada"/,
+      expect: /"Mongo Ada"/,
     },
     {
       label: "plan MongoDB write in terminal",
@@ -509,7 +509,7 @@ function scenario(): TerminalStep[] {
         }),
       ),
       commandId: "mongo.exec",
-      expect: /"committed":false/,
+      expect: /"status":"pending"/,
     },
     {
       label: "roll back MongoDB transaction",
@@ -574,7 +574,7 @@ function scenario(): TerminalStep[] {
     {
       label: "verify disconnected status",
       command: stql("status"),
-      expect: /"connection":null/,
+      expect: /"session_id":(?!.*"connection")/,
     },
     {
       label: "close current session",

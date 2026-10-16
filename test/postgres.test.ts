@@ -514,7 +514,7 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   hangMaintenance = true;
   const timedOut = await stateql.exec("VACUUM timeout_table", {
     allowDestructive: true,
-    timeoutMs: 10,
+    timeoutMs: 100,
   });
   assert.equal(timedOut.ok, false);
   if (!timedOut.ok) {
@@ -525,7 +525,7 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
 
   const controller = new AbortController();
   const cancelledCloseCount = closeCount;
-  setTimeout(() => controller.abort(), 10).unref();
+  setTimeout(() => controller.abort(), 100).unref();
   const cancelled = await stateql.exec("ANALYZE cancelled_table", {
     allowDestructive: true,
     signal: controller.signal,

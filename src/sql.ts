@@ -106,7 +106,12 @@ function parseSqlStatement(
         ? "MySQL"
         : "Sqlite";
   const parserSql = driver === "postgres" ? postgresParserSql(sql) : sql;
-  const parsed = parser.astify(parserSql, { database });
+  let parsed: ReturnType<typeof parser.astify>;
+  try {
+    parsed = parser.astify(parserSql, { database });
+  } catch (error) {
+    throw new StateQLError("INVALID_SQL", syntaxErrorMessage(error, parserSql));
+  }
   if (Array.isArray(parsed) && parsed.length !== 1) {
     throw new StateQLError(
       "INVALID_SQL",
@@ -1218,6 +1223,19 @@ function postgresBlockCommentEnd(
     }
   }
   return undefined;
+}
+
+// The parser lists every expected token (often 500+ characters); position and nearby text are enough to fix the SQL.
+function syntaxErrorMessage(error: unknown, sql: string): string {
+  const start = (error as {
+    location?: { start?: { offset: number; line: number; column: number } };
+  }).location?.start;
+  if (!start) return error instanceof Error ? error.message : "Invalid SQL.";
+  const near = sql.slice(start.offset, start.offset + 20).split("\n")[0];
+  const position = `line ${start.line}, column ${start.column}`;
+  return near
+    ? `Syntax error at ${position} near "${near}".`
+    : `Syntax error at ${position}: unexpected end of input.`;
 }
 
 function postgresParserSql(sql: string): string {

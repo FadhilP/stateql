@@ -288,9 +288,10 @@ test("CLI parses positional EJSON and maps native result, operation, and plan ha
   const query = run(["mongo", "query", payload]);
   assert.equal(query.status, 0, query.stderr || query.stdout);
   const queried = JSON.parse(query.stdout) as Record<string, any>;
-  assert.match(queried.handle, /^q_[a-z2-7]{26}$/);
+  assert.match(queried.handle, /^[a-z2-7]{10}$/);
   assert.equal(queried.total, 1);
   assert.equal(queried.rows[0]._id.$oid, "507f1f77bcf86cd799439011");
+  assert.equal("columns" in queried, false);
   assert.equal("result_id" in queried, false);
 
   const plan = run([

@@ -33,6 +33,7 @@ import {
 import {
   asStateQLError,
   CredentialResolutionError,
+  isTransientDatabaseError,
   StateQLError,
 } from "./errors.js";
 import {
@@ -1182,7 +1183,7 @@ export class StateQL {
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
           {
-            retryable: true,
+            retryable: isTransientDatabaseError(error),
             executed: true,
           },
         );
@@ -1302,7 +1303,7 @@ export class StateQL {
         throw new StateQLError(
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
-          { retryable: true, executed: true },
+          { retryable: isTransientDatabaseError(error), executed: true },
         );
       } finally {
         await closeAdapterQuietly(adapter);
@@ -1346,7 +1347,7 @@ export class StateQL {
       } catch (error) {
         if (error instanceof StateQLError) throw error;
         if (error instanceof AdapterExecutionError) throw stoppedStateQLError(error, true);
-        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { retryable: true, executed: true });
+        throw new StateQLError("QUERY_FAILED", safeCredentialErrorMessage(error, source), { retryable: isTransientDatabaseError(error), executed: true });
       } finally { await closeAdapterQuietly(adapter); }
     });
   }
@@ -2271,7 +2272,7 @@ export class StateQL {
         throw new StateQLError(
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
-          { retryable: true, executed: true },
+          { retryable: isTransientDatabaseError(error), executed: true },
         );
       } finally {
         await closeAdapterQuietly(adapter);
@@ -2352,7 +2353,7 @@ export class StateQL {
         throw new StateQLError(
           "QUERY_FAILED",
           safeCredentialErrorMessage(error, adapterSource),
-          { retryable: true, executed: true },
+          { retryable: isTransientDatabaseError(error), executed: true },
         );
       } finally {
         await closeAdapterQuietly(adapter);
@@ -2508,7 +2509,7 @@ export class StateQL {
           throw new StateQLError(
             "QUERY_FAILED",
             safeCredentialErrorMessage(error, adapterSource),
-            { retryable: true, executed: true },
+            { retryable: isTransientDatabaseError(error), executed: true },
           );
         } finally {
           await closeAdapterQuietly(adapter);

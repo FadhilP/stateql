@@ -104,12 +104,10 @@ test("local profiles persist and connect by bare or explicit name", async () => 
   );
   assert.equal(addCredentialProfile.status, 0, addCredentialProfile.stderr);
   const addedCredentialProfile = JSON.parse(addCredentialProfile.stdout) as {
-    target: string | null;
-    secret_env: string | null;
-    credential_ref: string | null;
+    credential_ref: string;
   };
-  assert.equal(addedCredentialProfile.target, null);
-  assert.equal(addedCredentialProfile.secret_env, null);
+  assert.equal("target" in addedCredentialProfile, false);
+  assert.equal("secret_env" in addedCredentialProfile, false);
   assert.equal(addedCredentialProfile.credential_ref, opaqueReference);
 });
 
@@ -243,7 +241,8 @@ test("CLI accepts shell-safe parameters and applies destructive plans", async ()
   assert.equal(apply.status, 0, apply.stdout);
   const applied = JSON.parse(apply.stdout) as Record<string, unknown>;
   assert.match(String(applied.handle), /^op_/);
-  assert.equal(applied.plan_id, planId);
+  assert.equal("plan_id" in applied, false);
+  assert.equal(applied.status, "committed");
   assert.equal("operation_id" in applied, false);
 
   const restarted = new StateQL({ home: fixture.home });
@@ -288,16 +287,19 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   assert.equal(compactQuery.stdout.trim().split(/\r?\n/).length, 1);
   const compact = JSON.parse(compactQuery.stdout) as Record<string, any>;
   assert.equal(compact.ok, true);
-  assert.match(compact.handle, /^q_[a-z2-7]{26}$/);
+  assert.match(compact.handle, /^[a-z2-7]{10}$/);
   assert.equal(compact.total, 3);
+  assert.deepEqual(compact.columns, ["id", "name"]);
   assert.equal(compact.rows.length, 2);
-  assert.equal(compact.truncated, true);
+  assert.equal(Array.isArray(compact.rows[0]), true);
   assert.equal(compact.next_offset, 2);
   assert.equal("data" in compact, false);
   assert.equal("command_id" in compact, false);
   assert.equal("session_id" in compact, false);
-  assert.equal("columns" in compact, false);
   assert.equal("meta" in compact, false);
+  assert.equal("truncated" in compact, false);
+  assert.equal("cached" in compact, false);
+  assert.equal("display_alias" in compact, false);
 
   const compactRows = spawnSync(
     process.execPath,
@@ -310,7 +312,8 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   );
   assert.equal(compactRows.status, 0, compactRows.stderr);
   const page = JSON.parse(compactRows.stdout) as Record<string, any>;
-  assert.equal(page.handle, compact.handle);
+  assert.equal("handle" in page, false);
+  assert.deepEqual(page.columns, ["id", "name"]);
   assert.equal(page.rows.length, 2);
   assert.equal(page.total, 3);
   assert.equal(page.next_offset, 2);
@@ -330,7 +333,6 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   assert.equal(compactCount.status, 0, compactCount.stderr);
   assert.deepEqual(JSON.parse(compactCount.stdout), {
     ok: true,
-    handle: compact.handle,
     total: 3,
   });
 
@@ -352,15 +354,21 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   );
   assert.equal(compactFilter.status, 0, compactFilter.stderr);
   const filtered = JSON.parse(compactFilter.stdout) as Record<string, any>;
-  assert.match(filtered.handle, /^q_[a-z2-7]{26}$/);
+  assert.match(filtered.handle, /^[a-z2-7]{10}$/);
   assert.notEqual(filtered.handle, compact.handle);
   assert.equal(filtered.total, 1);
-  assert.equal(filtered.rows[0].name, "Ada");
-  assert.equal(filtered.next_offset, null);
+  assert.equal(filtered.rows[0][filtered.columns.indexOf("name")], "Ada");
+  assert.equal("next_offset" in filtered, false);
 
   const compactWarning = spawnSync(
     process.execPath,
-    ["dist/src/cli.js", "query", "SELECT id FROM output_rows"],
+    [
+      "dist/src/cli.js",
+      "query",
+      "SELECT id FROM output_rows",
+      "--preview-rows",
+      "1",
+    ],
     {
       cwd: process.cwd(),
       env: { ...process.env, STQL_HOME: fixture.home },
@@ -370,6 +378,52 @@ test("CLI defaults to compact agent output and preserves verbose JSON", async ()
   assert.equal(compactWarning.status, 0, compactWarning.stderr);
   const warning = JSON.parse(compactWarning.stdout) as Record<string, any>;
   assert.equal(warning.warnings[0].code, "NON_DETERMINISTIC_PAGINATION");
+
+  const completeUnordered = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "query", "SELECT id FROM output_rows"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(completeUnordered.status, 0, completeUnordered.stderr);
+  const complete = JSON.parse(completeUnordered.stdout) as Record<string, any>;
+  assert.equal(complete.total, 3);
+  assert.equal("warnings" in complete, false);
+
+  const compactHistory = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "history", "--limit", "2"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactHistory.status, 0, compactHistory.stderr);
+  const history = JSON.parse(compactHistory.stdout) as Record<string, any>;
+  assert.equal(typeof history.session_id, "string");
+  assert.equal(history.history.length, 2);
+  for (const entry of history.history) {
+    assert.equal("session_id" in entry, false);
+    assert.equal("error_code" in entry, false);
+  }
+
+  const compactObjects = spawnSync(
+    process.execPath,
+    ["dist/src/cli.js", "objects", "table"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, STQL_HOME: fixture.home },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(compactObjects.status, 0, compactObjects.stderr);
+  const catalog = JSON.parse(compactObjects.stdout) as Record<string, any>;
+  assert.deepEqual(catalog.columns, ["kind", "schema", "name"]);
+  assert.deepEqual(catalog.objects, [["table", "main", "output_rows"]]);
 
   const verboseQuery = spawnSync(
     process.execPath,
@@ -522,7 +576,8 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
   assert.equal(output.length, 2);
   assert.equal(output.every((response) => response.ok), true);
   assert.equal("data" in output[0]!, false);
-  assert.match(output[0]!.handle, /^q_[a-z2-7]{26}$/);
+  assert.match(output[0]!.handle, /^[a-z2-7]{10}$/);
+  assert.equal(output[0]!.alias, "pipe_rows");
   assert.equal(output[1]!.total, 1);
 
   const batchFile = join(fixture.home, "commands.json");

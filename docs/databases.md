@@ -1,6 +1,6 @@
 # Database support
 
-[Home](../README.md) · [Usage](usage.md) · [Database support](databases.md) · [TypeScript library](library.md)
+[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 - [Driver notes](#driver-notes)
 - [SQL statement support](#sql-statement-support)
@@ -10,9 +10,9 @@
 - [Native MongoDB](#native-mongodb)
 - [Native Redis](#native-redis)
 
-Connect using the [usage guide](usage.md#connections-and-profiles). All writes
+Connect using the [usage guide](connections.md). All writes
 require a read-write connection; SQL/MongoDB approvals and retry rules are
-covered under [write safety](usage.md#write-safety).
+covered under [write safety](writes.md).
 
 ## Driver notes
 
@@ -37,7 +37,7 @@ StateQL parses and classifies one `SELECT`, `INSERT`, `REPLACE`, `UPDATE`,
 `node-sql-parser`, subject to dialect support and safety validation. Reads use
 `query`; mutations and DDL use durable `exec`/`plan`/`apply` operations. Raw
 transaction-control SQL is unsupported: use
-[staged transactions](usage.md#transactions), not `BEGIN` or `COMMIT` statements.
+[staged transactions](writes.md#transactions), not `BEGIN` or `COMMIT` statements.
 MongoDB and Redis use separate native command APIs.
 
 Unrecognized or parser-unsupported forms remain blocked.

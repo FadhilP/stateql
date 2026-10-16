@@ -67,6 +67,49 @@ export function exitCodeFor(code: string): number {
   return 1;
 }
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EAI_AGAIN",
+  "PROTOCOL_CONNECTION_LOST",
+]);
+// SQLSTATE classes: connection, transaction rollback, resources, operator intervention, system.
+const TRANSIENT_SQLSTATE_CLASSES = new Set(["08", "40", "53", "57", "58"]);
+// MySQL: too many connections, lock wait timeout, deadlock.
+const TRANSIENT_MYSQL_ERRNOS = new Set([1040, 1205, 1213]);
+const TRANSIENT_ERROR_NAMES = new Set([
+  "MongoNetworkError",
+  "MongoNetworkTimeoutError",
+  "MongoServerSelectionError",
+  "SocketClosedUnexpectedlyError",
+  "ConnectionTimeoutError",
+]);
+const TRANSIENT_SQLITE_MESSAGE = /database (table )?is locked|SQLITE_BUSY/i;
+
+// Permanent failures such as a missing table must not invite retries; unknown errors are not retryable.
+export function isTransientDatabaseError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const details = error as {
+    code?: unknown;
+    sqlState?: unknown;
+    errno?: unknown;
+    errorLabels?: unknown;
+  };
+  if (typeof details.code === "string" && TRANSIENT_NETWORK_CODES.has(details.code)) return true;
+  if (TRANSIENT_ERROR_NAMES.has(error.name)) return true;
+  if (typeof details.errno === "number" && TRANSIENT_MYSQL_ERRNOS.has(details.errno)) return true;
+  if (Array.isArray(details.errorLabels) && details.errorLabels.includes("TransientTransactionError")) {
+    return true;
+  }
+  const sqlState = typeof details.sqlState === "string" ? details.sqlState : details.code;
+  if (typeof sqlState === "string" && /^[0-9A-Z]{5}$/.test(sqlState)) {
+    return TRANSIENT_SQLSTATE_CLASSES.has(sqlState.slice(0, 2));
+  }
+  return TRANSIENT_SQLITE_MESSAGE.test(error.message);
+}
+
 export function asStateQLError(error: unknown): StateQLError {
   if (error instanceof StateQLError) return error;
   const message = error instanceof Error ? error.message : String(error);

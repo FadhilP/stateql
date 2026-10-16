@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
+import { isTransientDatabaseError } from "../src/errors.js";
 import { StateQL } from "../src/stateql.js";
 import { StateStore } from "../src/store.js";
 import type { BatchCommand } from "../src/types.js";
@@ -496,3 +497,43 @@ test("schema inspection and secret handling stay machine-safe", async () => {
   fixture.stateql.close();
 });
 
+
+test("SQL syntax errors report position instead of every expected token", async () => {
+  const fixture = await createFixture();
+  const incomplete = await fixture.stateql.query("SELECT 1 AS value WHERE");
+  assertFailure(incomplete, "INVALID_SQL");
+  if (!incomplete.ok) {
+    assert.equal(
+      incomplete.error.message,
+      "Syntax error at line 1, column 24: unexpected end of input.",
+    );
+  }
+  const misspelled = await fixture.stateql.query("SELECT 1 AS value\nWHER value = 1");
+  assertFailure(misspelled, "INVALID_SQL");
+  if (!misspelled.ok) {
+    assert.match(misspelled.error.message, /^Syntax error at line 2, column \d+ near "/);
+  }
+  fixture.stateql.close();
+});
+
+test("only transient database failures are retryable", async () => {
+  const withProperties = (properties: Record<string, unknown>, message = "failed") =>
+    Object.assign(new Error(message), properties);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "40001" })), true);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "08006" })), true);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "42P01" })), false);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "ER_LOCK_DEADLOCK", errno: 1213, sqlState: "40001" })), true);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "ER_NO_SUCH_TABLE", errno: 1146, sqlState: "42S02" })), false);
+  assert.equal(isTransientDatabaseError(withProperties({ code: "ECONNRESET" })), true);
+  assert.equal(isTransientDatabaseError(new Error("database is locked")), true);
+  assert.equal(isTransientDatabaseError(new Error("no such table: missing")), false);
+
+  const fixture = await createFixture();
+  const missing = await fixture.stateql.query("SELECT * FROM missing_table");
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.equal(missing.error.code, "QUERY_FAILED");
+    assert.equal(missing.error.retryable, false);
+  }
+  fixture.stateql.close();
+});

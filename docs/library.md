@@ -1,6 +1,6 @@
 # TypeScript library
 
-[Home](../README.md) · [Usage](usage.md) · [Database support](databases.md) · [TypeScript library](library.md)
+[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 - [Getting started](#getting-started)
 - [Responses and command context](#responses-and-command-context)
@@ -49,10 +49,11 @@ the durable session. Await active commands before closing. Use `disconnect()`
 only when you intend to remove the session's shared active connection.
 
 Options include `timeoutMs`, `credentialTimeoutMs`, `maxResultBytes`,
-`maxStateBytes`, `cacheTtlSeconds`, and `resultTtlSeconds`. Database calls also
-accept `signal` for cancellation. See [limits](usage.md#result-lifetime-and-limits)
-and [deadlines](usage.md#deadlines-and-cancellation) for defaults and behavior.
-The same [write safety](usage.md#write-safety) and
+`maxStateBytes`, `maxCellCharacters`, `cacheTtlSeconds`, and
+`resultTtlSeconds`. Database calls also
+accept `signal` for cancellation. See [limits](results.md#result-lifetime-and-limits)
+and [deadlines](cli.md#deadlines-and-cancellation) for defaults and behavior.
+The same [write safety](writes.md) and
 [database restrictions](databases.md) apply to library calls.
 
 ## Responses and command context
