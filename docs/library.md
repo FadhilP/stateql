@@ -4,6 +4,7 @@
 
 - [Getting started](#getting-started)
 - [Responses and command context](#responses-and-command-context)
+  - [Compact responses for model context](#compact-responses-for-model-context)
 - [Actor workspaces](#actor-workspaces)
 - [Credential resolution](#credential-resolution)
 - [Safe profile updates](#safe-profile-updates)
@@ -93,6 +94,23 @@ direct calls and `executeCommand(command)` calls are recorded as `legacy`.
 `history_origin` is only a retrieval filter; putting an `origin` field in a
 `BatchCommand` cannot attribute the command. `batch` accepts the same trusted
 context as `options.executionContext` for all commands in that batch.
+
+### Compact responses for model context
+
+When a response goes into a model's context, pass it through `agentResponse`
+with the batch command name. It returns the same compact shape as the CLI
+`agent` output mode (see [output modes](cli.md#output-modes)). Keep the full
+response for application logic.
+
+```ts
+import { agentResponse } from "@fadhilp/stateql";
+
+const response = await stateql.executeCommand(command, { origin: "model" });
+const forModel = JSON.stringify(agentResponse(response, command.command));
+```
+
+`objects.list` and `object.describe` are accepted as names for catalog
+responses from `listObjects` and `describeObject`.
 
 ## Actor workspaces
 

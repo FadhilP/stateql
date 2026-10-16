@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
 import { isTransientDatabaseError } from "../src/errors.js";
+import { agentResponse } from "../src/index.js";
 import { StateQL } from "../src/stateql.js";
 import { StateStore } from "../src/store.js";
 import type { BatchCommand } from "../src/types.js";
@@ -535,5 +536,19 @@ test("only transient database failures are retryable", async () => {
     assert.equal(missing.error.code, "QUERY_FAILED");
     assert.equal(missing.error.retryable, false);
   }
+  fixture.stateql.close();
+});
+
+test("agentResponse compacts library responses for model context", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE agent_items (id INTEGER)"));
+  const compact = agentResponse(await fixture.stateql.query("SELECT 1 AS value"), "query");
+  assert.match(String(compact.handle), /^[a-z2-7]{10}$/);
+  assert.deepEqual(compact.columns, ["value"]);
+  assert.deepEqual(compact.rows, [[1]]);
+  assert.equal("command_id" in compact, false);
+  const objects = agentResponse(await fixture.stateql.listObjects({}), "objects.list");
+  assert.deepEqual(objects.columns, ["kind", "schema", "name"]);
+  assert.deepEqual(objects.objects, [["table", "main", "agent_items"]]);
   fixture.stateql.close();
 });

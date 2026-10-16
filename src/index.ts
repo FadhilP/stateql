@@ -1,4 +1,5 @@
 export { StateQL } from "./stateql.js";
+export { agentResponse } from "./agent-response.js";
 export {
   CredentialResolutionError,
   StateQLError,
