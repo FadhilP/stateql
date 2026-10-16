@@ -1,6 +1,6 @@
 # Connections and profiles
 
-[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
+[StateQL](../README.md) · [Agent skill](../skills/stateql/SKILL.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 A connection accepts exactly one source: a direct target, `--env`,
 `--credential-ref`, or `--profile`. Library and batch callers may additionally

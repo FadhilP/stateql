@@ -1,6 +1,6 @@
 # TypeScript library
 
-[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
+[StateQL](../README.md) · [Agent skill](../skills/stateql/SKILL.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 - [Getting started](#getting-started)
 - [Responses and command context](#responses-and-command-context)

@@ -471,7 +471,7 @@ function parseParameters(
     : value!;
   let parsedValue: unknown;
   try {
-    parsedValue = JSON.parse(json) as unknown;
+    parsedValue = JSON.parse(withoutBom(json)) as unknown;
   } catch {
     throw new Error(
       `Invalid JSON from ${file ? "--params-file" : "--params"}. ` +
@@ -525,6 +525,11 @@ async function* readBatchCommands(
   }
 }
 
+// PowerShell pipes and Out-File/Notepad files can start with a UTF-8 BOM, which JSON.parse rejects.
+function withoutBom(value: string): string {
+  return value.startsWith("﻿") ? value.slice(1) : value;
+}
+
 function parseBatchCommand(value: unknown, location: string): BatchCommand {
   if (
     !value ||
@@ -538,7 +543,7 @@ function parseBatchCommand(value: unknown, location: string): BatchCommand {
 
 function parseBatchJson(value: string, location: string): unknown {
   try {
-    return JSON.parse(value) as unknown;
+    return JSON.parse(withoutBom(value)) as unknown;
   } catch {
     throw new Error(`Invalid JSON at ${location}.`);
   }
@@ -702,7 +707,7 @@ Credential refs require a trusted host CredentialResolver; the standalone CLI ca
 State: --max-state-bytes N, --cache-ttl-seconds N, --result-ttl-seconds N.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Agent rows: arrays in "columns" order (objects when shapes differ). next_offset only when more rows exist.
-Agent output omits null fields and false cached/duplicate flags. Guide: docs/agents.md.
+Agent output omits null fields and false cached/duplicate flags. Agent skill: skills/stateql/SKILL.md.
 Batch/pipe accept JSON array files or JSONL streams. Stop on first error.`;
 }
 

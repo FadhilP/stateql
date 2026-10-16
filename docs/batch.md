@@ -1,6 +1,6 @@
 # Batch and pipes
 
-[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
+[StateQL](../README.md) · [Agent skill](../skills/stateql/SKILL.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 `batch` reads a JSON array from a `.json` file or JSONL from a `.jsonl` file.
 `pipe` reads JSONL from standard input. Commands run sequentially and stop on

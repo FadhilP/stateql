@@ -22,6 +22,7 @@
     "dist/src",
     "README.md",
     "docs",
+    "skills",
     "LICENSE"
   ],
   "scripts": {

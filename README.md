@@ -40,11 +40,23 @@ stql filter katcitg6un "name LIKE ?" --param "A%"
 stql export katcitg6un --output users.csv
 ```
 
+## Agent skill
+
+`skills/stateql` is an [Agent Skill](https://agentskills.io) that teaches coding
+agents to use `stql` safely and with few tokens. Copy the folder into your
+agent's skills directory, for example for Claude Code:
+
+```bash
+cp -r "$(npm root -g)/@fadhilp/stateql/skills/stateql" ~/.claude/skills/
+```
+
+Use `.claude/skills/` inside a project to share it with your team.
+
 ## Documentation
 
 | Page | Contents |
 | --- | --- |
-| [Agent guide](docs/agents.md) | The short version for agents: connect, query, reuse, save tokens |
+| [Agent skill](skills/stateql/SKILL.md) | Rules, workflow, response format, quoting, and errors for coding agents |
 | [Connections](docs/connections.md) | Targets, environment credentials, profiles |
 | [CLI reference](docs/cli.md) | Commands, parameters, catalog, output modes, deadlines |
 | [Results and state](docs/results.md) | Sessions, actors, limits, caching, local filtering |

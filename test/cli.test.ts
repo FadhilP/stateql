@@ -577,6 +577,16 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
   assert.equal(output.every((response) => response.ok), true);
   assert.equal("data" in output[0]!, false);
   assert.match(output[0]!.handle, /^[a-z2-7]{10}$/);
+
+  const bomPipe = spawnSync(process.execPath, ["dist/src/cli.js", "pipe"], {
+    cwd: process.cwd(),
+    env: { ...process.env, STQL_HOME: fixture.home },
+    input: `﻿${JSON.stringify({ command: "count", handle: "pipe_rows" })}
+`,
+    encoding: "utf8",
+  });
+  assert.equal(bomPipe.status, 0, bomPipe.stdout);
+  assert.equal(JSON.parse(bomPipe.stdout).total, 1);
   assert.equal(output[0]!.alias, "pipe_rows");
   assert.equal(output[1]!.total, 1);
 

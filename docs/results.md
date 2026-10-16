@@ -1,6 +1,6 @@
 # Durable state and result reuse
 
-[StateQL](../README.md) · [Agents](agents.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
+[StateQL](../README.md) · [Agent skill](../skills/stateql/SKILL.md) · [Connections](connections.md) · [CLI](cli.md) · [Results](results.md) · [Writes](writes.md) · [Batch](batch.md) · [Databases](databases.md) · [Library](library.md)
 
 State metadata lives under `STQL_HOME`, or the platform data directory when
 unset. StateQL keeps connections, sessions, handles, aliases, cache entries,
