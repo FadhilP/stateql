@@ -8,6 +8,7 @@ import { BSON } from "mongodb";
 import { exitCodeFor } from "./errors.js";
 import { StateQL } from "./stateql.js";
 import { agentResponse } from "./agent-response.js";
+import { askPassword, cliCredentialResolver, deleteOsPassword, saveOsPassword } from "./os-credentials.js";
 import type {
   BatchCommand,
   CatalogObject,
@@ -30,6 +31,7 @@ const parsed = parseArgs({
     profile: { type: "string" },
     env: { type: "string" },
     "credential-ref": { type: "string" },
+    "ask-password": { type: "boolean" },
     "read-only": { type: "boolean" },
     "read-write": { type: "boolean" },
     params: { type: "string" },
@@ -94,6 +96,7 @@ const stateql = new StateQL({
   ...(values["max-cell-characters"] === undefined
     ? {}
     : { maxCellCharacters: Number(values["max-cell-characters"]) }),
+  credentialResolver: cliCredentialResolver,
   signal: abortController.signal,
 });
 
@@ -400,33 +403,57 @@ async function dispatchProfile(
   args: string[],
 ): Promise<Response<unknown>> {
   switch (action) {
-    case "add":
+    case "add": {
       if (values["read-only"] && values["read-write"]) {
         throw new Error("--read-only and --read-write are mutually exclusive.");
       }
-      return stateql.addProfile(
-        requireValue(args[0], "profile name"),
-        args[1],
-        {
-          ...(values.env ? { secretEnv: values.env } : {}),
-          ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
-          readOnly: !values["read-write"],
-        },
-      );
-    case "update":
+      const name = requireValue(args[0], "profile name");
+      const passwordRef = values["ask-password"]
+        ? await saveOsPassword(await askPassword(name, requireValue(args[1], "TARGET for --ask-password")))
+        : undefined;
+      const added = await stateql.addProfile(name, args[1], {
+        ...(values.env ? { secretEnv: values.env } : {}),
+        ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
+        ...(passwordRef ? { passwordRef } : {}),
+        readOnly: !values["read-write"],
+      });
+      if (!added.ok) await deleteOsPassword(passwordRef);
+      return added;
+    }
+    case "update": {
       if (values["read-only"] && values["read-write"]) throw new Error("--read-only and --read-write are mutually exclusive.");
-      return stateql.updateProfile(requireValue(args[0], "profile name"), {
+      const name = requireValue(args[0], "profile name");
+      const before = await stateql.showProfile(name);
+      if (!before.ok) return before;
+      const target = args[1] ?? before.data.target;
+      const passwordRef = values["ask-password"]
+        ? await saveOsPassword(await askPassword(name, requireValue(target ?? undefined, "TARGET for --ask-password")))
+        : undefined;
+      const updated = await stateql.updateProfile(name, {
         ...(args[1] !== undefined ? { target: args[1] } : {}),
         ...(values.env ? { secretEnv: values.env } : {}),
         ...(values["credential-ref"] ? { credentialRef: values["credential-ref"] } : {}),
+        ...(passwordRef ? { passwordRef } : {}),
         ...(values["read-only"] ? { readOnly: true } : values["read-write"] ? { readOnly: false } : {}),
       });
+      if (!updated.ok) {
+        await deleteOsPassword(passwordRef);
+        return updated;
+      }
+      if (updated.data.password_ref !== before.data.password_ref) await deleteOsPassword(before.data.password_ref);
+      return updated;
+    }
     case "list":
       return stateql.listProfiles();
     case "show":
       return stateql.showProfile(requireValue(args[0], "profile name"));
-    case "remove":
-      return stateql.removeProfile(requireValue(args[0], "profile name"));
+    case "remove": {
+      const name = requireValue(args[0], "profile name");
+      const before = await stateql.showProfile(name);
+      const removed = await stateql.removeProfile(name);
+      if (removed.ok && before.ok) await deleteOsPassword(before.data.password_ref);
+      return removed;
+    }
     default:
       throw new Error(`Unknown profile command "${action ?? ""}".`);
   }
@@ -685,7 +712,7 @@ Commands:
   connect TARGET | --env ENV | --credential-ref REF | --profile NAME
   disconnect, status
   actor show | set-name NAME
-  profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
+  profile add|update NAME [TARGET [--ask-password] | --env ENV | --credential-ref REF]
   profile list|show|remove
   query, filter, exec, show, rows, count, columns, export
   mongo query|exec|plan '<EJSON command>'
@@ -703,7 +730,8 @@ SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
 Query preview: --preview-rows N (default: 5, maximum: 200).
 Long cells: --max-cell-characters N (default: 200); use export for full values.
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.
-Credential refs require a trusted host CredentialResolver; the standalone CLI cannot resolve them.
+Saved passwords: --ask-password opens a dialog and keeps the password in the OS credential store.
+Other credential refs require a trusted host CredentialResolver; the standalone CLI cannot resolve them.
 State: --max-state-bytes N, --cache-ttl-seconds N, --result-ttl-seconds N.
 Output: --output agent|json|jsonl|text|silent (default: agent).
 Agent rows: arrays in "columns" order (objects when shapes differ). next_offset only when more rows exist.

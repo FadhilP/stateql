@@ -22,7 +22,7 @@ If `stql --version` fails, ask the user before installing
 3. Never add `--allow-destructive`, `--allow-unbounded`, or `--replay` unless the
    user explicitly approved that operation. They are approvals, not fixes.
 4. Never put a password in a command. Remote URLs go in an environment variable
-   that you pass with `--env`.
+   that you pass with `--env`, or in a profile with a saved password (below).
 5. Pass values as parameters (`--param`), never by building SQL strings.
 6. Do not rerun a query to see more rows. Use its handle.
 
@@ -36,6 +36,11 @@ stql connect --env DATABASE_URL --read-write # only for requested changes
 ```
 
 `status` without a `connection` field means no connection is open.
+
+To save a remote database with its password, run
+`stql profile add <name> '<password-free URL>' --ask-password`. The user types
+the password in a dialog; then use `stql connect <name>`. `stql profile list`
+shows saved profiles.
 
 ## Read workflow
 

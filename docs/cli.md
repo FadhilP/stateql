@@ -11,7 +11,7 @@ stql disconnect
 stql status
 stql actor show
 stql actor set-name <display-name>
-stql profile add|update NAME [TARGET | --env ENV | --credential-ref REF]
+stql profile add|update NAME [TARGET [--ask-password] | --env ENV | --credential-ref REF]
                            [--read-only|--read-write]
 stql profile list|show|remove
 stql session start|list|show|summary|close

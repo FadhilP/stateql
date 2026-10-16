@@ -11,6 +11,7 @@ import {
 } from "../src/index.js";
 import { injectPassword, validatePasswordReferenceTarget } from "../src/connection.js";
 import { StateStore } from "../src/store.js";
+import { cliCredentialResolver, deleteOsPassword, saveOsPassword } from "../src/os-credentials.js";
 import {
   assertFailure,
   createTemporaryDirectory,
@@ -857,4 +858,43 @@ test("password reference capability gates setup before legacy runtimes execute i
   assert.equal(setupCalls, 0);
   connectionSetup(StateQL);
   assert.equal(setupCalls, 1);
+});
+
+test("CLI resolver reads OS-stored passwords and environment variables only", async (t) => {
+  let reference: string;
+  try {
+    reference = await saveOsPassword("p@ss:wörd");
+  } catch {
+    t.skip("No OS credential store is available.");
+    return;
+  }
+  const base = {
+    actorId: "cli",
+    session: { id: "s", name: "s" },
+    operation: "connect",
+    access: "read",
+  } as const;
+  try {
+    assert.equal(
+      await cliCredentialResolver({ ...base, reference, source: "password_ref", target: "postgres://u@h/d" }),
+      "p@ss:wörd",
+    );
+    assert.equal(
+      await cliCredentialResolver({ ...base, reference: "pylon:stateql:v1:x", source: "password_ref", target: "postgres://u@h/d" }),
+      undefined,
+    );
+    assert.equal(await cliCredentialResolver({ ...base, reference, source: "credential_ref" }), undefined);
+    process.env.STQL_TEST_RESOLVER_URL = "postgres://u:p@h/d";
+    assert.equal(
+      await cliCredentialResolver({ ...base, reference: "STQL_TEST_RESOLVER_URL", source: "secret_env" }),
+      "postgres://u:p@h/d",
+    );
+  } finally {
+    delete process.env.STQL_TEST_RESOLVER_URL;
+    await deleteOsPassword(reference);
+  }
+  assert.equal(
+    await cliCredentialResolver({ ...base, reference, source: "password_ref", target: "postgres://u@h/d" }),
+    undefined,
+  );
 });

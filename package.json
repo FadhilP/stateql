@@ -47,6 +47,7 @@
     "node": ">=22.16"
   },
   "dependencies": {
+    "@napi-rs/keyring": "^2.1.1",
     "@redis/client": "^5.12.1",
     "bson": "^6.10.4",
     "mongodb": "^6.21.0",

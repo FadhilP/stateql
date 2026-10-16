@@ -45,9 +45,10 @@ export SQLITE_DATABASE='sqlite:./app.sqlite'
 stql connect --env SQLITE_DATABASE --name local --read-only
 ```
 
-StateQL stores no PostgreSQL, MySQL, MongoDB, or Redis password.
+StateQL stores no PostgreSQL, MySQL, MongoDB, or Redis password in its state.
 Credential-bearing URLs must be supplied through `--env` or an opaque full-URL
-credential reference. SQLite paths remain persisted as connection metadata.
+credential reference, or the password can be [saved in the OS credential
+store](#saved-passwords). SQLite paths remain persisted as connection metadata.
 
 ## Local profiles
 
@@ -70,15 +71,36 @@ stql connect --profile production
 ```
 
 Credential references are bounded nonempty opaque strings; StateQL does not
-apply environment-variable syntax or normalization to them. They can only be
-resolved by a trusted host `CredentialResolver`, so the standalone CLI may
-store them in profiles but cannot connect with them.
+apply environment-variable syntax or normalization to them. Apart from the
+`os:` password references below, they can only be resolved by a trusted host
+`CredentialResolver`, so the standalone CLI may store them in profiles but
+cannot connect with them.
+
+## Saved passwords
+
+`--ask-password` opens a password dialog and saves the password in the OS
+credential store: Windows Credential Manager, macOS Keychain, or Linux Secret
+Service. The profile keeps the password-free target and an `os:` password
+reference.
+
+```bash
+stql profile add charlie 'postgres://reader@db.example.com:5432/app?sslmode=verify-full' --ask-password --read-only
+stql profile update charlie --ask-password    # replace the saved password
+stql profile remove charlie                   # also deletes the saved password
+```
+
+The dialog uses Windows PowerShell on Windows, `osascript` on macOS, and `zenity`
+on Linux, so it also works when an agent runs the command. Replacing the
+password, changing the target or source, or removing the profile deletes the
+old saved password; reconnect sessions that used it. Any program running as
+your OS user can read the store, so give agent profiles a read-only database
+user.
 
 A bare connection target matching a profile name resolves to that profile;
 otherwise it remains a path or database URL.
 
 `profile update` changes subsequent connections, not an already-open connection.
 Omitting the source keeps it; supplying a new source replaces the old one.
-Password references are configured through the library or batch API, not a CLI
-`--password-ref` flag. See [safe profile updates](library.md#safe-profile-updates)
+Other password references are configured through the library or batch API, not
+a CLI `--password-ref` flag. See [safe profile updates](library.md#safe-profile-updates)
 for source-replacement and downgrade restrictions.
