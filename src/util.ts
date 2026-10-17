@@ -105,7 +105,7 @@ export function compactRows(
   );
 }
 
-function compactValue(value: unknown, max: number): unknown {
+export function compactValue(value: unknown, max: number): unknown {
   if (typeof value === "bigint") return value.toString();
   if (Buffer.isBuffer(value)) {
     return { type: "binary", length: value.length };

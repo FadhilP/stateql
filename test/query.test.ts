@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { isTransientDatabaseError } from "../src/errors.js";
@@ -550,5 +551,39 @@ test("agentResponse compacts library responses for model context", async () => {
   const objects = agentResponse(await fixture.stateql.listObjects({}), "objects.list");
   assert.deepEqual(objects.columns, ["kind", "schema", "name"]);
   assert.deepEqual(objects.objects, [["table", "main", "agent_items"]]);
+  fixture.stateql.close();
+});
+
+test("rows and export project columns, and summarize describes a stored result", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE projected (id INTEGER PRIMARY KEY, name TEXT, amount TEXT)"));
+  await succeed(fixture.stateql.exec(
+    "INSERT INTO projected (name, amount) VALUES ('Ada', '9.50'), ('Grace', '10.25'), (NULL, '9.50')",
+  ));
+  const result = await succeed(fixture.stateql.query("SELECT id, name, amount FROM projected ORDER BY id"));
+
+  const page = await succeed(fixture.stateql.rows(result.result_id, { columns: ["amount", "id"], limit: 2 }));
+  assert.deepEqual(page.rows, [{ amount: "9.50", id: 1 }, { amount: "10.25", id: 2 }]);
+  assertFailure(await fixture.stateql.rows(result.result_id, { columns: ["missing"] }), "INVALID_COMMAND");
+  assertFailure(await fixture.stateql.rows(result.result_id, { columns: [] }), "INVALID_COMMAND");
+
+  const output = join(fixture.home, "projected.csv");
+  await succeed(fixture.stateql.exportResult(result.result_id, output, "csv", ["name"]));
+  assert.equal(readFileSync(output, "utf8"), "name\nAda\nGrace\n\n");
+
+  const summary = await succeed(fixture.stateql.summarize(result.result_id));
+  assert.equal(summary.total, 3);
+  assert.deepEqual(summary.columns, [
+    { name: "id", nulls: 0, distinct: 3, min: 1, max: 3 },
+    { name: "name", nulls: 1, distinct: 2, min: "Ada", max: "Grace" },
+    { name: "amount", nulls: 0, distinct: 2, min: "9.50", max: "10.25" },
+  ]);
+  const compact = agentResponse(await fixture.stateql.summarize(result.result_id), "summarize");
+  assert.deepEqual(compact, {
+    ok: true,
+    total: 3,
+    columns: ["name", "nulls", "distinct", "min", "max"],
+    rows: [["id", 0, 3, 1, 3], ["name", 1, 2, "Ada", "Grace"], ["amount", 0, 2, "9.50", "10.25"]],
+  });
   fixture.stateql.close();
 });

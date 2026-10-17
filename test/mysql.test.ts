@@ -201,6 +201,12 @@ test(
       );
       assert.equal(queried.rows, 1);
       assert.equal(queried.preview[0].name, "first");
+      const estimated = await succeed(
+        stateql.plan(`UPDATE ${identifier} SET name = ? WHERE name = ?`, {
+          params: ["renamed", "first"],
+        }),
+      );
+      assert.equal(estimated.estimated_rows, 1);
       const explained = await succeed(
         stateql.query(`EXPLAIN SELECT id, name FROM ${identifier} WHERE name = ?`, {
           params: ["first"],

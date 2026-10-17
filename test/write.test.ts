@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { StateQLError } from "../src/errors.js";
-import { analyzeSql } from "../src/sql.js";
+import { analyzeSql, matchedRowsCount } from "../src/sql.js";
 import { StateQL } from "../src/stateql.js";
 import { StateStore } from "../src/store.js";
 import {
@@ -507,3 +507,46 @@ test("uncertain write outcomes stay blocked until explicit replay", async () => 
   fixture.stateql.close();
 });
 
+
+test("plans estimate rows matched by single-table updates and deletes", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE estimate_rows (id INTEGER PRIMARY KEY, amount INTEGER, note TEXT)"));
+  await succeed(fixture.stateql.exec("INSERT INTO estimate_rows (amount) VALUES (1), (5), (9)"));
+
+  const update = await succeed(fixture.stateql.plan(
+    "UPDATE estimate_rows SET note = ? WHERE amount > ?",
+    { params: ["big", 3] },
+  ));
+  assert.equal(update.estimated_rows, 2);
+  const unbounded = await succeed(fixture.stateql.plan("DELETE FROM estimate_rows", {
+    allowUnbounded: true,
+    allowDestructive: true,
+  }));
+  assert.equal(unbounded.estimated_rows, 3);
+  const insert = await succeed(fixture.stateql.plan("INSERT INTO estimate_rows (amount) VALUES (2)"));
+  assert.equal("estimated_rows" in insert, false);
+  fixture.stateql.close();
+});
+
+test("matched-row counts keep only WHERE parameters and skip unsafe shapes", () => {
+  const postgres = matchedRowsCount(
+    analyzeSql("UPDATE jobs SET claimed = $1 WHERE id = $3 AND owner = $2 AND retry = $3", "postgres"),
+    [true, "ada", 7],
+    "postgres",
+  );
+  assert.deepEqual(postgres?.params, [7, "ada"]);
+  assert.match(postgres!.sql, /^SELECT COUNT\(\*\) FROM "jobs" WHERE .*\$1.*\$2.*\$1/);
+
+  const mysql = matchedRowsCount(analyzeSql("UPDATE jobs SET claimed = ? WHERE id = ?", "mysql"), [1, 42], "mysql");
+  assert.deepEqual(mysql?.params, [42]);
+
+  for (const [sql, driver, params] of [
+    ["UPDATE jobs SET claimed = 1 WHERE id = ? ORDER BY id LIMIT 1", "mysql", [1]],
+    ["DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.x = ?", "mysql", [1]],
+    ["UPDATE a SET x = b.x FROM b WHERE a.id = b.id", "postgres", []],
+    ["UPDATE jobs SET claimed = ? WHERE id = ?", "sqlite", [1]],
+    ["INSERT INTO jobs (id) VALUES (?)", "sqlite", [1]],
+  ] as const) {
+    assert.equal(matchedRowsCount(analyzeSql(sql, driver), [...params], driver), undefined, sql);
+  }
+});

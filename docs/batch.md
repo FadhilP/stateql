@@ -42,7 +42,8 @@ stql batch commands.json
 Batch fields use snake case. Supported command names match CLI paths, such as
 `actor.show`, `actor.set-name`, `filter`, `transaction.begin`, `session.summary`,
 `alias.set`, `plan`, and `apply`. `actor.set-name` takes the display name in the
-`name` field. Query commands may set `preview_rows` from 0 to 200. Native MongoDB
+`name` field. Query commands may set `preview_rows` from 0 to 200. `rows` may
+set `columns` to an array of column names; `summarize` takes `handle`. Native MongoDB
 batches use `mongo.query`, `mongo.exec`, or `mongo.plan` with the command object
 in `mongo`; the same cache, replay, idempotency, safety, and timeout fields
 apply. Database commands may set `timeout_ms`; otherwise they use the 30-second

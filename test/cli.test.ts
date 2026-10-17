@@ -611,3 +611,34 @@ test("batch and pipe execute sequential JSON commands with safe failure control"
   );
 });
 
+
+test("CLI reads statements from files or standard input and shows help for one command", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE cli_files (id INTEGER PRIMARY KEY, name TEXT)"));
+  await succeed(fixture.stateql.exec("INSERT INTO cli_files (name) VALUES ('Ada'), ('Grace')"));
+  fixture.stateql.close();
+  const run = (args: string[], input?: string) => spawnSync(process.execPath, ["dist/src/cli.js", ...args], {
+    cwd: process.cwd(),
+    env: { ...process.env, STQL_HOME: fixture.home },
+    encoding: "utf8",
+    ...(input === undefined ? {} : { input }),
+  });
+
+  const sqlFile = join(fixture.home, "query.sql");
+  writeFileSync(sqlFile, "﻿SELECT name\nFROM cli_files\nWHERE id = ?\nORDER BY id\n");
+  const fromFile = JSON.parse(run(["query", "--file", sqlFile, "--param", "2"]).stdout);
+  assert.deepEqual(fromFile.rows, [["Grace"]]);
+
+  const fromStdin = JSON.parse(run(["query", "--file", "-"], "SELECT count(*) AS n FROM cli_files").stdout);
+  assert.deepEqual(fromStdin.rows, [[2]]);
+
+  const both = run(["query", "SELECT 1", "--file", sqlFile]);
+  assert.equal(both.status, 2);
+  assert.match(both.stdout, /either inline text or --file/);
+
+  const help = run(["help", "rows"]);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /^stql rows <result-handle>.*--columns/);
+  assert.equal(help.stdout.includes("stql query"), false);
+  assert.equal(run(["help", "unknown-command"]).status, 2);
+});

@@ -63,7 +63,9 @@ Library responses retain the full response envelope regardless of the CLI
 output mode. Check `response.ok` before reading `response.data`; failures expose
 `response.error`. Queries return typed `ResultData` with `result_id`, `preview`,
 and result metadata. Reuse `result_id` with methods such as `filter`, `rows`,
-`count`, and `exportResult`; the CLI instead presents its primary ID as `handle`.
+`count`, `summarize`, and `exportResult`; the CLI instead presents its primary ID as `handle`.
+`rows(id, { columns })` and `exportResult(id, output, format, columns)` return
+only the named columns.
 Queries preview five rows by default. Set `previewRows` from 0 to 200 on an
 individual query to control its response without changing or rerunning the
 materialized result. The constructor-level `previewRows` option changes the

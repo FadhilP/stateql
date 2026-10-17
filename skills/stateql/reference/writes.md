@@ -43,10 +43,13 @@ Use a plan when the user should review a write before it runs.
 
 ```bash
 stql plan 'DELETE FROM sessions WHERE expires_at < $1' --param 2026-01-01 --allow-destructive
-# show the user statement_type, required_overrides, and expires_at
+# show the user statement_type, estimated_rows, required_overrides, and expires_at
 stql apply <plan-handle>
 ```
 
+- `estimated_rows` is the number of rows the `WHERE` clause matched when the
+  plan was made. It is present only for single-table `UPDATE` and `DELETE`
+  without `ORDER BY`/`LIMIT`. If it is absent, count the rows with a query.
 - A plan keeps only the approval flags given to `plan`; `apply` never adds any.
 - If data changed after `plan`, `apply` returns `STALE_PLAN`. Create a new plan.
 - Plans expire after 10 minutes.

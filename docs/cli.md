@@ -15,25 +15,25 @@ stql profile add|update NAME [TARGET [--ask-password] | --env ENV | --credential
                            [--read-only|--read-write]
 stql profile list|show|remove
 stql session start|list|show|summary|close
-stql query <sql> [--params JSON | --param VALUE...] [--cache auto|bypass|require]
+stql query <sql> | --file FILE [--params JSON | --param VALUE...] [--cache auto|bypass|require]
                  [--preview-rows 0..200]
 stql filter <result-handle> <predicate> [--params JSON | --param VALUE...]
-stql exec <sql> [--params JSON | --param VALUE...] [--idempotency-key KEY] [--replay]
+stql exec <sql> | --file FILE [--params JSON | --param VALUE...] [--idempotency-key KEY] [--replay]
               [--allow-unbounded] [--allow-destructive]
-stql mongo query|exec|plan '<EJSON command>' [--cache MODE] [--idempotency-key KEY]
+stql mongo query|exec|plan '<EJSON command>' | --file FILE [--cache MODE] [--idempotency-key KEY]
                                   [--replay] [--allow-unbounded] [--allow-destructive]
 stql redis query '<JSON command>' [--cache auto|bypass|require]
 stql redis exec '<JSON command>' [--idempotency-key KEY] [--replay]
 stql redis plan '<JSON command>'
-stql show|count|columns <result-handle>
-stql rows <result-handle> [--offset N] [--limit N]
+stql show|count|columns|summarize <result-handle>
+stql rows <result-handle> [--offset N] [--limit N] [--columns a,b]
 stql alias set <name> <result-handle>
-stql export <result-handle> --output FILE [--format json|jsonl|csv]
+stql export <result-handle> --output FILE [--format json|jsonl|csv] [--columns a,b]
 stql inspect schema|table|collection|collections|columns|indexes|constraints [name]
 stql objects [KIND] [--schema NAME] [--search TEXT] [--offset N|--cursor CURSOR] [--limit N]
 stql object KIND NAME [IDENTITY] [--schema NAME]
 stql transaction begin|status|commit|rollback [--isolation LEVEL]
-stql plan <sql> [--params JSON | --param VALUE...] [--allow-unbounded] [--allow-destructive]
+stql plan <sql> | --file FILE [--params JSON | --param VALUE...] [--allow-unbounded] [--allow-destructive]
 stql apply <plan-handle>
 stql history [--limit N] [--offset N] [--category statement|introspection|management]
              [--internal|--external]
@@ -43,7 +43,7 @@ stql purge [expired|results|history|all]
 stql capabilities
 stql batch [commands.json|commands.jsonl|-] [--continue-on-error]
 stql pipe [--continue-on-error]
-stql help
+stql help [command]
 ```
 
 Global options: `--output MODE`, `--timeout-ms N`, `--max-cell-characters N`,
@@ -62,6 +62,10 @@ stql exec "INSERT INTO users (name, status) VALUES (?, ?)" `
 Use `--params JSON` for a JSON array or named parameters. Use
 `--params-file FILE` when JSON is awkward to quote; `--params-file -` reads
 JSON from standard input.
+
+Use `--file FILE` instead of inline text to read the SQL, or the MongoDB or
+Redis command, from a file. `--file -` reads standard input, so it cannot be
+combined with `--params-file -`. A leading UTF-8 BOM is ignored.
 
 ## Catalog inspection
 
@@ -98,6 +102,8 @@ their complete error object. Empty warnings and tracing metadata are omitted.
 
 Agent mode also removes data that costs tokens but adds no information:
 
+- `summarize` returns `columns` (`name`, `nulls`, `distinct`, `min`, `max`) and
+  one row per result column.
 - `query`, `filter`, `show`, `mongo.query`, and `rows` return `columns` once and
   each row as an array in that order. When rows have different keys (for
   example, MongoDB documents), rows stay objects and `columns` is omitted.
@@ -110,7 +116,7 @@ Agent mode also removes data that costs tokens but adds no information:
 - `capabilities` lists enabled `features` as names.
 - `objects` returns `columns` once and each entry as an array. `identity` is
   omitted when it equals `schema.name` (or `name`) for every entry.
-- `rows`, `count`, and `columns` do not repeat the handle you passed.
+- `rows`, `count`, `columns`, and `summarize` do not repeat the handle you passed.
 - Result `handle` is the generated alias, which cannot be reassigned. Full
   `q_...` IDs work too and appear in `--output json`, `silent`, and history.
   `alias` is present only when you chose a different name (batch `as`).

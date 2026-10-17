@@ -23,6 +23,42 @@ import type {
 
 type OutputMode = "agent" | "json" | "jsonl" | "text" | "silent";
 
+const USAGE = `stql connect <target> [--name NAME] [--read-only|--read-write]
+stql connect --env ENV | --credential-ref REF | --profile NAME [--name NAME] [--read-only|--read-write]
+stql disconnect|status
+stql actor show | set-name <display-name>
+stql profile add|update NAME [TARGET [--ask-password] | --env ENV | --credential-ref REF]
+                           [--read-only|--read-write]
+stql profile list|show|remove NAME
+stql session start|list|show|summary|close
+stql query <sql> | --file FILE [--params JSON | --param VALUE... | --params-file FILE]
+                 [--cache auto|bypass|require] [--preview-rows 0..200]
+stql filter <result-handle> <predicate> [--params JSON | --param VALUE...]
+stql exec <sql> | --file FILE [--params JSON | --param VALUE...] [--idempotency-key KEY]
+                [--replay] [--allow-unbounded] [--allow-destructive]
+stql plan <sql> | --file FILE [--params JSON | --param VALUE...] [--allow-unbounded]
+                [--allow-destructive]
+stql apply <plan-handle>
+stql mongo query|exec|plan '<EJSON command>' | --file FILE [--cache MODE] [--idempotency-key KEY]
+                                  [--replay] [--allow-unbounded] [--allow-destructive]
+stql redis query|exec|plan '<JSON command>' | --file FILE [--cache MODE] [--idempotency-key KEY]
+                                  [--replay]
+stql show|count|columns|summarize <result-handle>
+stql rows <result-handle> [--offset N] [--limit N] [--columns a,b]
+stql alias set <name> <result-handle>
+stql export <result-handle> --output FILE [--format json|jsonl|csv] [--columns a,b]
+stql inspect schema|table|collection|collections|columns|indexes|constraints [name]
+stql objects [KIND] [--schema NAME] [--search TEXT] [--offset N|--cursor CURSOR] [--limit N]
+stql object KIND NAME [IDENTITY] [--schema NAME]
+stql transaction begin|status|commit|rollback [--isolation LEVEL]
+stql history [--limit N] [--offset N] [--category statement|introspection|management]
+             [--internal|--external]
+stql receipt <operation-handle>
+stql doctor|capabilities
+stql purge [expired|results|history|all]
+stql batch [commands.json|commands.jsonl|-] [--continue-on-error]
+stql pipe [--continue-on-error]`;
+
 const parsed = parseArgs({
   allowPositionals: true,
   strict: true,
@@ -37,6 +73,8 @@ const parsed = parseArgs({
     params: { type: "string" },
     param: { type: "string", multiple: true },
     "params-file": { type: "string" },
+    file: { type: "string" },
+    columns: { type: "string" },
     cache: { type: "string" },
     "preview-rows": { type: "string" },
     "max-cell-characters": { type: "string" },
@@ -73,7 +111,13 @@ if (values.version) {
   process.exit(0);
 }
 if (values.help || !command || command === "help") {
-  console.log(helpText());
+  const topic = command === "help" ? subcommand : command;
+  const usage = topic ? commandUsage(topic) : helpText();
+  if (usage === undefined) {
+    console.error(`Unknown command "${topic}". Run "stql help" to list commands.`);
+    process.exit(exitCodeFor("INVALID_COMMAND"));
+  }
+  console.log(usage);
   process.exit(0);
 }
 
@@ -163,7 +207,7 @@ async function dispatch(): Promise<Response<unknown>> {
     values.param,
     values["params-file"],
   );
-  const sql = [subcommand, ...rest].filter(Boolean).join(" ");
+  const sql = (): string => statementText([subcommand, ...rest]);
 
   switch (command) {
     case "connect": {
@@ -200,7 +244,7 @@ async function dispatch(): Promise<Response<unknown>> {
     case "redis":
       return dispatchRedis(subcommand, rest);
     case "query":
-      return stateql.query(sql, {
+      return stateql.query(sql(), {
         params,
         cache: cacheMode(values.cache),
         ...(values["preview-rows"] === undefined
@@ -214,7 +258,7 @@ async function dispatch(): Promise<Response<unknown>> {
         { params },
       );
     case "exec":
-      return stateql.exec(sql, {
+      return stateql.exec(sql(), {
         params,
         replay: values.replay ?? false,
         ...(values["idempotency-key"]
@@ -229,16 +273,20 @@ async function dispatch(): Promise<Response<unknown>> {
       return stateql.rows(requireValue(subcommand, "result handle"), {
         offset: numberOption(values.offset, 0),
         limit: numberOption(values.limit, 20),
+        ...(values.columns === undefined ? {} : { columns: columnList(values.columns) }),
       });
     case "count":
       return stateql.count(requireValue(subcommand, "result handle"));
     case "columns":
       return stateql.columns(requireValue(subcommand, "result handle"));
+    case "summarize":
+      return stateql.summarize(requireValue(subcommand, "result handle"));
     case "export":
       return stateql.exportResult(
         requireValue(subcommand, "result handle"),
         requireValue(values.output, "--output"),
         exportFormat(values.format),
+        values.columns === undefined ? undefined : columnList(values.columns),
       );
     case "alias":
       if (subcommand !== "set") throw new Error("Expected: alias set NAME RESULT");
@@ -271,7 +319,7 @@ async function dispatch(): Promise<Response<unknown>> {
     case "transaction":
       return dispatchTransaction(subcommand, rest[0]);
     case "plan":
-      return stateql.plan(sql, {
+      return stateql.plan(sql(), {
         params,
         allowUnbounded: values["allow-unbounded"] ?? false,
         ...(values["allow-destructive"]
@@ -304,7 +352,7 @@ async function dispatchMongo(
   action: string | undefined,
   args: string[],
 ): Promise<Response<unknown>> {
-  const payload = requireValue(args.join(" ").trim(), "MongoDB EJSON command");
+  const payload = requireValue(statementText(args), "MongoDB EJSON command");
   switch (action) {
     case "query":
       return stateql.mongoQuery(parseMongoCommand(payload) as MongoReadCommand, {
@@ -335,7 +383,7 @@ async function dispatchRedis(
   action: string | undefined,
   args: string[],
 ): Promise<Response<unknown>> {
-  const payload = parseRedisCommand(requireValue(args.join(" ").trim(), "Redis JSON command"));
+  const payload = parseRedisCommand(requireValue(statementText(args), "Redis JSON command"));
   switch (action) {
     case "query": return stateql.redisQuery(payload, { cache: cacheMode(values.cache) });
     case "exec": return stateql.redisExec(payload, { replay: values.replay ?? false, ...(values["idempotency-key"] ? { idempotencyKey: values["idempotency-key"] } : {}) });
@@ -512,6 +560,21 @@ function parseParameters(
     throw new Error("--params must be a JSON array or object.");
   }
   return parsedValue as SqlParameters;
+}
+
+function statementText(args: Array<string | undefined>): string {
+  const inline = args.filter(Boolean).join(" ").trim();
+  const file = values.file;
+  if (file === undefined) return inline;
+  if (inline) throw new Error("Use either inline text or --file, not both.");
+  if (file === "-" && values["params-file"] === "-") {
+    throw new Error("--file and --params-file cannot both read standard input.");
+  }
+  return withoutBom(readFileSync(file === "-" ? 0 : resolve(file), "utf8")).trim();
+}
+
+function columnList(value: string): string[] {
+  return value.split(",").map((name) => name.trim()).filter(Boolean);
 }
 
 function parseParameter(value: string): unknown {
@@ -703,30 +766,23 @@ function extractHandle(data: unknown): string | undefined {
   return undefined;
 }
 
+function commandUsage(name: string): string | undefined {
+  const entries = USAGE.split(/\n(?=stql )/).filter((entry) =>
+    entry.slice("stql ".length).split(" ")[0]!.split("|").includes(name),
+  );
+  return entries.length > 0 ? entries.join("\n") : undefined;
+}
+
 function helpText(): string {
   return `StateQL ${packageVersion()}
 
 Usage: stql <command> [arguments] [options]
 
-Commands:
-  connect TARGET | --env ENV | --credential-ref REF | --profile NAME
-  disconnect, status
-  actor show | set-name NAME
-  profile add|update NAME [TARGET [--ask-password] | --env ENV | --credential-ref REF]
-  profile list|show|remove
-  query, filter, exec, show, rows, count, columns, export
-  mongo query|exec|plan '<EJSON command>'
-  redis query|exec|plan '<JSON command>'
-  alias set
-  inspect schema|table|collection|collections|columns|indexes|constraints
-  objects [KIND] [--schema NAME] [--search TEXT] [--offset N|--cursor CURSOR]
-  object KIND NAME [IDENTITY] [--schema NAME]
-  transaction begin|status|commit|rollback
-  plan, apply, history [--category CATEGORY] [--internal|--external], receipt, doctor, purge, capabilities
-  batch [file.json|file.jsonl|-]
-  pipe
+Commands (stql help COMMAND shows one):
+${USAGE}
 
 SQL parameters: --params JSON, repeated --param VALUE, or --params-file FILE.
+Long SQL or native commands: --file FILE (- reads standard input) instead of inline text.
 Query preview: --preview-rows N (default: 5, maximum: 200).
 Long cells: --max-cell-characters N (default: 200); use export for full values.
 Deadline: --timeout-ms N (default: 30000). Ctrl+C cancels database work.

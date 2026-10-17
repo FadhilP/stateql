@@ -5,7 +5,7 @@ const RESULT_COMMANDS = new Set(["query", "mongo.query", "redis.query", "filter"
 const FALSE_DEFAULT_KEYS = ["cached", "duplicate", "duplicate_override"];
 const SHARED_HISTORY_KEYS = ["session_id", "actor_id", "actor_name", "origin"];
 // The caller already holds the handle it passed to these commands.
-const HANDLE_ECHO_COMMANDS = new Set(["rows", "count", "columns"]);
+const HANDLE_ECHO_COMMANDS = new Set(["rows", "count", "columns", "summarize"]);
 const WRITE_COMMANDS = new Set(["exec", "mongo.exec", "redis.exec", "apply"]);
 const COMMAND_ALIASES: Record<string, string> = {
   "objects.list": "objects",
@@ -58,6 +58,9 @@ export function agentResponse(
   } else if (currentCommand === "count" && typeof data.rows === "number") {
     data.total = data.rows;
     delete data.rows;
+  } else if (currentCommand === "summarize" && Array.isArray(data.columns)) {
+    const table = columnarRows(data.columns, undefined);
+    Object.assign(data, { columns: table.columns, rows: table.rows });
   } else if (WRITE_COMMANDS.has(currentCommand)) {
     delete data.actor_id;
     delete data.plan_id;
@@ -206,6 +209,7 @@ function primaryHandleKey(currentCommand: string): string | undefined {
     rows: "result_id",
     count: "result_id",
     columns: "result_id",
+    summarize: "result_id",
     export: "result_id",
     alias: "result_id",
     "alias.set": "result_id",

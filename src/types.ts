@@ -413,6 +413,7 @@ export interface RedisPlanOptions extends ExecutionOptions {}
 export interface RowsOptions {
   offset?: number;
   limit?: number;
+  columns?: string[];
 }
 
 export interface PlanOptions extends ExecutionOptions {
@@ -449,6 +450,7 @@ export type BatchCommandName =
   | "rows"
   | "count"
   | "columns"
+  | "summarize"
   | "alias.set"
   | "inspect"
   | "transaction.begin"
@@ -487,6 +489,7 @@ export interface BatchCommand {
   object?: CatalogObject;
   cache?: "auto" | "bypass" | "require";
   preview_rows?: number;
+  columns?: string[];
   read_only?: boolean;
   secret_env?: string;
   credential_ref?: string;
@@ -683,6 +686,20 @@ export interface ColumnsData {
   columns: Column[];
 }
 
+export interface ColumnSummary {
+  name: string;
+  nulls: number;
+  distinct: number;
+  min: unknown;
+  max: unknown;
+}
+
+export interface SummaryData {
+  result_id: string;
+  total: number;
+  columns: ColumnSummary[];
+}
+
 export interface AliasData {
   alias: string;
   result_id: string;
@@ -751,6 +768,8 @@ export interface PlanData {
   state_version: string;
   owner_actor_id: string;
   expires_at: string;
+  /** Rows a single-table UPDATE or DELETE matched at plan time; absent when not derivable. */
+  estimated_rows?: number;
 }
 
 export interface ApplyData extends ExecData {

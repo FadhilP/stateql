@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import type { AST } from "node-sql-parser";
 import { StateQLError } from "./errors.js";
-import type { Driver, SqlDriver } from "./types.js";
+import type { Driver, SqlDriver, SqlParameters } from "./types.js";
 
 const require = createRequire(import.meta.url);
 let parser: import("node-sql-parser").Parser | undefined;
@@ -94,17 +94,103 @@ interface ParsedSql {
   normalized: string;
 }
 
+function parserDatabase(driver: Exclude<Driver, "mongodb" | "redis">): string {
+  if (driver === "postgres") return "Postgresql";
+  if (driver === "mysql") return "MySQL";
+  return "Sqlite";
+}
+
+export interface CountStatement {
+  sql: string;
+  params: unknown[];
+}
+
+/** A COUNT(*) of the rows a single-table UPDATE or DELETE matches, or undefined when it cannot be derived safely. */
+export function matchedRowsCount(
+  analysis: SqlAnalysis,
+  params: SqlParameters,
+  driver: SqlDriver,
+): CountStatement | undefined {
+  const ast = analysis.ast as unknown as Record<string, unknown>;
+  const isUpdate = analysis.statementType === "update";
+  const isDelete = analysis.statementType === "delete";
+  if (!isUpdate && !isDelete) return undefined;
+  const tables = isUpdate ? ast.table : ast.from;
+  const singleTable =
+    Array.isArray(tables) && tables.length === 1 && !record(tables[0])?.join;
+  const limit = record(ast.limit)?.value;
+  const hasLimit = Array.isArray(limit) && limit.length > 0;
+  if (!Array.isArray(params) || !singleTable) return undefined;
+  if (ast.with || ast.orderby || hasLimit || (isUpdate && ast.from)) return undefined;
+  // The parser drops NULLS FIRST/LAST, which can change a subquery that also has a LIMIT.
+  if (/\bnulls\s+(?:first|last)\b/i.test(analysis.normalized)) return undefined;
+
+  const where = structuredClone(ast.where ?? null);
+  const setPlaceholders = placeholders(ast.set);
+  const wherePlaceholders = placeholders(where);
+  const placeholderCount = setPlaceholders.length + wherePlaceholders.length;
+  if (placeholders(ast).length !== placeholderCount) return undefined;
+
+  let countParams: unknown[];
+  if ([...setPlaceholders, ...wherePlaceholders].every(isQuestionMark)) {
+    if (params.length !== placeholderCount) return undefined;
+    countParams = params.slice(setPlaceholders.length);
+  } else if (driver === "postgres" && wherePlaceholders.every(isNumberedVar)) {
+    const renumbered = new Map<number, number>();
+    for (const node of wherePlaceholders) {
+      const number = node.name as number;
+      if (!renumbered.has(number)) renumbered.set(number, renumbered.size + 1);
+      node.name = renumbered.get(number);
+    }
+    countParams = [...renumbered.keys()].map((number) => params[number - 1]);
+  } else {
+    return undefined;
+  }
+
+  const select = {
+    type: "select",
+    columns: [{ expr: { type: "aggr_func", name: "COUNT", args: { expr: { type: "star", value: "*" } } }, as: null }],
+    from: tables,
+    where,
+  } as unknown as AST;
+  return {
+    sql: sqlParser().sqlify(select, { database: parserDatabase(driver) }),
+    params: countParams,
+  };
+}
+
+function placeholders(
+  node: unknown,
+  found: Record<string, unknown>[] = [],
+): Record<string, unknown>[] {
+  if (Array.isArray(node)) {
+    for (const item of node) placeholders(item, found);
+    return found;
+  }
+  const value = record(node);
+  if (!value) return found;
+  if (value.type === "var" || isQuestionMark(value)) {
+    found.push(value);
+    return found;
+  }
+  for (const child of Object.values(value)) placeholders(child, found);
+  return found;
+}
+
+function isQuestionMark(node: Record<string, unknown>): boolean {
+  return node.type === "origin" && node.value === "?";
+}
+
+function isNumberedVar(node: Record<string, unknown>): boolean {
+  return node.type === "var" && node.prefix === "$" && Number.isInteger(node.name);
+}
+
 function parseSqlStatement(
   sql: string,
   driver: Exclude<Driver, "mongodb" | "redis">,
 ): ParsedSql {
   const parser = sqlParser();
-  const database =
-    driver === "postgres"
-      ? "Postgresql"
-      : driver === "mysql"
-        ? "MySQL"
-        : "Sqlite";
+  const database = parserDatabase(driver);
   const parserSql = driver === "postgres" ? postgresParserSql(sql) : sql;
   let parsed: ReturnType<typeof parser.astify>;
   try {
@@ -858,9 +944,10 @@ class UtilityParser {
   optionalTargets(allowOnlyAndStar = false): void {
     if (this.done()) return;
     while (true) {
-      if (allowOnlyAndStar) this.consumeWord("ONLY");
+      const only = allowOnlyAndStar && this.consumeWord("ONLY");
       this.qualifiedIdentifier();
-      if (allowOnlyAndStar) this.consumePunctuation("*");
+      // PostgreSQL accepts ONLY name or name *, never both.
+      if (allowOnlyAndStar && !only) this.consumePunctuation("*");
       if (this.consumePunctuation("(")) {
         this.identifier();
         while (this.consumePunctuation(",")) this.identifier();

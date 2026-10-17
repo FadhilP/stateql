@@ -51,14 +51,18 @@ shows saved profiles.
 4. Read the response (see below). `total` is the full row count, so you do not
    need a separate `COUNT(*)`.
 5. More rows: `stql rows <handle> --offset <next_offset> --limit 50`
-   (default 20, maximum 1000).
+   (default 20, maximum 1000). Add `--columns id,email` to return only some
+   columns of a wide result.
+   To understand the data, run `stql summarize <handle>`: for each column it
+   returns the null count, distinct count, min, and max.
 6. Narrow down: `stql filter <handle> 'CAST(total AS REAL) > ?' --param 100`.
    This runs locally on the stored rows in SQLite syntax, always with `?`, and
    returns a new handle. PostgreSQL `numeric`/`bigint` and MySQL `DECIMAL` values
    are stored as strings (`"7.50"`), and SQLite treats every string as greater
    than every number, so `total > ?` silently matches all rows. Wrap such
    columns in `CAST(... AS REAL)`, or filter in SQL with a new query.
-7. Save all rows: `stql export <handle> --output rows.csv` (`--format json|jsonl|csv`).
+7. Save all rows: `stql export <handle> --output rows.csv` (`--format json|jsonl|csv`,
+   optional `--columns`).
 
 Use `--preview-rows N` (0 to 200) on `query` to change the preview size. Use
 `--cache bypass` when data may have changed outside this session; writes made
@@ -72,7 +76,7 @@ through `stql` invalidate the cache automatically.
 
 | Field | Meaning |
 | --- | --- |
-| `handle` | Stable result handle. Pass it to `rows`, `filter`, `count`, `columns`, `show`, `export`. |
+| `handle` | Stable result handle. Pass it to `rows`, `filter`, `count`, `columns`, `summarize`, `show`, `export`. |
 | `columns` + `rows` | Each row is an array in `columns` order. If rows have different keys (MongoDB documents), rows are objects and `columns` is absent. |
 | `total` | Rows in the stored result. |
 | `next_offset` | Present only when more rows exist. Absent means you have every row. |
@@ -96,12 +100,16 @@ through `stql` invalidate the cache automatically.
 
 - Put SQL in single quotes. In bash and PowerShell, `"$1"` expands to an empty
   string and breaks the query.
+- For long SQL, or SQL with quotes, write it to a file and pass
+  `--file query.sql` instead of the inline SQL. `--file -` reads standard input.
+  This works for `query`, `exec`, `plan`, `stql mongo`, and `stql redis`.
 - Use parameters instead of string literals, so you do not need quotes inside
   quotes: `--param 'Ada Lovelace'`.
 - **Windows PowerShell 5.1** removes the double quotes inside JSON arguments, so
   `--params '[1]'` is fine but `stql redis query '{"command":"GET"}'` breaks.
-  Send JSON on standard input instead: `'<one JSON command>' | stql pipe` (see
-  below), or escape every inner quote as `\"`.
+  Send the JSON on standard input instead:
+  `'{"command":"GET","args":["a"]}' | stql redis query --file -`, or
+  `'<one JSON command>' | stql pipe` (see below).
 
 ## Several steps in one call
 
@@ -168,4 +176,4 @@ before you use `stql mongo` or `stql redis`.
 | `stql history --limit 10` | Recent commands in this session |
 | `stql receipt <operation-handle>` | Full record of a write |
 | `stql session summary` | Open results and recent writes |
-| `stql help` | Command syntax |
+| `stql help <command>` | Syntax of one command (`stql help` lists all) |

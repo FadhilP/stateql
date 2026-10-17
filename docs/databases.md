@@ -95,8 +95,8 @@ stql plan "REINDEX TABLE public.jobs" --allow-destructive
 
 The PostgreSQL 14–18 grammar includes parenthesized `REINDEX CONCURRENTLY`,
 PostgreSQL 16 `BUFFER_USAGE_LIMIT` for `VACUUM`/`ANALYZE`, optional
-`DATABASE`/`SYSTEM` reindex names, and PostgreSQL 18 `ONLY table *` maintenance
-targets. Memory sizes accept an integer number of kilobytes or a quoted
+`DATABASE`/`SYSTEM` reindex names, and PostgreSQL 18 `ONLY table` and `table *`
+maintenance targets (not both on one table). Memory sizes accept an integer number of kilobytes or a quoted
 `B|kB|MB|GB|TB` value. Older servers may reject newer forms after dispatch, so
 StateQL retains conservative unknown-outcome handling.
 

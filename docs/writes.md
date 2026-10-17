@@ -10,6 +10,12 @@ The flags are independent.
 the flags explicitly supplied when it is created; `apply` never adds
 authorization.
 
+For a single-table SQL `UPDATE` or `DELETE` without `ORDER BY` or `LIMIT`,
+`plan` also returns `estimated_rows`: a `COUNT(*)` of the rows that the `WHERE`
+clause matches at plan time. The field is absent for other statements, or when
+the count cannot be derived. Data can change before `apply`, so treat it as an
+estimate; `affected_rows` on `apply` is the real value.
+
 Use an idempotency key to protect retryable writes from duplicate execution:
 
 ```bash

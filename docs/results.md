@@ -67,6 +67,18 @@ use `results`, `history`, or `all` for explicit session cleanup. On POSIX
 systems, StateQL removes group and world access from its state directory,
 database, and SQLite sidecar files.
 
+## Column projection and summaries
+
+`rows` and `export` accept `--columns a,b` (library: `columns: ["a", "b"]`) to
+return only those columns, in that order. Unknown column names fail with
+`INVALID_COMMAND` and a list of the available columns.
+
+`summarize` returns, for each column of a stored result, the null count, the
+distinct count, and the min and max. Min and max are computed only when all
+non-null values are numbers or all are strings. Numeric strings, such as
+PostgreSQL `numeric` values, compare as numbers. Neither command accesses the
+original database.
+
 ## Local filtering
 
 `filter` evaluates one scalar SQLite predicate against a stored result. It

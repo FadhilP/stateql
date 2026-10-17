@@ -157,9 +157,11 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     "REINDEX (TABLESPACE fastspace) INDEX public.items_idx",
     "REINDEX TABLE CONCURRENTLY public.items",
     "REINDEX DATABASE CONCURRENTLY app",
-    "VACUUM (BUFFER_USAGE_LIMIT 256, PROCESS_MAIN 0) ONLY public.items * (id)",
+    "VACUUM (BUFFER_USAGE_LIMIT 256, PROCESS_MAIN 0) ONLY public.items (id)",
+    "VACUUM public.items * (id)",
     "VACUUM (BUFFER_USAGE_LIMIT '256 MB', PROCESS_TOAST 1) public.items",
-    "ANALYZE (BUFFER_USAGE_LIMIT '128kB') ONLY public.items * (id)",
+    "ANALYZE (BUFFER_USAGE_LIMIT '128kB') ONLY public.items (id)",
+    "ANALYZE public.items * (id)",
     "ANALYZE (BUFFER_USAGE_LIMIT 0) public.items",
     "REINDEX (CONCURRENTLY, VERBOSE 0) TABLE public.items",
     "REINDEX SYSTEM CONCURRENTLY app",
@@ -196,6 +198,8 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     "ANALYZE (BUFFER_USAGE_LIMIT '17 GB') items",
     "VACUUM ONLY",
     "VACUUM items. *",
+    "VACUUM ONLY items *",
+    "ANALYZE ONLY public.items * (id)",
     "REINDEX (CONCURRENTLY) TABLE CONCURRENTLY public.items",
     "REINDEX DATABASE app.extra",
     "REINDEX SCHEMA public.extra",
@@ -636,6 +640,13 @@ test(
       );
       assert.equal(queried.rows, 1);
       assert.equal(queried.preview[0].name, "first");
+      const estimated = await succeed(
+        stateql.plan(
+          `UPDATE ${identifier} SET name = $1 WHERE name = $2 AND id > $3`,
+          { params: ["renamed", "first", 0] },
+        ),
+      );
+      assert.equal(estimated.estimated_rows, 1);
 
       const explained = await succeed(
         stateql.query(
@@ -683,7 +694,8 @@ test(
       }
       for (const [minimumMajor, sql] of [
         [16, `ANALYZE (BUFFER_USAGE_LIMIT '128 kB') ${identifier}`],
-        [18, `ANALYZE ONLY ${identifier} *`],
+        [18, `ANALYZE ONLY ${identifier}`],
+        [18, `ANALYZE ${identifier} *`],
       ] as const) {
         const response = await stateql.exec(sql, { allowDestructive: true });
         if (serverMajor >= minimumMajor) {

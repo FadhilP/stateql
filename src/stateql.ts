@@ -65,7 +65,7 @@ import {
   sessionData,
   transactionData,
 } from "./response-data.js";
-import { analyzeSql } from "./sql.js";
+import { analyzeSql, matchedRowsCount, type CountStatement } from "./sql.js";
 import {
   StateStore,
   type ConnectionRecord,
@@ -93,6 +93,7 @@ import type {
   ListObjectsFilter,
   CloseSessionData,
   ColumnsData,
+  SqlDriver,
   CommitTransactionData,
   ConnectOptions,
   ConnectionData,
@@ -142,6 +143,8 @@ import type {
   RowsOptions,
   Row,
   Column,
+  ColumnSummary,
+  SummaryData,
   SqlParameters,
   StateConfidence,
   StateQLActorOptions,
@@ -159,6 +162,7 @@ import type {
 } from "./types.js";
 import {
   compactRows,
+  compactValue,
   defaultHome,
   hash,
   isSqlParameters,
@@ -1438,7 +1442,11 @@ export class StateQL {
         );
       }
       const allRows = this.store.resultRows(result);
-      const rows = allRows.slice(offset, offset + limit);
+      const rows = selectColumns(
+        allRows.slice(offset, offset + limit),
+        this.store.resultColumns(result),
+        options.columns,
+      );
       return {
         data: {
           result_id: result.id,
@@ -1480,6 +1488,25 @@ export class StateQL {
       stateVersion: result.state_version,
       confidence: result.state_confidence,
     }));
+  }
+
+  async summarize(idOrAlias: string): Promise<Response<SummaryData>> {
+    return this.withResult("summarize", idOrAlias, async (result) => {
+      const rows = this.store.resultRows(result);
+      return {
+        data: {
+          result_id: result.id,
+          total: result.row_count,
+          columns: this.store.resultColumns(result).map((column) =>
+            summarizeColumn(column.name, rows, this.maxCellCharacters),
+          ),
+        },
+        handle: result.id,
+        cached: true,
+        stateVersion: result.state_version,
+        confidence: result.state_confidence,
+      };
+    });
   }
 
   async setAlias(name: string, id: string): Promise<Response<AliasData>> {
@@ -1724,15 +1751,17 @@ export class StateQL {
     idOrAlias: string,
     output: string,
     format: "json" | "jsonl" | "csv" = "csv",
+    columns?: string[],
   ): Promise<Response<ExportData>> {
     return this.withResult("export", idOrAlias, async (result) => {
-      const rows = this.store.resultRows(result);
+      const resultColumns = this.store.resultColumns(result);
+      const rows = selectColumns(this.store.resultRows(result), resultColumns, columns);
       const content =
         format === "json"
           ? `${JSON.stringify(rows, null, 2)}\n`
           : format === "jsonl"
             ? `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`
-            : rowsToCsv(rows, this.store.resultColumns(result).map((column) => column.name));
+            : rowsToCsv(rows, columns ?? resultColumns.map((column) => column.name));
       writeFileSync(resolve(output), content, "utf8");
       return {
         data: {
@@ -2224,6 +2253,10 @@ export class StateQL {
       );
       try {
         const stateSignature = await adapter.signature();
+        const estimatedRows = await countMatchedRows(
+          adapter,
+          matchedRowsCount(analysis, options.params ?? [], connection.driver as SqlDriver),
+        );
         const expiresAt = new Date(this.now().getTime() + 10 * 60_000).toISOString();
         const plan = this.store.savePlan({
           sessionId: session.id,
@@ -2258,6 +2291,7 @@ export class StateQL {
             state_version: plan.state_version,
             owner_actor_id: plan.owner_actor_id,
             expires_at: plan.expires_at,
+            ...(estimatedRows === undefined ? {} : { estimated_rows: estimatedRows }),
           },
           handle: plan.id,
           executed: true,
@@ -2638,6 +2672,9 @@ export class StateQL {
           multi_row_table_plans: true,
           history_classification: true,
           actor_display_names: true,
+          result_projection: true,
+          result_summary: true,
+          plan_row_estimates: true,
         },
         driver_features: {
           mongodb: {
@@ -2820,11 +2857,14 @@ export class StateQL {
           return this.rows(batchString(command.handle, "handle"), {
             offset: command.offset ?? 0,
             limit: command.limit ?? 20,
+            ...(command.columns ? { columns: command.columns } : {}),
           });
         case "count":
           return this.count(batchString(command.handle, "handle"));
         case "columns":
           return this.columns(batchString(command.handle, "handle"));
+        case "summarize":
+          return this.summarize(batchString(command.handle, "handle"));
         case "alias.set":
           return this.setAlias(
             batchString(command.name, "name"),
@@ -4453,6 +4493,79 @@ function queryPreviewRows(value: number): number {
 function positiveInteger(value: number, name: string): number {
   if (Number.isInteger(value) && value > 0) return value;
   throw new StateQLError("INVALID_COMMAND", `${name} must be a positive integer.`);
+}
+
+function selectColumns(
+  rows: Row[],
+  available: Column[],
+  selected: string[] | undefined,
+): Row[] {
+  if (!selected) return rows;
+  const names = available.map((column) => column.name);
+  const unknown = selected.filter((name) => !names.includes(name));
+  if (selected.length === 0 || unknown.length > 0) {
+    throw new StateQLError(
+      "INVALID_COMMAND",
+      unknown.length > 0 ? `Unknown column: ${unknown.join(", ")}.` : "columns cannot be empty.",
+      { suggestedAction: `Use one or more of: ${names.join(", ")}.` },
+    );
+  }
+  // Keep missing keys missing, so MongoDB documents still distinguish missing from null.
+  return rows.map((row) =>
+    Object.fromEntries(selected.filter((name) => name in row).map((name) => [name, row[name]])),
+  );
+}
+
+function summarizeColumn(name: string, rows: Row[], maxCellCharacters: number): ColumnSummary {
+  const values = rows
+    .map((row) => row[name])
+    .filter((value) => value !== null && value !== undefined);
+  const [min, max] = valueRange(values);
+  return {
+    name,
+    nulls: rows.length - values.length,
+    distinct: new Set(values.map((value) => JSON.stringify(value))).size,
+    min: compactValue(min, maxCellCharacters),
+    max: compactValue(max, maxCellCharacters),
+  };
+}
+
+const NUMERIC_TEXT = /^-?\d+(?:\.\d+)?$/;
+
+// Exact numerics (PostgreSQL numeric/bigint, MySQL DECIMAL) arrive as strings, so compare them as numbers.
+function valueRange(values: unknown[]): [unknown, unknown] {
+  const numeric = values.every(
+    (value) => typeof value === "number" || (typeof value === "string" && NUMERIC_TEXT.test(value)),
+  );
+  const text = values.every((value) => typeof value === "string");
+  if (values.length === 0) return [null, null];
+  if (!numeric && !text) return [null, null];
+  const compare = numeric
+    ? (left: unknown, right: unknown) => Number(left) - Number(right)
+    : (left: unknown, right: unknown) => (String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0);
+  let min = values[0];
+  let max = values[0];
+  for (const value of values) {
+    if (compare(value, min) < 0) min = value;
+    if (compare(value, max) > 0) max = value;
+  }
+  return [min, max];
+}
+
+async function countMatchedRows(
+  adapter: Adapter,
+  count: CountStatement | undefined,
+): Promise<number | undefined> {
+  if (!count) return undefined;
+  try {
+    const { rows } = await adapter.read(count.sql, count.params);
+    const value = Number(Object.values(rows[0] ?? {})[0]);
+    return Number.isSafeInteger(value) ? value : undefined;
+  } catch (error) {
+    if (error instanceof AdapterExecutionError) throw error;
+    // The estimate is advisory; a count the parser cannot express must not block the plan.
+    return undefined;
+  }
 }
 
 async function closeAdapterQuietly(adapter: Adapter | MongoAdapter | RedisAdapter): Promise<void> {
