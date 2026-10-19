@@ -53,11 +53,9 @@ export type {
   HistoryCategory,
   HistoryOptions,
   MongoAggregateOptions,
-
   MongoDocument,
   MongoFindOptions,
   MongoMutationOptions,
-
   MongoExecOptions,
   MongoPlanOptions,
   MongoQueryOptions,
@@ -82,6 +80,7 @@ export type {
   RecentResultData,
   RemovedProfileData,
   Response,
+  ResponseMeta,
   ResultData,
   RollbackTransactionData,
   Row,
@@ -90,6 +89,7 @@ export type {
   SqlParameters,
   SqlDriver,
   StateQLActorOptions,
+  StateQLErrorShape,
   StateQLOptions,
   StateConfidence,
   StateQLSnapshot,

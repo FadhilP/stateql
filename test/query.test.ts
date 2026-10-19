@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { isTransientDatabaseError } from "../src/errors.js";
 import { agentResponse } from "../src/index.js";
 import { StateQL } from "../src/stateql.js";
-import { StateStore } from "../src/store.js";
+import type { StateStore } from "../src/store.js";
 import type { BatchCommand } from "../src/types.js";
 import {
   assertFailure,
@@ -570,6 +570,10 @@ test("rows and export project columns, and summarize describes a stored result",
   const output = join(fixture.home, "projected.csv");
   await succeed(fixture.stateql.exportResult(result.result_id, output, "csv", ["name"]));
   assert.equal(readFileSync(output, "utf8"), "name\nAda\nGrace\n\n");
+
+  const formula = await succeed(fixture.stateql.query("SELECT '=HYPERLINK(1)' AS cell, -5 AS amount"));
+  await succeed(fixture.stateql.exportResult(formula.result_id, output, "csv"));
+  assert.equal(readFileSync(output, "utf8"), "cell,amount\n'=HYPERLINK(1),-5\n");
 
   const summary = await succeed(fixture.stateql.summarize(result.result_id));
   assert.equal(summary.total, 3);

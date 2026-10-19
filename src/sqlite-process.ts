@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type { BatchWriteOperation } from "./adapters.js";
-import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Column, Row, SqlParameters } from "./types.js";
+import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Row, SqlParameters } from "./types.js";
 import { hash, isSqlParameters, parseJson, toJsonSafe } from "./util.js";
 
 interface Request {
@@ -68,15 +68,21 @@ function execute(request: Request): unknown {
   switch (request.operation) {
     case "read": {
       const [sql, params] = request.args as [string, SqlParameters];
-      const statement = database.prepare(sql);
-      const rows = bindAll(statement, params) as Row[];
-      return {
-        rows: toJsonSafe(rows),
-        columns: statement.columns().map((column) => ({
-          name: column.name,
-          type: column.type?.toLowerCase() ?? inferType(rows, column.name),
-        })),
-      };
+      // SQLite itself rejects writes here even if SQL analysis misclassifies a statement.
+      database.exec("PRAGMA query_only = ON");
+      try {
+        const statement = database.prepare(sql);
+        const rows = bindAll(statement, params) as Row[];
+        return {
+          rows: toJsonSafe(rows),
+          columns: statement.columns().map((column) => ({
+            name: column.name,
+            type: column.type?.toLowerCase() ?? inferType(rows, column.name),
+          })),
+        };
+      } finally {
+        database.exec("PRAGMA query_only = OFF");
+      }
     }
     case "write": {
       if (readOnly) throw new Error("Connection is read-only.");

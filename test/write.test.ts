@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { StateQLError } from "../src/errors.js";
 import { analyzeSql, matchedRowsCount } from "../src/sql.js";
 import { StateQL } from "../src/stateql.js";
-import { StateStore } from "../src/store.js";
+import type { StateStore } from "../src/store.js";
 import {
   assertFailure,
   assertOutcomeUnknown,

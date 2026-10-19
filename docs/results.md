@@ -73,6 +73,11 @@ database, and SQLite sidecar files.
 return only those columns, in that order. Unknown column names fail with
 `INVALID_COMMAND` and a list of the available columns.
 
+CSV exports put a `'` before text cells that start with `=`, `+`, `-`, or `@`
+(after optional spaces or control characters), or with a tab or line break.
+Spreadsheets then show these cells as text and do not run them as formulas.
+Number values are not changed.
+
 `summarize` returns, for each column of a stored result, the null count, the
 distinct count, and the min and max. Min and max are computed only when all
 non-null values are numbers or all are strings. Numeric strings, such as

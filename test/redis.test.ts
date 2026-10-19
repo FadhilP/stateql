@@ -48,3 +48,44 @@ test("Redis query results and guarded plans detect pre-apply changes", { skip: !
     stateql.close();
   }
 });
+
+test("Redis writes share duplicate protection, plans, and read caching", { skip: !process.env.STQL_REDIS_URL }, async () => {
+  const stateql = new StateQL({ home: createTemporaryDirectory() });
+  const external = createClient({ url: process.env.STQL_REDIS_URL });
+  external.on("error", () => undefined);
+  const key = `stateql:test:${randomUUID()}`;
+  try {
+    await external.connect();
+    await succeed(stateql.connect(undefined, { secretEnv: "STQL_REDIS_URL", readOnly: false }));
+    const idempotencyKey = randomUUID();
+    const first = await succeed(stateql.redisExec({ command: "SET", args: [key, "one"] }, { idempotencyKey }));
+    const repeated = await succeed(stateql.redisExec({ command: "SET", args: [key, "one"] }, { idempotencyKey }));
+    assert.equal(repeated.duplicate_of, first.operation_id);
+    const duplicate = await stateql.redisExec({ command: "SET", args: [key, "one"] });
+    assert.equal(duplicate.ok, false);
+    if (!duplicate.ok) assert.equal(duplicate.error.code, "POTENTIAL_DUPLICATE_WRITE");
+
+    const plan = await succeed(stateql.redisPlan({ command: "SET", args: [key, "planned"] }));
+    const applied = await succeed(stateql.apply(plan.plan_id));
+    assert.equal(applied.plan_id, plan.plan_id);
+    assert.equal(await external.get(key), "planned");
+
+    await succeed(stateql.redisQuery({ command: "GET", args: [key] }));
+    const cached = await succeed(stateql.redisQuery({ command: "GET", args: [key] }));
+    assert.equal(cached.cached, true);
+    assert.equal(cached.preview[0].value, "planned");
+
+    const transaction = await stateql.beginTransaction();
+    assert.equal(transaction.ok, false);
+    if (!transaction.ok) assert.equal(transaction.error.code, "UNSUPPORTED_DRIVER");
+
+    await succeed(stateql.connect(undefined, { secretEnv: "STQL_REDIS_URL" }));
+    const readOnly = await stateql.redisExec({ command: "DEL", args: [key] });
+    assert.equal(readOnly.ok, false);
+    if (!readOnly.ok) assert.equal(readOnly.error.code, "READ_ONLY_CONNECTION");
+    assert.equal(await external.get(key), "planned");
+  } finally {
+    if (external.isOpen) { await external.del(key); await external.quit(); }
+    stateql.close();
+  }
+});

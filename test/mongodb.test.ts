@@ -20,7 +20,7 @@ import {
   validateMongoWriteCommand,
 } from "../src/mongodb.js";
 import { StateQL } from "../src/stateql.js";
-import { StateStore, type ConnectionRecord } from "../src/store.js";
+import type { StateStore, ConnectionRecord } from "../src/store.js";
 import type { MongoReadCommand, Response } from "../src/types.js";
 import { hash } from "../src/util.js";
 
@@ -422,7 +422,7 @@ test(
       assert.equal(found.ok, true);
       if (found.ok) {
         assert.equal(found.data.rows, 1);
-        assert.ok((found.data.preview[0]?._id as { $oid?: string }).$oid);
+        assert.ok((found.data.preview[0]?._id as { $oid?: string } | undefined)?.$oid);
       }
 
       const controller = new AbortController();

@@ -245,9 +245,9 @@ function validateFilterExpression(
       );
     }
   }
-  Object.values(record).forEach((item) =>
-    validateFilterExpression(item, columns, tableName),
-  );
+  for (const item of Object.values(record)) {
+    validateFilterExpression(item, columns, tableName);
+  }
 }
 
 function filterFunctionName(record: Record<string, unknown>): string | undefined {

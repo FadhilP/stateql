@@ -1,5 +1,13 @@
 import { createRequire } from "node:module";
-import { AdapterExecutionError, AdapterWriteError, type AdapterContext } from "./adapters.js";
+import type { BaseAdapter } from "./adapters.js";
+import {
+  AdapterExecutionError,
+  AdapterWriteError,
+  remainingMilliseconds,
+  throwIfStopped,
+  withContext,
+  type AdapterContext,
+} from "./execution.js";
 import type {
   CatalogObject,
   DescribeObjectData,
@@ -96,7 +104,8 @@ export function deserializeRedisCommand(value: string): RedisCommand {
   catch { throw new Error("Stored Redis command is invalid."); }
 }
 
-export class RedisAdapter {
+export class RedisAdapter implements BaseAdapter {
+  readonly kind = "redis" as const;
   readonly confidence = "ttl_based" as const;
   private readonly client: ReturnType<typeof import("@redis/client")["createClient"]>;
   private connected = false;
@@ -164,7 +173,7 @@ export class RedisAdapter {
         const transaction = this.client.multi();
         transaction.addCommand([command.command, ...(command.args ?? [])]);
         dispatched = true;
-        const result = await withDeadline(transaction.exec(), this.context, true, () => this.stop());
+        const result = await withContext(transaction.exec(), this.context, () => this.stop(), true);
         if (result === null) throw new AdapterWriteError("ROW_CONFLICT: The Redis key changed. Reload before editing.", false);
         raw = result[0];
       } else {
@@ -258,11 +267,11 @@ export class RedisAdapter {
     }
     const [type, dump] = await Promise.all([
       this.execute(["TYPE", key], false),
-      withDeadline(
+      withContext(
         this.client.sendCommand<Buffer | null>(["DUMP", key], { typeMapping: { [redis().RESP_TYPES.BLOB_STRING]: Buffer } }),
         this.context,
-        false,
         () => this.stop(),
+        false,
       ),
     ]);
     const encoded = Buffer.isBuffer(dump) ? dump.toString("base64") : dump;
@@ -276,13 +285,13 @@ export class RedisAdapter {
     throwIfStopped(this.context, false);
     if (this.closed) throw new Error("Redis adapter is closed.");
     if (this.connected) return;
-    await withDeadline(this.client.connect(), this.context, false, () => this.stop());
+    await withContext(this.client.connect(), this.context, () => this.stop(), false);
     this.connected = true;
   }
 
   private async execute(command: string[], outcomeUnknown: boolean): Promise<unknown> {
     throwIfStopped(this.context, outcomeUnknown);
-    return withDeadline(this.client.sendCommand(command), this.context, outcomeUnknown, () => this.stop());
+    return withContext(this.client.sendCommand(command), this.context, () => this.stop(), outcomeUnknown);
   }
 
   private stop(): void { if (this.client.isOpen) this.client.destroy(); this.closed = true; }
@@ -318,7 +327,7 @@ function boundedRange(startText: string, stopText: string): void {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(stop) || start < 0 || stop < start || stop - start >= MAX_COLLECTION_VALUES) throw new Error(`Redis LRANGE must request at most ${MAX_COLLECTION_VALUES} non-negative elements.`);
 }
 function boundedLimit(value: number | undefined): number { const limit = value ?? 50; if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_COLLECTION_VALUES) throw new Error(`limit must be 1-${MAX_COLLECTION_VALUES}.`); return limit; }
-function escapeGlob(value: string): string { if (!value || value.length > 200 || value.includes("\0")) throw new Error("Redis search must be 1-200 characters."); return value.replace(/[\\*?\[\]]/g, "\\$&"); }
+function escapeGlob(value: string): string { if (!value || value.length > 200 || value.includes("\0")) throw new Error("Redis search must be 1-200 characters."); return value.replace(/[\\*?[\]]/g, "\\$&"); }
 
 function redisRows(command: RedisCommand, raw: unknown): RedisReadResult {
   if (["SCAN", "HSCAN", "SSCAN", "ZSCAN"].includes(command.command)) {
@@ -341,18 +350,4 @@ function redisRows(command: RedisCommand, raw: unknown): RedisReadResult {
 function inferColumns(rows: Row[]): Column[] { const first = rows[0] ?? {}; return Object.keys(first).map((name) => ({ name, type: typeof first[name] })); }
 function normalizeScalar(value: unknown): string | number | null { if (value === null || typeof value === "string" || typeof value === "number") return value; return JSON.stringify(toJsonSafe(value)); }
 function redisAffectedRows(command: string, result: string | number | null): number { if (typeof result === "number") return result; return command === "SET" && result === "OK" ? 1 : 0; }
-function remainingMilliseconds(context: AdapterContext): number { const remaining = context.deadline - Date.now(); if (remaining <= 0) throw new AdapterExecutionError("Database operation timed out.", "timeout", false); return Math.min(remaining, 2_147_483_647); }
-function throwIfStopped(context: AdapterContext, outcomeUnknown: boolean): void { if (context.signal?.aborted) throw new AdapterExecutionError("Database operation was cancelled.", "aborted", outcomeUnknown); if (context.deadline <= Date.now()) throw new AdapterExecutionError("Database operation timed out.", "timeout", outcomeUnknown); }
-async function withDeadline<T>(promise: Promise<T>, context: AdapterContext, outcomeUnknown: boolean, stop: () => void): Promise<T> {
-  throwIfStopped(context, outcomeUnknown);
-  let timer: NodeJS.Timeout | undefined;
-  let abort: (() => void) | undefined;
-  const stopped = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => { stop(); reject(new AdapterExecutionError("Database operation timed out.", "timeout", outcomeUnknown)); }, remainingMilliseconds(context));
-    timer.unref();
-    if (context.signal) { abort = () => { stop(); reject(new AdapterExecutionError("Database operation was cancelled.", "aborted", outcomeUnknown)); }; context.signal.addEventListener("abort", abort, { once: true }); }
-  });
-  try { return await Promise.race([promise, stopped]); }
-  finally { if (timer) clearTimeout(timer); if (abort && context.signal) context.signal.removeEventListener("abort", abort); }
-}
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }

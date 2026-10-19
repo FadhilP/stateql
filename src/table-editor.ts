@@ -98,7 +98,7 @@ export function parseTableUpdate(parameters: string): TableUpdate {
     const outer: unknown = JSON.parse(parameters);
     if (!Array.isArray(outer) || outer.length !== 1 || typeof outer[0] !== "string" || outer[0].length > 128 * 1024) throw new Error();
     const update = JSON.parse(outer[0]) as TableUpdate;
-    if (!update || !update.metadata || !["sqlite", "postgres", "mysql", "mongodb"].includes(update.metadata.driver) ||
+    if (!update?.metadata || !["sqlite", "postgres", "mysql", "mongodb"].includes(update.metadata.driver) ||
       !Array.isArray(update.metadata.columns) || update.metadata.columns.length > 100 ||
       !update.metadata.columns.every(column => typeof column.name === "string" && typeof column.type === "string" && typeof column.nullable === "boolean" && typeof column.generated === "boolean" && Number.isSafeInteger(column.key)) ||
       !update.original || !update.changes || typeof update.changes !== "object") throw new Error();
@@ -112,7 +112,7 @@ export function parseTableUpdates(parameters: string): TableUpdate[] {
     const outer: unknown = JSON.parse(parameters);
     if (!Array.isArray(outer) || outer.length !== 1 || typeof outer[0] !== "string" || outer[0].length > 512 * 1024) throw new Error();
     const batch = JSON.parse(outer[0]) as TableUpdateBatch;
-    if (!batch || batch.version !== 1 || !Array.isArray(batch.updates) || batch.updates.length < 1 || batch.updates.length > 100) throw new Error();
+    if (batch?.version !== 1 || !Array.isArray(batch.updates) || batch.updates.length < 1 || batch.updates.length > 100) throw new Error();
     for (const update of batch.updates) {
       if (!update?.metadata || !["sqlite", "postgres", "mysql", "mongodb"].includes(update.metadata.driver) ||
         !Array.isArray(update.metadata.columns) || update.metadata.columns.length > 100 ||

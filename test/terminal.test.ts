@@ -11,7 +11,7 @@ import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
 import { StateQL } from "../src/stateql.js";
 import { serializeMongoCommand } from "../src/mongodb.js";
-import { StateStore } from "../src/store.js";
+import type { StateStore } from "../src/store.js";
 import type { MongoReadCommand } from "../src/types.js";
 import { hash } from "../src/util.js";
 import { createTemporaryDirectory, succeed } from "./helpers.js";

@@ -15,12 +15,18 @@ import type {
   Sort,
   UpdateOptions,
 } from "mongodb";
+import type { BaseAdapter } from "./adapters.js";
 import {
   AdapterExecutionError,
   AdapterWriteError,
   BatchWriteError,
+  isStopped,
+  remainingMilliseconds,
+  stoppedError,
+  throwIfStopped,
+  withContext,
   type AdapterContext,
-} from "./adapters.js";
+} from "./execution.js";
 import type { ConnectionRecord } from "./store.js";
 import type {
   CatalogObject,
@@ -211,7 +217,8 @@ export function deserializeMongoWriteCommand(value: string): MongoWriteCommand {
 }
 
 
-export class MongoAdapter {
+export class MongoAdapter implements BaseAdapter {
+  readonly kind = "mongodb" as const;
   readonly confidence = "ttl_based" as const;
   private readonly client: MongoClient;
   private readonly databaseName: string;
@@ -270,7 +277,7 @@ export class MongoAdapter {
     await this.connect();
     const collection = this.client.db(this.databaseName).collection(value.collection);
     const signal = operationSignal(this.context);
-    let cursor;
+    let cursor: Parameters<typeof collectCursor>[0] | undefined;
     try {
       if (value.operation === "find") {
         const options = findOptions(value.options as MongoDocument | undefined, this.context, signal, maxRows);
@@ -318,7 +325,7 @@ export class MongoAdapter {
       if (error instanceof AdapterWriteError) throw error;
       const stopped = writeStoppedError(error, this.context, true);
       if (stopped) throw stopped;
-      throw new AdapterWriteError(errorText(error), knownNoWrite(error) ? false : true);
+      throw new AdapterWriteError(errorText(error), !knownNoWrite(error));
     }
   }
 
@@ -963,81 +970,15 @@ function ejsonSafe<T>(value: T): unknown {
   return JSON.parse(BSON.EJSON.stringify(value, { relaxed: false })) as unknown;
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-
-function remainingMilliseconds(context: AdapterContext): number {
-  return Math.max(1, Math.min(2_147_483_647, Math.ceil(context.deadline - Date.now())));
-}
 
 function operationSignal(context: AdapterContext): AbortSignal {
   const deadlineSignal = AbortSignal.timeout(remainingMilliseconds(context));
   return context.signal ? AbortSignal.any([context.signal, deadlineSignal]) : deadlineSignal;
 }
 
-function throwIfStopped(context: AdapterContext, outcomeUnknown: boolean): void {
-  if (context.signal?.aborted || context.deadline <= Date.now()) {
-    throw stoppedError(context, outcomeUnknown);
-  }
-}
-
-function stoppedError(context: AdapterContext, outcomeUnknown: boolean): AdapterExecutionError {
-  const aborted = context.signal?.aborted ?? false;
-  return new AdapterExecutionError(
-    aborted ? "Database operation cancelled." : "Database operation timed out.",
-    aborted ? "aborted" : "timeout",
-    outcomeUnknown,
-  );
-}
-
-function withContext<T>(
-  promise: Promise<T>,
-  context: AdapterContext,
-  onStop: () => void,
-  outcomeUnknown: boolean,
-): Promise<T> {
-  try {
-    throwIfStopped(context, outcomeUnknown);
-  } catch (error) {
-    return Promise.reject(error);
-  }
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const finish = (action: () => void): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      context.signal?.removeEventListener("abort", stop);
-      action();
-    };
-    const stop = (): void => finish(() => {
-      try {
-        onStop();
-      } catch {
-        // Preserve cancellation/deadline error.
-      }
-      reject(stoppedError(context, outcomeUnknown));
-    });
-    const timer = setTimeout(stop, remainingMilliseconds(context));
-    context.signal?.addEventListener("abort", stop, { once: true });
-    promise.then(
-      (result) => context.signal?.aborted || context.deadline <= Date.now()
-        ? stop()
-        : finish(() => resolve(result)),
-      (error) => context.signal?.aborted || context.deadline <= Date.now()
-        ? stop()
-        : finish(() => reject(error)),
-    );
-  });
-}
-
 function readError(error: unknown, context: AdapterContext): unknown {
   if (error instanceof AdapterExecutionError) return error;
-  if (isTimeoutError(error) || context.signal?.aborted || context.deadline <= Date.now()) {
-    return stoppedError(context, false);
-  }
+  if (isTimeoutError(error) || isStopped(context)) return stoppedError(context, false);
   return error;
 }
 
@@ -1049,9 +990,7 @@ function writeStoppedError(
   if (error instanceof AdapterExecutionError) {
     return new AdapterExecutionError(error.message, error.reason, outcomeUnknown);
   }
-  if (isTimeoutError(error) || context.signal?.aborted || context.deadline <= Date.now()) {
-    return stoppedError(context, outcomeUnknown);
-  }
+  if (isTimeoutError(error) || isStopped(context)) return stoppedError(context, outcomeUnknown);
   return undefined;
 }
 

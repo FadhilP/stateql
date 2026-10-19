@@ -17,7 +17,8 @@ covered under [write safety](writes.md).
 ## Driver notes
 
 - **SQLite:** use a filesystem path for direct connections or `sqlite:` for an
-  environment-backed path.
+  environment-backed path. Reads run with `PRAGMA query_only`, also on
+  read-write connections, so a read cannot change the database.
 - **PostgreSQL:** StateQL preserves strict TLS verification by normalizing
   `sslmode=prefer`, `require`, and `verify-ca` to `verify-full` before opening
   the adapter. Use `sslmode=verify-full` explicitly for clarity. Setting

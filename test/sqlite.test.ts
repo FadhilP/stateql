@@ -362,6 +362,22 @@ test("SQLite catalog discovery filters and pages in the adapter", async () => {
   } finally { fixture.stateql.close(); }
 });
 
+test("SQLite reads on a read-write connection cannot write even if analysis is bypassed", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE guarded (id INTEGER PRIMARY KEY)"));
+  fixture.stateql.close();
+  const adapter = await createAdapter(
+    { driver: "sqlite", read_only: 0 } as unknown as Parameters<typeof createAdapter>[0],
+    createAdapterContext(5_000),
+    { source: fixture.database },
+  );
+  try {
+    await assert.rejects(adapter.read("INSERT INTO guarded VALUES (1) RETURNING id", []), /readonly|read-only/i);
+    assert.equal((await adapter.write("INSERT INTO guarded VALUES (2)", [])).affectedRows, 1);
+    assert.deepEqual((await adapter.read("SELECT id FROM guarded", [])).rows, [{ id: 2 }]);
+  } finally { await adapter.close(); }
+});
+
 
 test("SQLite in-memory targets are rejected instead of losing committed writes", async () => {
   const stateql = new StateQL({ home: createTemporaryDirectory() });

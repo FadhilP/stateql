@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { StateQL } from "../src/stateql.js";
-import { StateStore } from "../src/store.js";
+import type { StateStore } from "../src/store.js";
 import {
   assertFailure,
   assertOutcomeUnknown,

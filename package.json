@@ -26,8 +26,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/cli.test.js dist/test/credential.test.js dist/test/import.test.js dist/test/mongodb.test.js dist/test/mysql.test.js dist/test/postgres.test.js dist/test/query.test.js dist/test/redis.test.js dist/test/sqlite.test.js dist/test/store.test.js dist/test/terminal.test.js dist/test/transaction.test.js dist/test/write.test.js dist/test/panel.test.js",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "lint": "biome lint",
     "release": "npm version",
     "version": "npm install",
     "prepack": "npm test"
@@ -56,6 +57,7 @@
     "pg": "^8.16.3"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.15",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.5",
     "node-pty": "^1.1.0",

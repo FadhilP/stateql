@@ -150,25 +150,11 @@ export interface StateQLSnapshot {
     database: string;
     read_only: boolean;
   } | null;
-  transaction: {
-    transaction_id: string;
-    owner_actor_id: string;
-    state: string;
-  } | null;
+  transaction: TransactionReferenceData | null;
   state_version: string | null;
   state_confidence: StateConfidence | null;
-  recent_results: Array<{
-    alias: string | null;
-    handle: string;
-    rows: number;
-  }>;
-  recent_operations: Array<{
-    handle: string;
-    actor_id: string;
-    type: string;
-    affected_rows: number | null;
-    status: string;
-  }>;
+  recent_results: RecentResultData[];
+  recent_operations: RecentOperationData[];
   history: HistoryEntry[];
 }
 

@@ -11,9 +11,29 @@ import type {
 import type { Connection as MySqlConnection } from "mysql2/promise";
 import type { Client, QueryResult } from "pg";
 import { StateQLError } from "./errors.js";
+import {
+  AdapterExecutionError,
+  AdapterWriteError,
+  BatchWriteError,
+  remainingMilliseconds,
+  stoppedError,
+  throwIfStopped,
+  withContext,
+  type AdapterContext,
+} from "./execution.js";
+import { MongoAdapter } from "./mongodb.js";
+import { RedisAdapter } from "./redis.js";
 import type { CatalogObject, DescribeObjectData, ListObjectsData, ListObjectsFilter, Column, Row, SqlParameters, StateConfidence } from "./types.js";
 import type { ConnectionRecord, OperationRecord } from "./store.js";
 import { isSqlParameters, parseJson, toJsonSafe } from "./util.js";
+
+export {
+  AdapterExecutionError,
+  AdapterWriteError,
+  BatchWriteError,
+  createAdapterContext,
+  type AdapterContext,
+} from "./execution.js";
 
 const require = createRequire(import.meta.url);
 let mysqlModule: typeof import("mysql2") | undefined;
@@ -32,46 +52,18 @@ export interface WriteResult {
 
 export type BatchWriteOperation = OperationRecord & { expectedRows?: 1 };
 
-export interface AdapterContext {
-  deadline: number;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-export class AdapterExecutionError extends Error {
-  constructor(
-    message: string,
-    readonly reason: "timeout" | "aborted",
-    readonly outcomeUnknown: boolean,
-  ) {
-    super(message);
-    this.name = "AdapterExecutionError";
-  }
-}
-
-export class BatchWriteError extends Error {
-  constructor(
-    message: string,
-    readonly outcomeUnknown: boolean,
-  ) {
-    super(message);
-    this.name = "BatchWriteError";
-  }
-}
-
-export class AdapterWriteError extends Error {
-  constructor(
-    message: string,
-    readonly outcomeUnknown: boolean,
-  ) {
-    super(message);
-    this.name = "AdapterWriteError";
-  }
-}
-
-export interface Adapter {
+/** What every database adapter offers, whatever its command language. */
+export interface BaseAdapter {
   readonly confidence: StateConfidence;
   ping(): Promise<void>;
+  signature(): Promise<string>;
+  listObjects(filter: ListObjectsFilter): Promise<ListObjectsData>;
+  describeObject(object: CatalogObject): Promise<DescribeObjectData>;
+  close(): Promise<void>;
+}
+
+export interface SqlAdapter extends BaseAdapter {
+  readonly kind: "sql";
   read(sql: string, params: SqlParameters): Promise<ReadResult>;
   readAutocommit?(sql: string, params: SqlParameters): Promise<ReadResult>;
   write(sql: string, params: SqlParameters, expectedRows?: 1): Promise<WriteResult>;
@@ -80,29 +72,27 @@ export interface Adapter {
     operations: BatchWriteOperation[],
     isolation: string,
   ): Promise<WriteResult[]>;
-  signature(): Promise<string>;
   inspect(kind: string, table?: string): Promise<unknown>;
-  listObjects(filter: ListObjectsFilter): Promise<ListObjectsData>;
-  describeObject(object: CatalogObject): Promise<DescribeObjectData>;
-  close(): Promise<void>;
 }
 
-export function createAdapterContext(
-  timeoutMs: number,
-  signal?: AbortSignal,
-): AdapterContext {
-  return {
-    deadline: Date.now() + timeoutMs,
-    timeoutMs,
-    ...(signal ? { signal } : {}),
-  };
+export type DatabaseAdapter = SqlAdapter | MongoAdapter | RedisAdapter;
+
+/** Opens the adapter for any supported driver; this is the only place that maps drivers to adapters. */
+export async function openAdapter(
+  connection: ConnectionRecord,
+  context: AdapterContext,
+  source: string,
+): Promise<DatabaseAdapter> {
+  if (connection.driver === "mongodb") return new MongoAdapter(connection, context, { source });
+  if (connection.driver === "redis") return new RedisAdapter(source, Boolean(connection.read_only), context);
+  return createAdapter(connection, context, { source });
 }
 
 export async function createAdapter(
   connection: ConnectionRecord,
   context: AdapterContext,
   input: { source: string },
-): Promise<Adapter> {
+): Promise<SqlAdapter> {
   const { source } = input;
   switch (connection.driver) {
     case "sqlite":
@@ -142,7 +132,8 @@ interface PendingSQLiteCall {
 const SQLITE_AUTOCOMMIT_STATEMENTS = new Set(["vacuum", "analyze", "reindex"]);
 
 
-class SQLiteAdapter implements Adapter {
+class SQLiteAdapter implements SqlAdapter {
+  readonly kind = "sql" as const;
   readonly confidence = "database_reported" as const;
   private readonly child: ChildProcess;
   private readonly pending = new Map<number, PendingSQLiteCall>();
@@ -364,7 +355,8 @@ const POSTGRES_AUTOCOMMIT_STATEMENTS = new Set([
   "cluster",
 ]);
 
-class PostgresAdapter implements Adapter {
+class PostgresAdapter implements SqlAdapter {
+  readonly kind = "sql" as const;
   readonly confidence = "ttl_based" as const;
   private readonly client: Client;
   private readonly pgTypes: typeof import("pg")["types"];
@@ -378,10 +370,7 @@ class PostgresAdapter implements Adapter {
   ) {
     const { Client, types } = postgres();
     this.pgTypes = types;
-    const timeout = Math.min(
-      2_147_483_647,
-      remainingMilliseconds(context),
-    );
+    const timeout = remainingMilliseconds(context);
     this.client = new Client({
       connectionString: normalizePostgresConnectionString(source),
       connectionTimeoutMillis: timeout,
@@ -752,7 +741,8 @@ class PostgresAdapter implements Adapter {
   }
 }
 
-class MySqlAdapter implements Adapter {
+class MySqlAdapter implements SqlAdapter {
+  readonly kind = "sql" as const;
   readonly confidence = "ttl_based" as const;
   private rawClient: MySqlCoreConnection | undefined;
   private client: MySqlConnection | undefined;
@@ -1299,83 +1289,6 @@ function postgresCatalogFilter(filter: ListObjectsFilter): { where: string; para
   return { where: predicates.length ? `WHERE ${predicates.join(" AND ")}` : "", params };
 }
 
-
-function remainingMilliseconds(context: AdapterContext): number {
-  return Math.max(1, Math.ceil(context.deadline - Date.now()));
-}
-
-function throwIfStopped(
-  context: AdapterContext,
-  outcomeUnknown: boolean,
-): void {
-  if (context.signal?.aborted || context.deadline <= Date.now()) {
-    throw stoppedError(context, outcomeUnknown);
-  }
-}
-
-function stoppedError(
-  context: AdapterContext,
-  outcomeUnknown: boolean,
-): AdapterExecutionError {
-  const aborted = context.signal?.aborted ?? false;
-  return new AdapterExecutionError(
-    aborted ? "Database operation cancelled." : "Database operation timed out.",
-    aborted ? "aborted" : "timeout",
-    outcomeUnknown,
-  );
-}
-
-function withContext<T>(
-  promise: Promise<T>,
-  context: AdapterContext,
-  onStop: () => void,
-  outcomeUnknown: boolean,
-): Promise<T> {
-  try {
-    throwIfStopped(context, outcomeUnknown);
-  } catch (error) {
-    try {
-      onStop();
-    } catch {
-      // Preserve deadline/cancellation error.
-    }
-    return Promise.reject(error);
-  }
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const finish = (action: () => void): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      context.signal?.removeEventListener("abort", stop);
-      action();
-    };
-    const stop = (): void => {
-      finish(() => {
-        try {
-          onStop();
-        } catch {
-          // Preserve deadline/cancellation error.
-        }
-        reject(stoppedError(context, outcomeUnknown));
-      });
-    };
-    const stopped = (): boolean =>
-      Boolean(context.signal?.aborted) || context.deadline <= Date.now();
-    const timer = setTimeout(stop, remainingMilliseconds(context));
-    context.signal?.addEventListener("abort", stop, { once: true });
-    promise.then(
-      (value) => {
-        if (stopped()) stop();
-        else finish(() => resolve(value));
-      },
-      (error) => {
-        if (stopped()) stop();
-        else finish(() => reject(error));
-      },
-    );
-  });
-}
 
 function postgresErrorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;

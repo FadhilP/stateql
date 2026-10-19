@@ -93,18 +93,20 @@ export function paginationWarnings(ordered: boolean): Warning[] {
   ];
 }
 
+export function csvCell(value: unknown): string {
+  let text = value === null || value === undefined
+    ? ""
+    : typeof value === "object"
+      ? JSON.stringify(value)
+      : String(value);
+  // Spreadsheets evaluate cells that start like a formula; a leading quote keeps them text.
+  if (typeof value !== "number" && /^[\s\u0000-\u001f]*[=+@-]|^[\t\r\n]/u.test(text)) text = `'${text}`;
+  return /[",\r\n]/u.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
 export function rowsToCsv(rows: Row[], columns: string[]): string {
-  const encode = (value: unknown): string => {
-    const text =
-      value === null || value === undefined
-        ? ""
-        : typeof value === "object"
-          ? JSON.stringify(value)
-          : String(value);
-    return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-  };
   return [
-    columns.map(encode).join(","),
-    ...rows.map((row) => columns.map((column) => encode(row[column])).join(",")),
+    columns.map(csvCell).join(","),
+    ...rows.map((row) => columns.map((column) => csvCell(row[column])).join(",")),
   ].join("\n") + "\n";
 }

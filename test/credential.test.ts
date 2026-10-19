@@ -10,7 +10,7 @@ import {
   type CredentialRequest,
 } from "../src/index.js";
 import { injectPassword, validatePasswordReferenceTarget } from "../src/connection.js";
-import { StateStore } from "../src/store.js";
+import type { StateStore } from "../src/store.js";
 import { cliCredentialResolver, deleteOsPassword, saveOsPassword } from "../src/os-credentials.js";
 import {
   assertFailure,
