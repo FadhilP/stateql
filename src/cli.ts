@@ -8,7 +8,7 @@ import { BSON } from "mongodb";
 import { exitCodeFor } from "./errors.js";
 import { StateQL } from "./stateql.js";
 import { agentResponse } from "./agent-response.js";
-import { askPassword, cliCredentialResolver, deleteOsPassword, saveOsPassword } from "./os-credentials.js";
+import { askPassword, cliCredentialResolver, createOsPasswordRef, deleteOsPassword, saveOsPassword } from "./os-credentials.js";
 import type {
   BatchCommand,
   CatalogObject,
@@ -446,6 +446,12 @@ async function dispatchSession(
   }
 }
 
+async function askAndSavePassword(profile: string, target: string): Promise<string> {
+  const reference = createOsPasswordRef();
+  await saveOsPassword(reference, target, await askPassword(profile, target));
+  return reference;
+}
+
 async function dispatchProfile(
   action: string | undefined,
   args: string[],
@@ -457,7 +463,7 @@ async function dispatchProfile(
       }
       const name = requireValue(args[0], "profile name");
       const passwordRef = values["ask-password"]
-        ? await saveOsPassword(await askPassword(name, requireValue(args[1], "TARGET for --ask-password")))
+        ? await askAndSavePassword(name, requireValue(args[1], "TARGET for --ask-password"))
         : undefined;
       const added = await stateql.addProfile(name, args[1], {
         ...(values.env ? { secretEnv: values.env } : {}),
@@ -475,7 +481,7 @@ async function dispatchProfile(
       if (!before.ok) return before;
       const target = args[1] ?? before.data.target;
       const passwordRef = values["ask-password"]
-        ? await saveOsPassword(await askPassword(name, requireValue(target ?? undefined, "TARGET for --ask-password")))
+        ? await askAndSavePassword(name, requireValue(target ?? undefined, "TARGET for --ask-password"))
         : undefined;
       const updated = await stateql.updateProfile(name, {
         ...(args[1] !== undefined ? { target: args[1] } : {}),

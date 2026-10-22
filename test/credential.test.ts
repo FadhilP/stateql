@@ -11,7 +11,14 @@ import {
 } from "../src/index.js";
 import { injectPassword, validatePasswordReferenceTarget } from "../src/connection.js";
 import type { StateStore } from "../src/store.js";
-import { cliCredentialResolver, deleteOsPassword, saveOsPassword } from "../src/os-credentials.js";
+import {
+  cliCredentialResolver,
+  createOsPasswordRef,
+  deleteOsPassword,
+  invalidateOsPassword,
+  readOsPassword,
+  saveOsPassword,
+} from "../src/os-credentials.js";
 import {
   assertFailure,
   createTemporaryDirectory,
@@ -860,10 +867,43 @@ test("password reference capability gates setup before legacy runtimes execute i
   assert.equal(setupCalls, 1);
 });
 
-test("CLI resolver reads OS-stored passwords and environment variables only", async (t) => {
-  let reference: string;
+test("OS passwords resolve only for the destination they were saved for", async (t) => {
+  const reference = createOsPasswordRef();
+  const target = "postgres://u@db.example/app?sslmode=verify-full&pylon_tls_ca=aws-rds";
   try {
-    reference = await saveOsPassword("p@ss:wörd");
+    await saveOsPassword(reference, target, "p@ss:wörd");
+  } catch {
+    t.skip("No OS credential store is available.");
+    return;
+  }
+  try {
+    const materialized = "postgresql://u@DB.example:5432/app?sslrootcert=%2Fca.pem&sslmode=verify-full";
+    assert.equal(await readOsPassword(reference, materialized), "p@ss:wörd");
+    assert.equal(await readOsPassword(reference, "postgres://u@other.example/app"), undefined);
+    assert.equal(await readOsPassword(reference, "postgres://admin@db.example/app"), undefined);
+    assert.equal(await readOsPassword(reference, "postgres://u@db.example/app?application_name=x"), undefined);
+    assert.equal(await invalidateOsPassword(reference), true);
+    assert.equal(await readOsPassword(reference, target), undefined);
+
+    const multiHost = "mongodb://u@db-a.example:27017,db-b.example:27018/app";
+    await saveOsPassword(reference, multiHost, "mongo");
+    assert.equal(await readOsPassword(reference, multiHost), "mongo");
+    assert.equal(await readOsPassword(reference, multiHost.replace("db-b", "db-c")), undefined);
+    await assert.rejects(saveOsPassword(reference, "postgres://u:inline@db.example/app", "x"));
+    await assert.rejects(saveOsPassword("pylon:stateql:v1:x", target, "x"));
+
+    const { AsyncEntry } = await import("@napi-rs/keyring");
+    await new AsyncEntry("stql", reference.slice("os:".length)).setPassword("raw legacy");
+    assert.equal(await readOsPassword(reference, "postgres://anyone@anywhere/db"), "raw legacy");
+  } finally {
+    await deleteOsPassword(reference);
+  }
+});
+
+test("CLI resolver reads OS-stored passwords and environment variables only", async (t) => {
+  const reference = createOsPasswordRef();
+  try {
+    await saveOsPassword(reference, "postgres://u@h/d", "p@ss:wörd");
   } catch {
     t.skip("No OS credential store is available.");
     return;

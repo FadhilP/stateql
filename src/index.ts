@@ -1,6 +1,14 @@
 export { StateQL } from "./stateql.js";
 export { agentResponse } from "./agent-response.js";
 export {
+  createOsPasswordRef,
+  deleteOsPassword,
+  invalidateOsPassword,
+  isOsPasswordRef,
+  readOsPassword,
+  saveOsPassword,
+} from "./os-credentials.js";
+export {
   CredentialResolutionError,
   StateQLError,
   exitCodeFor,
