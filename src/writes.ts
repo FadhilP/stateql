@@ -159,6 +159,9 @@ export function prepareMongoWrite(
     parameters: [serialized],
     statementType: `mongo.${value.operation}`,
     fingerprint: hash({ command: serialized, database: databaseIdentity(connection) }),
+    ...(value.operation === "createIndex" || value.operation === "dropIndex"
+      ? { stagingError: "MongoDB index changes cannot be staged in a transaction." }
+      : {}),
     conflictMessage: "The document changed or was removed. Reload before editing.",
     unknownAction: REPLAY_ACTION,
     execute: (adapter) => adapterOfKind(adapter, "mongodb").write(value, safety.expectedRows),

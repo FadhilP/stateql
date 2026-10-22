@@ -16,8 +16,72 @@ test("Redis URLs and bounded command classification are explicit", () => {
   assert.throws(() => validateRedisReadCommand({ command: "KEYS", args: ["*"] }), /Unsupported/);
   assert.throws(() => validateRedisReadCommand({ command: "EVAL", args: ["return 1", "0"] }), /Unsupported/);
   assert.throws(() => validateRedisReadCommand({ command: "LRANGE", args: ["key", "0", "1000"] }), /at most/);
-  assert.throws(() => validateRedisWriteCommand({ command: "DEL", args: ["one", "two"] }), /requires 1/);
+  assert.equal(validateRedisWriteCommand({ command: "DEL", args: ["one", "two"] }).command, "DEL");
+  assert.throws(() => validateRedisWriteCommand({ command: "DEL", args: [] }), /requires 1-100/);
   assert.throws(() => validateRedisWriteCommand({ command: "FLUSHALL", args: [] }), /Unsupported/);
+  for (const args of [["k", "v", "EX", "10"], ["k", "v", "px", "5", "NX"], ["k", "v", "XX"]]) {
+    assert.equal(validateRedisWriteCommand({ command: "SET", args }).command, "SET", args.join(" "));
+  }
+  for (const args of [["k", "v", "EX", "0"], ["k", "v", "EX", "1", "PX"], ["k", "v", "NX", "XX"], ["k", "v", "GET"], ["k", "v", "EX"]]) {
+    assert.throws(() => validateRedisWriteCommand({ command: "SET", args }), /Redis SET/, args.join(" "));
+  }
+  assert.throws(() => validateRedisWriteCommand({ command: "HSET", args: ["k", "a", "1", "b"] }), /pairs/);
+  assert.throws(() => validateRedisWriteCommand({ command: "INCRBY", args: ["k", "1.5"] }), /integer/);
+  assert.throws(() => validateRedisWriteCommand({ command: "EXPIRE", args: ["k", "-1"] }), /positive integer/);
+  assert.throws(() => validateRedisReadCommand({ command: "ZRANGE", args: ["k", "0", "1", "BYSCORE"] }), /index ranges/);
+  assert.throws(() => validateRedisReadCommand({ command: "ZRANGE", args: ["k", "0", "-1"] }), /at most/);
+  assert.throws(() => validateRedisReadCommand({ command: "INFO", args: ["a b"] }), /section/);
+});
+
+test("Redis common reads and writes stay bounded", { skip: !process.env.STQL_REDIS_URL }, async () => {
+  const stateql = new StateQL({ home: createTemporaryDirectory() });
+  const external = createClient({ url: process.env.STQL_REDIS_URL });
+  external.on("error", () => undefined);
+  const prefix = `stateql:test:${randomUUID()}`;
+  const [hashKey, setKey, zsetKey, counter, big, other] = ["hash", "set", "zset", "counter", "big", "other"].map((name) => `${prefix}:${name}`) as [string, string, string, string, string, string];
+  const exec = (command: string, ...args: string[]) => succeed(stateql.redisExec({ command, args }, { idempotencyKey: randomUUID() }));
+  const query = async (command: string, ...args: string[]) => (await succeed(stateql.redisQuery({ command, args }, { cache: "bypass" }))).preview;
+  try {
+    await external.connect();
+    await succeed(stateql.connect(undefined, { secretEnv: "STQL_REDIS_URL", readOnly: false }));
+    await exec("HSET", hashKey, "a", "1", "b", "2");
+    assert.equal((await exec("HINCRBY", hashKey, "a", "5")).affected_rows, 1);
+    assert.deepEqual(await query("HGETALL", hashKey), [{ field: "a", value: "6" }, { field: "b", value: "2" }]);
+    assert.deepEqual(await query("HLEN", hashKey), [{ value: 2 }]);
+    await exec("SADD", setKey, "x");
+    assert.deepEqual(await query("SMEMBERS", setKey), [{ index: 0, value: "x" }]);
+    assert.deepEqual(await query("SISMEMBER", setKey, "x"), [{ value: 1 }]);
+    await exec("ZADD", zsetKey, "2", "two");
+    await exec("ZADD", zsetKey, "1", "one");
+    assert.deepEqual(await query("ZRANGE", zsetKey, "0", "9", "WITHSCORES"), [{ value: "one", score: "1" }, { value: "two", score: "2" }]);
+    assert.deepEqual(await query("ZSCORE", zsetKey, "two"), [{ value: "2" }]);
+    assert.equal((await exec("INCRBY", counter, "41")).affected_rows, 1);
+    await exec("INCR", counter);
+    assert.equal(await external.get(counter), "42");
+    assert.equal((await exec("SET", counter, "7", "NX")).affected_rows, 0);
+    await exec("SET", counter, "7", "XX", "EX", "100");
+    assert.ok((await external.ttl(counter)) > 90);
+    await exec("PERSIST", counter);
+    assert.equal(await external.ttl(counter), -1);
+    assert.ok((await query("DBSIZE"))[0]!.value as number >= 4);
+    assert.ok((await query("INFO", "server")).some((row: { field: string }) => row.field === "redis_version"));
+
+    await external.sAdd(big, Array.from({ length: 201 }, (_, index) => String(index)));
+    const tooBig = await stateql.redisQuery({ command: "SMEMBERS", args: [big] }, { cache: "bypass" });
+    assert.equal(tooBig.ok, false);
+    if (!tooBig.ok) assert.match(tooBig.error.message, /limit is 200\. Use SSCAN/);
+
+    await external.set(other, "o");
+    const plan = await succeed(stateql.redisPlan({ command: "DEL", args: [counter, other] }));
+    await external.set(other, "changed");
+    const conflict = await stateql.apply(plan.plan_id);
+    assert.equal(conflict.ok, false);
+    if (!conflict.ok) assert.equal(conflict.error.code, "ROW_CONFLICT");
+    assert.equal((await exec("UNLINK", counter, other)).affected_rows, 2);
+  } finally {
+    if (external.isOpen) { await external.del([hashKey, setKey, zsetKey, counter, big, other]); await external.quit(); }
+    stateql.close();
+  }
 });
 
 test("Redis query results and guarded plans detect pre-apply changes", { skip: !process.env.STQL_REDIS_URL }, async () => {

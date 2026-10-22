@@ -105,8 +105,22 @@ test("native MongoDB commands validate allowlisted shapes and operators", () => 
   );
   assert.throws(
     () => validateMongoReadCommand({ operation: "count", collection: "items" }),
-    /only support find and aggregate/,
+    /only support find, aggregate, countDocuments, and distinct/,
   );
+  assert.equal(validateMongoReadCommand({ operation: "countDocuments", collection: "items", filter: { a: 1 }, options: { limit: 5 } }).operation, "countDocuments");
+  assert.equal(validateMongoReadCommand({ operation: "distinct", collection: "items", field: "status" }).operation, "distinct");
+  assert.equal(validateMongoReadCommand({ operation: "find", collection: "items", explain: "executionStats" }).operation, "find");
+  assert.throws(() => validateMongoReadCommand({ operation: "distinct", collection: "items", field: "$status" }), /distinct field/);
+  assert.throws(() => validateMongoReadCommand({ operation: "countDocuments", collection: "items", options: { sort: { a: 1 } } }), /Unknown MongoDB countDocuments options field "sort"/);
+  assert.throws(() => validateMongoReadCommand({ operation: "find", collection: "items", explain: true }), /explain must be/);
+  assert.throws(() => validateMongoReadCommand({ operation: "distinct", collection: "items", field: "a", explain: "queryPlanner" }), /Unknown MongoDB read command field "explain"/);
+  assert.equal(validateMongoWriteCommand({ operation: "createIndex", collection: "items", keys: { a: 1, b: -1 }, options: { unique: true, name: "a_b" } }).operation, "createIndex");
+  assert.throws(() => validateMongoWriteCommand({ operation: "createIndex", collection: "items", keys: { a: 2 } }), /createIndex keys must map/);
+  assert.throws(() => validateMongoWriteCommand({ operation: "createIndex", collection: "items", keys: {} }), /at least one field/);
+  assert.throws(() => validateMongoWriteCommand({ operation: "createIndex", collection: "items", keys: { a: 1 }, options: { background: true } }), /Unknown MongoDB createIndex options field/);
+  for (const index of ["*", "_id_"]) {
+    assert.throws(() => validateMongoWriteCommand({ operation: "dropIndex", collection: "items", index }), /cannot drop index/);
+  }
   assert.throws(
     () => validateMongoWriteCommand({
       operation: "insertOne",
@@ -160,6 +174,14 @@ test("MongoDB empty-filter safety keeps unbounded and destructive flags independ
       document: { value: 1 },
     }),
     { unbounded: false, destructive: false },
+  );
+  assert.deepEqual(
+    analyzeMongoWriteSafety({ operation: "createIndex", collection: "items", keys: { a: 1 } }),
+    { unbounded: false, destructive: false },
+  );
+  assert.deepEqual(
+    analyzeMongoWriteSafety({ operation: "dropIndex", collection: "items", index: "a_1" }),
+    { unbounded: false, destructive: true },
   );
 });
 
@@ -476,6 +498,25 @@ test(
         assert.equal(applied.ok, true);
         if (applied.ok) assert.ok(applied.data.outcome?.inserted_id);
       }
+
+      await stateql.mongoExec({ operation: "insertOne", collection, document: { test_run: run, name: "updated" } });
+      const counted = await stateql.mongoQuery({ operation: "countDocuments", collection, filter: { test_run: run } }, { cache: "bypass" });
+      assert.equal(counted.ok, true);
+      if (counted.ok) assert.deepEqual(counted.data.preview, [{ count: 3 }]);
+      const names = await stateql.mongoQuery({ operation: "distinct", collection, field: "name", filter: { test_run: run } }, { cache: "bypass" });
+      assert.equal(names.ok, true);
+      if (names.ok) assert.deepEqual(names.data.preview, [{ value: "planned" }, { value: "updated" }]);
+      const explained = await stateql.mongoQuery({ operation: "find", collection, filter: { test_run: run }, explain: "queryPlanner" }, { cache: "bypass" });
+      assert.equal(explained.ok, true);
+      if (explained.ok) assert.ok(explained.data.preview[0]?.queryPlanner);
+
+      const index = `stateql_${process.pid}_idx`;
+      const created = await stateql.mongoExec({ operation: "createIndex", collection, keys: { test_run: 1, name: 1 }, options: { name: index } });
+      assert.equal(created.ok, true, created.ok ? undefined : JSON.stringify(created.error));
+      if (created.ok) assert.equal(created.data.outcome?.index_name, index);
+      assertFailure(await stateql.mongoExec({ operation: "dropIndex", collection, index }), "DESTRUCTIVE_OPERATION_BLOCKED");
+      const dropped = await stateql.mongoExec({ operation: "dropIndex", collection, index }, { allowDestructive: true });
+      assert.equal(dropped.ok, true, dropped.ok ? undefined : JSON.stringify(dropped.error));
 
       const deleted = await stateql.mongoExec({
         operation: "deleteOne",

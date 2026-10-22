@@ -41,7 +41,12 @@ transaction-control SQL is unsupported: use
 [staged transactions](writes.md#transactions), not `BEGIN` or `COMMIT` statements.
 MongoDB and Redis use separate native command APIs.
 
-Unrecognized or parser-unsupported forms remain blocked.
+A single `SELECT` or `WITH` statement that the parser cannot read still runs as
+a read: the database checks it inside its read-only transaction (SQLite
+`query_only`), which rejects writes and a second statement. A database syntax
+error is reported as `INVALID_SQL`. Statement separators, writing CTEs, and
+MySQL `INTO OUTFILE`/`DUMPFILE` are rejected before dispatch. Other
+parser-unsupported forms, including every write, remain blocked.
 
 ## Dialect upserts
 
@@ -80,12 +85,22 @@ user-defined or incorrectly labelled functions.
 
 StateQL supports PostgreSQL 14–18. Top-level `VALUES` is a bounded read and
 accepts normal PostgreSQL positional parameters. It is conservatively
-non-cacheable because expressions may be volatile. The following narrow `SHOW`
-allowlist is also available as non-cacheable diagnostics:
-`server_version`, `server_version_num`, `transaction_read_only`,
-`transaction_isolation`, and `default_transaction_isolation`. `SHOW ALL` and
-other settings remain blocked. Syntax accepted by StateQL but introduced by a
-newer PostgreSQL release may be rejected safely by an older server.
+non-cacheable because expressions may be volatile. `SHOW` of these non-secret
+settings is available as a non-cacheable diagnostic: `application_name`,
+`client_encoding`, `DateStyle`, `default_transaction_isolation`,
+`default_transaction_read_only`, `effective_cache_size`,
+`idle_in_transaction_session_timeout`, `IntervalStyle`, `lc_collate`,
+`lc_ctype`, `lock_timeout`, `maintenance_work_mem`, `max_connections`,
+`random_page_cost`, `search_path`, `server_encoding`, `server_version`,
+`server_version_num`, `shared_buffers`, `standard_conforming_strings`,
+`statement_timeout`, `TimeZone`, `transaction_isolation`,
+`transaction_read_only`, and `work_mem`. `SHOW ALL` and other settings remain
+blocked. Syntax accepted by StateQL but introduced by a newer PostgreSQL release
+may be rejected safely by an older server.
+
+To set a session `search_path` (or another setting), add the libpq `options`
+parameter to the connection URL, URL-encoded:
+`postgres://app@db/app?options=-c%20search_path%3Dreporting%2Cpublic`.
 
 `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER` are PostgreSQL maintenance writes:
 
@@ -167,9 +182,15 @@ stql mongo plan '{"operation":"deleteMany","collection":"users","filter":{"disab
 ```
 
 The TypeScript equivalents are `mongoQuery(command)`, `mongoExec(command)`, and
-`mongoPlan(command)`. Supported reads are `find` and `aggregate`; writes are
-`insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`,
-and `deleteMany`. Result documents are JSON-safe, order-preserving EJSON: for example,
+`mongoPlan(command)`. Supported reads are `find`, `aggregate`, `countDocuments`
+(one `{count}` row), and `distinct` (one `{value}` row per value, capped by the
+row limit). `find` and `aggregate` accept `explain: "queryPlanner" |
+"executionStats" | "allPlansExecution"` and return the plan as one document.
+Writes are `insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`,
+`deleteOne`, `deleteMany`, `createIndex` (`keys`, `options`: `name`, `unique`,
+`sparse`, `expireAfterSeconds`, `partialFilterExpression`, `collation`), and
+`dropIndex` (`index` name; destructive; `*` and `_id_` are rejected). Index
+changes cannot be staged in a transaction. Result documents are JSON-safe, order-preserving EJSON: for example,
 ObjectIds and dates appear as `{ "$oid": "..." }` and
 `{ "$date": { "$numberLong": "..." } }`.
 
@@ -208,9 +229,15 @@ stql object key app:status
 Writes and plans require a read-write connection. The TypeScript methods are:
 
 - `redisQuery`: `GET`, `MGET`, `TYPE`, `EXISTS`, `TTL`, `PTTL`, `HGET`, `HMGET`,
-  bounded `LRANGE`, and bounded `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`.
-- `redisExec` and `redisPlan`: one-key `SET`, `DEL`, `HSET`, `HDEL`, `LPUSH`,
-  `RPUSH`, `SADD`, `SREM`, `ZADD`, or `ZREM` mutation.
+  `HLEN`, `SCARD`, `SISMEMBER`, `ZCARD`, `ZSCORE`, `LLEN`, `STRLEN`, `DBSIZE`,
+  `INFO [section]` (one row per field), bounded `LRANGE`, bounded index
+  `ZRANGE [WITHSCORES]`, `HGETALL`/`SMEMBERS` on keys with at most 200 values,
+  and bounded `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`.
+- `redisExec` and `redisPlan`: `SET` (optional `EX`/`PX` and `NX`/`XX`),
+  `DEL`/`UNLINK` (up to 100 keys), `HSET` (field/value pairs), `HDEL`,
+  `HINCRBY`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
+  `LPUSH`, `RPUSH`, `SADD`, `SREM`, `ZADD`, or `ZREM`. A plan guards every key
+  that `DEL`/`UNLINK` names and the first key of other commands.
 - `describeObject({kind:"key",name})`: bounded string/hash/list/set/zset value
   inspection with TTL and continuation metadata where applicable.
 

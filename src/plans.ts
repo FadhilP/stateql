@@ -108,7 +108,7 @@ export function prepareRedisPlan(command: unknown): PlanStatement {
     descriptor: redisDescriptor(value.command),
     parameters: [],
     statementType: `redis.${value.command.toLowerCase()}`,
-    destructive: value.command === "DEL",
+    destructive: value.command === "DEL" || value.command === "UNLINK",
     allowUnbounded: false,
     allowDestructive: true,
     requiredOverrides: [],

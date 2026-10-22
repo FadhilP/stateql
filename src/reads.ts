@@ -7,7 +7,7 @@ import {
   type ActionResult,
   type Core,
 } from "./core.js";
-import { StateQLError } from "./errors.js";
+import { isSqlSyntaxError, StateQLError } from "./errors.js";
 import { serializeMongoCommand, validateMongoReadCommand } from "./mongodb.js";
 import { serializeRedisCommand, validateRedisReadCommand } from "./redis.js";
 import { paginationWarnings } from "./response-data.js";
@@ -76,7 +76,17 @@ export function prepareSqlRead(
       const executionSql = analysis.wrapForLimit
         ? boundedReadSql(analysis.limitSql ?? sql, fetchLimit)
         : sql;
-      if (!analysis.requiresAutocommit) return sqlAdapter.read(executionSql, parameters);
+      if (!analysis.requiresAutocommit) {
+        try {
+          return await sqlAdapter.read(executionSql, parameters);
+        } catch (error) {
+          // The parser's message points at the position in the SQL the caller wrote.
+          if (analysis.parserError && isSqlSyntaxError(error)) {
+            throw new StateQLError("INVALID_SQL", analysis.parserError);
+          }
+          throw error;
+        }
+      }
       if (!sqlAdapter.readAutocommit) {
         throw new StateQLError(
           "UNSUPPORTED_DRIVER",
@@ -249,10 +259,13 @@ function cacheMiss(message: string): StateQLError {
 
 function boundedReadSql(sql: string, limit: number): string {
   const statement = sql.trim().replace(/;\s*$/, "");
-  return `SELECT * FROM (${statement}) AS _stateql_bounded LIMIT ${limit}`;
+  // The newline ends a trailing line comment before the closing parenthesis.
+  return `SELECT * FROM (${statement}\n) AS _stateql_bounded LIMIT ${limit}`;
 }
 
 function mongoPaginationWarnings(command: MongoReadCommand): Warning[] {
+  if (command.operation === "countDocuments" || command.operation === "distinct") return [];
+  if (command.explain) return [];
   const ordered = command.operation === "find"
     ? command.options?.sort !== undefined
     : command.pipeline.some((stage) =>

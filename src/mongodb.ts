@@ -54,7 +54,13 @@ const FIND_OPTIONS = new Set([
   "hint",
   "collation",
 ]);
-const AGGREGATE_OPTIONS = new Set(["allowDiskUse", "hint", "collation"]);
+const READ_OPTIONS: Record<MongoReadCommand["operation"], ReadonlySet<string>> = {
+  find: FIND_OPTIONS,
+  aggregate: new Set(["allowDiskUse", "hint", "collation"]),
+  countDocuments: new Set(["skip", "limit", "hint", "collation"]),
+  distinct: new Set(["collation"]),
+};
+const EXPLAIN_VERBOSITY = new Set(["queryPlanner", "executionStats", "allPlansExecution"]);
 const WRITE_OPTIONS: Record<MongoWriteCommand["operation"], ReadonlySet<string>> = {
   insertOne: new Set(),
   insertMany: new Set(["ordered"]),
@@ -63,7 +69,10 @@ const WRITE_OPTIONS: Record<MongoWriteCommand["operation"], ReadonlySet<string>>
   replaceOne: new Set(["upsert", "collation", "hint"]),
   deleteOne: new Set(["collation", "hint"]),
   deleteMany: new Set(["collation", "hint"]),
+  createIndex: new Set(["name", "unique", "sparse", "expireAfterSeconds", "partialFilterExpression", "collation"]),
+  dropIndex: new Set(),
 };
+const INDEX_KEY_TYPES = new Set<unknown>([1, -1, "text", "2dsphere", "2d", "hashed"]);
 const FORBIDDEN_KEYS = new Set([
   "$out",
   "$merge",
@@ -81,8 +90,10 @@ const UPDATE_PIPELINE_STAGES = new Set([
   "$replaceWith",
 ]);
 const READ_KEYS: Record<MongoReadCommand["operation"], ReadonlySet<string>> = {
-  find: new Set(["operation", "collection", "filter", "options"]),
-  aggregate: new Set(["operation", "collection", "pipeline", "options"]),
+  find: new Set(["operation", "collection", "filter", "options", "explain"]),
+  aggregate: new Set(["operation", "collection", "pipeline", "options", "explain"]),
+  countDocuments: new Set(["operation", "collection", "filter", "options"]),
+  distinct: new Set(["operation", "collection", "field", "filter", "options"]),
 };
 const WRITE_KEYS: Record<MongoWriteCommand["operation"], ReadonlySet<string>> = {
   insertOne: new Set(["operation", "collection", "document", "options"]),
@@ -92,6 +103,8 @@ const WRITE_KEYS: Record<MongoWriteCommand["operation"], ReadonlySet<string>> = 
   replaceOne: new Set(["operation", "collection", "filter", "replacement", "options"]),
   deleteOne: new Set(["operation", "collection", "filter", "options"]),
   deleteMany: new Set(["operation", "collection", "filter", "options"]),
+  createIndex: new Set(["operation", "collection", "keys", "options"]),
+  dropIndex: new Set(["operation", "collection", "index"]),
 };
 
 interface MongoReadResult {
@@ -112,28 +125,41 @@ interface MongoWriteSafety {
 export function validateMongoReadCommand(value: unknown): MongoReadCommand {
   if (!isRecord(value)) throw new Error("MongoDB read command must be an object.");
   const operation = value.operation;
-  if (operation !== "find" && operation !== "aggregate") {
-    throw new Error("MongoDB reads only support find and aggregate.");
+  if (!isMongoReadOperation(operation)) {
+    throw new Error("MongoDB reads only support find, aggregate, countDocuments, and distinct.");
   }
   rejectUnknownKeys(value, READ_KEYS[operation], "read command");
   validateCollection(value.collection);
-  validateOptions(value.options, operation === "find" ? FIND_OPTIONS : AGGREGATE_OPTIONS, operation);
+  validateOptions(value.options, READ_OPTIONS[operation], operation);
+  if (value.explain !== undefined && !EXPLAIN_VERBOSITY.has(value.explain as string)) {
+    throw new Error("MongoDB explain must be queryPlanner, executionStats, or allPlansExecution.");
+  }
+  if (operation !== "aggregate" && value.filter !== undefined && !isDocument(value.filter)) {
+    throw new Error(`MongoDB ${operation} filter must be an object.`);
+  }
 
-  if (operation === "find") {
-    if (value.filter !== undefined && !isDocument(value.filter)) {
-      throw new Error("MongoDB find filter must be an object.");
-    }
-    validateFindOptions(value.options);
-  } else {
-    if (!Array.isArray(value.pipeline) || !value.pipeline.every(isDocument)) {
-      throw new Error("MongoDB aggregate pipeline must be an array of stage objects.");
-    }
-    for (const stage of value.pipeline) {
-      if (Object.keys(stage).length !== 1) {
-        throw new Error("Each MongoDB aggregate pipeline stage must contain exactly one operator.");
+  switch (operation) {
+    case "find":
+    case "countDocuments":
+      validateFindOptions(value.options);
+      break;
+    case "aggregate":
+      if (!Array.isArray(value.pipeline) || !value.pipeline.every(isDocument)) {
+        throw new Error("MongoDB aggregate pipeline must be an array of stage objects.");
       }
-    }
-    validateAggregateOptions(value.options);
+      for (const stage of value.pipeline) {
+        if (Object.keys(stage).length !== 1) {
+          throw new Error("Each MongoDB aggregate pipeline stage must contain exactly one operator.");
+        }
+      }
+      validateAggregateOptions(value.options);
+      break;
+    case "distinct":
+      if (typeof value.field !== "string" || !value.field || value.field.startsWith("$") || value.field.includes("\0")) {
+        throw new Error("MongoDB distinct field must be a field name.");
+      }
+      validateHintAndCollation((value.options ?? {}) as MongoDocument, operation);
+      break;
   }
   rejectForbiddenValues(value);
   return value as MongoReadCommand;
@@ -175,6 +201,17 @@ export function validateMongoWriteCommand(value: unknown): MongoWriteCommand {
     case "deleteMany":
       requireDocument(value.filter, `${operation} filter`);
       break;
+    case "createIndex":
+      validateIndex(value.keys, value.options);
+      break;
+    case "dropIndex":
+      if (typeof value.index !== "string" || !value.index || value.index.includes("\0")) {
+        throw new Error("MongoDB dropIndex index must be an index name.");
+      }
+      if (value.index === "*" || value.index === "_id_") {
+        throw new Error(`MongoDB cannot drop index "${value.index}".`);
+      }
+      break;
   }
   rejectForbiddenValues(value);
   return value as MongoWriteCommand;
@@ -204,6 +241,10 @@ export function analyzeMongoWriteSafety(command: MongoWriteCommand): MongoWriteS
         unbounded: Object.keys(value.filter).length === 0,
         destructive: true,
       };
+    case "createIndex":
+      return { unbounded: false, destructive: false };
+    case "dropIndex":
+      return { unbounded: false, destructive: true };
   }
 }
 
@@ -277,14 +318,32 @@ export class MongoAdapter implements BaseAdapter {
     await this.connect();
     const collection = this.client.db(this.databaseName).collection(value.collection);
     const signal = operationSignal(this.context);
-    let cursor: Parameters<typeof collectCursor>[0] | undefined;
+    let cursor: (Parameters<typeof collectCursor>[0] & { explain(verbosity: string): Promise<Document> }) | undefined;
     try {
-      if (value.operation === "find") {
+      const filter = "filter" in value && value.filter ? value.filter as Document : {};
+      if (value.operation === "countDocuments") {
+        const options = findOptions(value.options as MongoDocument | undefined, this.context, signal, Number.MAX_SAFE_INTEGER);
+        if (!value.options?.limit) delete options.limit;
+        const count = await withContext(collection.countDocuments(filter, options), this.context, () => this.stop(), false);
+        return { rows: [{ count }], columns: [{ name: "count", type: "number" }] };
+      }
+      if (value.operation === "distinct") {
         const options = findOptions(value.options as MongoDocument | undefined, this.context, signal, maxRows);
-        cursor = collection.find(value.filter as Document | undefined ?? {}, options);
-      } else {
-        const options = aggregateOptions(value.options as MongoDocument | undefined, this.context, signal);
-        cursor = collection.aggregate(value.pipeline as Document[], options).limit(maxRows);
+        delete options.limit;
+        const values = await withContext(collection.distinct(value.field, filter, options), this.context, () => this.stop(), false);
+        return documentsResult(values.slice(0, maxRows).map((item) => ({ value: item })));
+      }
+      const options = value.operation === "find"
+        ? findOptions(value.options as MongoDocument | undefined, this.context, signal, maxRows)
+        : aggregateOptions(value.options as MongoDocument | undefined, this.context, signal);
+      // The driver rejects explain with both limits; timeoutMS still bounds it.
+      if (value.explain) delete options.maxTimeMS;
+      cursor = value.operation === "find"
+        ? collection.find(filter, options)
+        : collection.aggregate(value.pipeline as Document[], options).limit(maxRows);
+      if (value.explain) {
+        const plan = await withContext(cursor.explain(value.explain), this.context, () => this.stop(), false);
+        return documentsResult([plan]);
       }
       const documents = await collectCursor(cursor, maxRows, this.context);
       return documentsResult(documents);
@@ -589,6 +648,15 @@ export class MongoAdapter implements BaseAdapter {
           },
         };
       }
+      case "createIndex": {
+        const options = writeOptions(command.options as MongoDocument | undefined, command.operation, session, timeoutMS);
+        const name = await collection.createIndex(command.keys, options);
+        return { affectedRows: 0, outcome: { acknowledged: true, index_name: name } };
+      }
+      case "dropIndex": {
+        await collection.dropIndex(command.index, { session, timeoutMS });
+        return { affectedRows: 0, outcome: { acknowledged: true, index_name: command.index } };
+      }
     }
   }
 
@@ -817,6 +885,31 @@ function validateHintAndCollation(options: MongoDocument, operation: string): vo
   }
 }
 
+function validateIndex(keys: unknown, value: unknown): void {
+  requireDocument(keys, "createIndex keys");
+  const entries = Object.entries(keys);
+  if (entries.length === 0) throw new Error("MongoDB createIndex keys must name at least one field.");
+  for (const [field, type] of entries) {
+    if (!field || field.startsWith("$") || !INDEX_KEY_TYPES.has(type)) {
+      throw new Error("MongoDB createIndex keys must map field names to 1, -1, text, 2dsphere, 2d, or hashed.");
+    }
+  }
+  if (value === undefined) return;
+  const options = value as MongoDocument;
+  if (options.name !== undefined && (typeof options.name !== "string" || !options.name || options.name.includes("\0"))) {
+    throw new Error("MongoDB createIndex name must be a non-empty string.");
+  }
+  for (const key of ["unique", "sparse"] as const) {
+    if (options[key] !== undefined && typeof options[key] !== "boolean") {
+      throw new Error(`MongoDB createIndex ${key} must be boolean.`);
+    }
+  }
+  if (options.expireAfterSeconds !== undefined) numericOption(options.expireAfterSeconds, "createIndex expireAfterSeconds");
+  if (options.partialFilterExpression !== undefined && !isDocument(options.partialFilterExpression)) {
+    throw new Error("MongoDB createIndex partialFilterExpression must be an object.");
+  }
+}
+
 function validateUpdate(value: unknown): void {
   if (Array.isArray(value)) {
     if (value.length === 0 || !value.every(isDocument)) {
@@ -945,10 +1038,12 @@ function isRecord(value: unknown): value is MongoDocument {
 }
 
 
+function isMongoReadOperation(value: unknown): value is MongoReadCommand["operation"] {
+  return typeof value === "string" && Object.hasOwn(READ_KEYS, value);
+}
+
 function isMongoWriteOperation(value: unknown): value is MongoWriteCommand["operation"] {
-  return value === "insertOne" || value === "insertMany" ||
-    value === "updateOne" || value === "updateMany" ||
-    value === "replaceOne" || value === "deleteOne" || value === "deleteMany";
+  return typeof value === "string" && Object.hasOwn(WRITE_KEYS, value);
 }
 
 function bsonTypeName(value: unknown): string | undefined {

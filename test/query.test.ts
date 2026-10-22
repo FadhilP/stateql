@@ -518,6 +518,18 @@ test("SQL syntax errors report position instead of every expected token", async 
   fixture.stateql.close();
 });
 
+test("reads the parser cannot read run on the database", async () => {
+  const fixture = await createFixture();
+  await succeed(fixture.stateql.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)"));
+  await succeed(fixture.stateql.exec("INSERT INTO items (value) VALUES (3), (1), (2)"));
+  const ranked = await succeed(fixture.stateql.query(
+    "SELECT id, rank() OVER w AS position FROM items WINDOW w AS (ORDER BY value) ORDER BY id",
+  ));
+  assert.equal(ranked.rows, 3);
+  assert.deepEqual(ranked.preview, [{ id: 1, position: 3 }, { id: 2, position: 1 }, { id: 3, position: 2 }]);
+  fixture.stateql.close();
+});
+
 test("only transient database failures are retryable", async () => {
   const withProperties = (properties: Record<string, unknown>, message = "failed") =>
     Object.assign(new Error(message), properties);

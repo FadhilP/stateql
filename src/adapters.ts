@@ -9,7 +9,7 @@ import type {
   RowDataPacket as MySqlRowDataPacket,
 } from "mysql2";
 import type { Connection as MySqlConnection } from "mysql2/promise";
-import type { Client, QueryResult } from "pg";
+import type { Client, QueryConfig, QueryResult } from "pg";
 import { StateQLError } from "./errors.js";
 import {
   AdapterExecutionError,
@@ -387,7 +387,9 @@ class PostgresAdapter implements SqlAdapter {
     await this.query("BEGIN READ ONLY", [], false);
     try {
       await this.setLocalDeadline();
-      const result = await this.query(sql, postgresParams(params), false);
+      // The extended protocol rejects multiple statements, so a read cannot COMMIT and continue.
+      const extended = { text: sql, queryMode: "extended" } as QueryConfig;
+      const result = await this.query(extended, postgresParams(params), false);
       await this.query("COMMIT", [], false);
       return {
         rows: toJsonSafe(result.rows as Row[]),
@@ -702,7 +704,7 @@ class PostgresAdapter implements SqlAdapter {
   }
 
   private async query(
-    sql: string,
+    sql: string | QueryConfig,
     params: unknown[],
     outcomeUnknown: boolean,
     preDispatchOutcomeUnknown = outcomeUnknown,

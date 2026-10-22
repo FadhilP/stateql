@@ -59,6 +59,8 @@ export interface SqlAnalysis {
   requiresAutocommit: boolean;
   /** Analysis-only SQL with trailing trivia removed when limit wrapping needs it. */
   limitSql?: string;
+  /** Set when the parser could not read this read statement; the database checks it instead. */
+  parserError?: string;
 }
 
 export function analyzeSql(sql: string, driver: SqlDriver): SqlAnalysis;
@@ -196,7 +198,7 @@ function parseSqlStatement(
   try {
     parsed = parser.astify(parserSql, { database });
   } catch (error) {
-    throw new StateQLError("INVALID_SQL", syntaxErrorMessage(error, parserSql));
+    throw new SqlSyntaxError(syntaxErrorMessage(error, parserSql));
   }
   if (Array.isArray(parsed) && parsed.length !== 1) {
     throw new StateQLError(
@@ -219,7 +221,57 @@ function parseSqlStatement(
 }
 
 function analyzeParsedSql(sql: string, driver: Exclude<Driver, "mongodb" | "redis">): SqlAnalysis {
-  return analyzeParsedStatement(parseSqlStatement(sql, driver), driver);
+  try {
+    return analyzeParsedStatement(parseSqlStatement(sql, driver), driver);
+  } catch (error) {
+    return unparsedRead(sql, driver, error);
+  }
+}
+
+const WRITABLE_CTE = /\bAS\s*(?:NOT\s+)?(?:MATERIALIZED\s*)?\(\s*(?:INSERT|UPDATE|DELETE|MERGE)\b/i;
+
+/** SQL the parser could not read, as opposed to SQL it read and rejected. */
+class SqlSyntaxError extends StateQLError {
+  constructor(message: string) {
+    super("INVALID_SQL", message);
+  }
+}
+
+// The parser misses much valid SQL. Adapters run every read in a read-only
+// transaction that accepts one statement, so the database rejects any write.
+function unparsedRead(
+  sql: string,
+  driver: Exclude<Driver, "mongodb" | "redis">,
+  error: unknown,
+): SqlAnalysis {
+  if (!(error instanceof SqlSyntaxError) || !looksLikeRead(sql, driver)) throw error;
+  if (hasStatementSeparator(sql)) throw error;
+  if (WRITABLE_CTE.test(sql)) {
+    throw new StateQLError("INVALID_SQL", "Read statements cannot contain writes or SELECT INTO.");
+  }
+  const normalized = sql.trim().replace(/;\s*$/, "");
+  return {
+    ast: { type: "select" } as unknown as AST,
+    normalized,
+    statementType: "select",
+    read: true,
+    unboundedMutation: false,
+    destructive: false,
+    ordered: /\border\s+by\b/i.test(normalized),
+    wrapForLimit: true,
+    cacheable: true,
+    requiresAutocommit: false,
+    parserError: error.message,
+  };
+}
+
+function looksLikeRead(sql: string, driver: Exclude<Driver, "mongodb" | "redis">): boolean {
+  const command = driver === "mysql"
+    ? new MySqlPrefixScanner(sql).readWord()?.value
+    : new SqlPrefixScanner(sql, driver).readWord()?.value;
+  if (command !== "SELECT" && command !== "WITH") return false;
+  // A MySQL read-only transaction does not stop SELECT from writing server files.
+  return driver !== "mysql" || !/\binto\s+(?:outfile|dumpfile)\b/i.test(sql);
 }
 
 function analyzeParsedStatement(
@@ -392,11 +444,31 @@ const EXPLAIN_SERIALIZE = new Set(["NONE", "TEXT", "BINARY"]);
 const BOOLEAN_VALUES = new Set(["TRUE", "FALSE", "ON", "OFF", "1", "0"]);
 
 const POSTGRES_SHOW_SETTINGS = new Set([
+  "application_name",
+  "client_encoding",
+  "datestyle",
   "default_transaction_isolation",
+  "default_transaction_read_only",
+  "effective_cache_size",
+  "idle_in_transaction_session_timeout",
+  "intervalstyle",
+  "lc_collate",
+  "lc_ctype",
+  "lock_timeout",
+  "maintenance_work_mem",
+  "max_connections",
+  "random_page_cost",
+  "search_path",
+  "server_encoding",
   "server_version",
   "server_version_num",
+  "shared_buffers",
+  "standard_conforming_strings",
+  "statement_timeout",
+  "timezone",
   "transaction_isolation",
   "transaction_read_only",
+  "work_mem",
 ]);
 
 function analyzePostgresCommand(sql: string): SqlAnalysis | undefined {
@@ -466,7 +538,12 @@ function analyzeMySqlSql(sql: string): SqlAnalysis {
   ) {
     return analyzeMySqlMaintenance(sql, scanner, command.value);
   }
-  const parsed = parseSqlStatement(sql, "mysql");
+  let parsed: ParsedSql;
+  try {
+    parsed = parseSqlStatement(sql, "mysql");
+  } catch (error) {
+    return unparsedRead(sql, "mysql", error);
+  }
   const details = parsed.ast as unknown as Record<string, unknown>;
   if (details.type === "explain") {
     const inner = details.expr as AST | undefined;
@@ -707,6 +784,7 @@ function analyzePostgresExplain(
     wrapForLimit: false,
     cacheable: false,
     requiresAutocommit: false,
+    ...(inner.parserError ? { parserError: inner.parserError } : {}),
   };
 }
 
@@ -1198,9 +1276,24 @@ class SqlPrefixScanner {
 }
 
 function postgresStatementBody(sql: string): string {
+  let last: [number, number] = [0, 0];
+  for (const token of postgresTokens(sql)) last = token;
+  const end = sql[last[0]] === ";" ? last[0] : last[1];
+  return sql.slice(0, end).trim();
+}
+
+/** True when a ; separates two statements; one trailing ; is allowed. */
+function hasStatementSeparator(sql: string): boolean {
+  let afterSeparator = false;
+  for (const [start] of postgresTokens(sql)) {
+    if (afterSeparator) return true;
+    afterSeparator = sql[start] === ";";
+  }
+  return false;
+}
+
+function* postgresTokens(sql: string): Generator<[number, number]> {
   let index = 0;
-  let lastTokenStart = 0;
-  let lastTokenEnd = 0;
   while (index < sql.length) {
     if (/\s/u.test(sql[index]!)) {
       index += 1;
@@ -1242,11 +1335,8 @@ function postgresStatementBody(sql: string): string {
     } else {
       index += 1;
     }
-    lastTokenStart = start;
-    lastTokenEnd = index;
+    yield [start, index];
   }
-  const end = sql[lastTokenStart] === ";" ? lastTokenStart : lastTokenEnd;
-  return sql.slice(0, end).trim();
 }
 
 function invalidPostgresSyntax(command: string): never {

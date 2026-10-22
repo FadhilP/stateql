@@ -132,6 +132,23 @@ test("MySQL rejects executable comments throughout SQL without rejecting quoted 
   }
 });
 
+test("MySQL reads the parser cannot read fall back unless they write files", () => {
+  const analysis = analyzeSql("SELECT a FROM t FOR SHARE SKIP LOCKED", "mysql");
+  assert.equal(analysis.read, true);
+  assert.match(analysis.parserError ?? "", /^Syntax error/);
+  for (const sql of [
+    "SELECT a FROM t FOR SHARE SKIP LOCKED INTO OUTFILE '/tmp/out'",
+    "SELECT a FROM t FOR SHARE SKIP LOCKED INTO DUMPFILE '/tmp/out'",
+    "SELECT a FROM t FOR SHARE SKIP LOCKED; DELETE FROM t",
+  ]) {
+    assert.throws(
+      () => analyzeSql(sql, "mysql"),
+      (error: unknown) => error instanceof StateQLError && error.details.code === "INVALID_SQL",
+      sql,
+    );
+  }
+});
+
 const mysqlUrl = process.env.STQL_MYSQL_URL;
 
 test(

@@ -78,10 +78,11 @@ test("PostgreSQL analysis accepts explicit null ordering without changing its fi
   assert.match(quoted.normalized, /'NULLS FIRST'/);
   assert.match(multiple.normalized, /NULLS FIRST, id NULLS LAST/);
   assert.notEqual(first.normalized, last.normalized);
-  assert.throws(
-    () => analyzeSql("SELECT 1 NULLS FIRST", "postgres"),
-    (error: unknown) => error instanceof StateQLError && error.details.code === "INVALID_SQL",
-  );
+  // Unparsed reads go to the database, which rejects the bad syntax.
+  const invalid = analyzeSql("SELECT 1 NULLS FIRST", "postgres");
+  assert.equal(invalid.read, true);
+  assert.equal(invalid.normalized, "SELECT 1 NULLS FIRST");
+  assert.match(invalid.parserError ?? "", /^Syntax error/);
 });
 
 test("PostgreSQL detection and SQL parsing stay explicit", () => {
@@ -130,6 +131,9 @@ test("PostgreSQL command analysis is narrow and fail-closed", () => {
     "SHOW transaction_read_only",
     "SHOW transaction_isolation",
     "SHOW default_transaction_isolation",
+    "SHOW search_path",
+    "SHOW TimeZone",
+    "SHOW work_mem",
   ]) {
     const analysis = analyzeSql(sql, "postgres");
     assert.equal(analysis.statementType, "show");
@@ -242,7 +246,7 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   const prototype = Client.prototype as unknown as {
     connect(): Promise<void>;
     end(): Promise<void>;
-    query(sql: string, params?: unknown[]): Promise<unknown>;
+    query(sql: string | { text: string }, params?: unknown[]): Promise<unknown>;
   };
   t.mock.method(prototype, "connect", async () => {
     if (hangConnect) await new Promise<void>(() => undefined);
@@ -250,7 +254,8 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   t.mock.method(prototype, "end", async () => {
     closeCount += 1;
   });
-  t.mock.method(prototype, "query", async (sql: string) => {
+  t.mock.method(prototype, "query", async (input: string | { text: string }) => {
+    const sql = typeof input === "string" ? input : input.text;
     calls.push(sql);
     if (hangMaintenance && /^(?:VACUUM|ANALYZE)\b/i.test(sql)) {
       return new Promise(() => undefined);
@@ -329,7 +334,7 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   assert.equal(values.rows, 2);
   assert.deepEqual(
     calls.slice(valuesStart).filter((sql) => /^SELECT \* FROM \(VALUES\b/i.test(sql)),
-    ["SELECT * FROM (VALUES (1), (2)) AS _stateql_bounded LIMIT 10001"],
+    ["SELECT * FROM (VALUES (1), (2)\n) AS _stateql_bounded LIMIT 10001"],
   );
   const valuesRequireStart = calls.length;
   assertFailure(
@@ -568,7 +573,93 @@ test("PostgreSQL diagnostics and maintenance use guarded runtime routes", async 
   stateql.close();
 });
 
+test("PostgreSQL reads the parser cannot read fall back to the database", () => {
+  for (const sql of [
+    "SELECT id FROM t WHERE payload @> $1::jsonb",
+    "WITH v(a, b) AS (VALUES (1, 2), (3, 4)) SELECT a FROM v",
+    "WITH x AS MATERIALIZED (SELECT 1 AS a) SELECT a FROM x",
+    "SELECT ARRAY[$1::text, $2::text] AS variants",
+    "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM t WHERE payload @> $1::jsonb",
+  ]) {
+    const analysis = analyzeSql(sql, "postgres");
+    assert.equal(analysis.read, true, sql);
+    assert.match(analysis.parserError ?? "", /^Syntax error/, sql);
+  }
+  assert.equal(analyzeSql("SELECT id FROM t ORDER BY payload @> $1::jsonb", "postgres").ordered, true);
+
+  for (const sql of [
+    "WITH x AS MATERIALIZED (SELECT 1) SELECT 1; DELETE FROM t",
+    "WITH x AS MATERIALIZED (SELECT 1) SELECT 1; COMMIT; DELETE FROM t",
+    "WITH x AS MATERIALIZED (DELETE FROM t RETURNING *) SELECT * FROM x",
+    "UPDATE t SET a = 1 WHERE payload @> $1::jsonb",
+    "EXPLAIN SELECT 1; VACUUM",
+  ]) {
+    assert.throws(
+      () => analyzeSql(sql, "postgres"),
+      (error: unknown) => error instanceof StateQLError && error.details.code === "INVALID_SQL",
+      sql,
+    );
+  }
+});
+
 const postgresUrl = process.env.STQL_POSTGRES_URL;
+
+test(
+  "PostgreSQL runs unparsed reads in a read-only transaction",
+  { skip: postgresUrl ? false : "Set STQL_POSTGRES_URL to run PostgreSQL integration tests." },
+  async () => {
+    const home = createTemporaryDirectory("stateql-postgres-fallback-test-");
+    const stateql = new StateQL({ home });
+    const table = `"stateql_fallback_${process.pid}_${Date.now()}"`;
+    await succeed(stateql.connect(undefined, { secretEnv: "STQL_POSTGRES_URL", readOnly: false }));
+    try {
+      await succeed(stateql.exec(`CREATE TABLE ${table} (id INT PRIMARY KEY, payload JSONB NOT NULL)`));
+      await succeed(stateql.exec(`INSERT INTO ${table} VALUES (1, '{"a":1}'), (2, '{"a":2}')`));
+
+      const read = await succeed(stateql.query(
+        `WITH x AS MATERIALIZED (SELECT id FROM ${table} WHERE payload @> $1::jsonb) SELECT id FROM x ORDER BY id -- note`,
+        { params: ['{"a":2}'], cache: "bypass" },
+      ));
+      assert.equal(read.rows, 1);
+      assert.deepEqual(read.preview, [{ id: 2 }]);
+
+      // The writable-CTE check misses the comment, so the database must stop these writes.
+      const hiddenWrite = `WITH gone AS (/* hidden */ DELETE FROM ${table} RETURNING id) SELECT id FROM gone WHERE id = ANY(ARRAY[$1::int])`;
+      for (const sql of [hiddenWrite, `EXPLAIN ANALYZE ${hiddenWrite}`]) {
+        const hidden = await stateql.query(sql, { params: [1], cache: "bypass" });
+        assert.equal(hidden.ok, false, sql);
+        if (!hidden.ok) assert.equal(hidden.error.code, "QUERY_FAILED", sql);
+      }
+      const count = await succeed(stateql.query(`SELECT count(*) AS n FROM ${table}`, { cache: "bypass" }));
+      assert.deepEqual(count.preview, [{ n: "2" }]);
+
+      const broken = await stateql.query("SELECT ARRAY[$1::text FROM", { params: ["a"] });
+      assertFailure(broken, "INVALID_SQL");
+    } finally {
+      await stateql.exec(`DROP TABLE IF EXISTS ${table}`, { allowDestructive: true });
+      stateql.close();
+    }
+  },
+);
+
+test(
+  "PostgreSQL URL options set search_path, and SHOW reads it",
+  { skip: postgresUrl ? false : "Set STQL_POSTGRES_URL to run PostgreSQL integration tests." },
+  async () => {
+    const stateql = new StateQL({ home: createTemporaryDirectory("stateql-postgres-search-path-test-") });
+    const url = new URL(postgresUrl!);
+    url.searchParams.set("options", "-c search_path=stateql_custom,public");
+    process.env.STQL_POSTGRES_SEARCH_PATH_URL = url.href;
+    try {
+      await succeed(stateql.connect(undefined, { secretEnv: "STQL_POSTGRES_SEARCH_PATH_URL" }));
+      const shown = await succeed(stateql.query("SHOW search_path", { cache: "bypass" }));
+      assert.deepEqual(shown.preview, [{ search_path: "stateql_custom,public" }]);
+    } finally {
+      delete process.env.STQL_POSTGRES_SEARCH_PATH_URL;
+      stateql.close();
+    }
+  },
+);
 
 test(
   "PostgreSQL adapter reads, writes, inspects, transacts, and cancels",

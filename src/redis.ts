@@ -31,10 +31,15 @@ const MAX_COLLECTION_VALUES = 200;
 const READ_COMMANDS = new Set([
   "GET", "MGET", "TYPE", "EXISTS", "TTL", "PTTL", "HGET", "HMGET",
   "LRANGE", "SCAN", "HSCAN", "SSCAN", "ZSCAN",
+  "HGETALL", "HLEN", "SMEMBERS", "SCARD", "SISMEMBER", "ZRANGE", "ZCARD", "ZSCORE",
+  "LLEN", "STRLEN", "DBSIZE", "INFO",
 ]);
 const WRITE_COMMANDS = new Set([
-  "SET", "DEL", "HSET", "HDEL", "LPUSH", "RPUSH", "SADD", "SREM", "ZADD", "ZREM",
+  "SET", "DEL", "UNLINK", "HSET", "HDEL", "LPUSH", "RPUSH", "SADD", "SREM", "ZADD", "ZREM",
+  "EXPIRE", "PEXPIRE", "PERSIST", "INCR", "INCRBY", "DECR", "DECRBY", "HINCRBY",
 ]);
+const COUNTERS = new Set(["INCR", "INCRBY", "DECR", "DECRBY", "HINCRBY"]);
+const SIZE_COMMANDS: Record<string, string> = { HGETALL: "HLEN", SMEMBERS: "SCARD" };
 
 export interface RedisReadResult {
   rows: Row[];
@@ -61,13 +66,26 @@ export function validateRedisReadCommand(value: unknown): RedisCommand {
   }
   const args = command.args ?? [];
   switch (command.command) {
-    case "GET": case "TYPE": case "TTL": case "PTTL": requireCount(args, 1); break;
+    case "GET": case "TYPE": case "TTL": case "PTTL":
+    case "HGETALL": case "HLEN": case "SMEMBERS": case "SCARD": case "ZCARD": case "LLEN": case "STRLEN":
+      requireCount(args, 1);
+      break;
     case "MGET": case "EXISTS": requireRange(args, 1, MAX_ARGUMENTS); break;
-    case "HGET": requireCount(args, 2); break;
+    case "HGET": case "SISMEMBER": case "ZSCORE": requireCount(args, 2); break;
     case "HMGET": requireRange(args, 2, MAX_ARGUMENTS + 1); break;
     case "LRANGE":
       requireCount(args, 3);
       boundedRange(args[1]!, args[2]!);
+      break;
+    case "ZRANGE":
+      requireRange(args, 3, 4);
+      boundedRange(args[1]!, args[2]!);
+      if (args.length === 4 && args[3]!.toUpperCase() !== "WITHSCORES") throw new Error("Redis ZRANGE only supports index ranges with optional WITHSCORES.");
+      break;
+    case "DBSIZE": requireCount(args, 0); break;
+    case "INFO":
+      requireRange(args, 0, 1);
+      if (args[0] !== undefined && !/^[A-Za-z]+$/.test(args[0])) throw new Error("Redis INFO section is invalid.");
       break;
     case "SCAN": validateScanArgs(args, false); break;
     case "HSCAN": case "SSCAN": case "ZSCAN": validateScanArgs(args, true); break;
@@ -82,10 +100,26 @@ export function validateRedisWriteCommand(value: unknown): RedisCommand {
   }
   const args = command.args ?? [];
   switch (command.command) {
-    case "SET": requireCount(args, 2); break;
-    case "DEL": requireCount(args, 1); break;
-    case "HSET": requireCount(args, 3); break;
+    case "SET": validateSetArgs(args); break;
+    case "DEL": case "UNLINK": requireRange(args, 1, MAX_ARGUMENTS); break;
+    case "HSET":
+      requireRange(args, 3, MAX_ARGUMENTS + 1);
+      if (args.length % 2 === 0) throw new Error("Redis HSET requires field and value pairs.");
+      break;
     case "HDEL": requireCount(args, 2); break;
+    case "EXPIRE": case "PEXPIRE":
+      requireCount(args, 2);
+      positiveInteger(args[1]!, command.command);
+      break;
+    case "PERSIST": case "INCR": case "DECR": requireCount(args, 1); break;
+    case "INCRBY": case "DECRBY":
+      requireCount(args, 2);
+      integer(args[1]!, command.command);
+      break;
+    case "HINCRBY":
+      requireCount(args, 3);
+      integer(args[2]!, command.command);
+      break;
     case "LPUSH": case "RPUSH": case "SADD": case "SREM": case "ZREM": requireCount(args, 2); break;
     case "ZADD":
       requireCount(args, 3);
@@ -135,6 +169,13 @@ export class RedisAdapter implements BaseAdapter {
   async read(input: RedisCommand): Promise<RedisReadResult> {
     const command = validateRedisReadCommand(input);
     await this.connect();
+    const sizeCommand = SIZE_COMMANDS[command.command];
+    if (sizeCommand) {
+      const size = Number(await this.execute([sizeCommand, command.args![0]!], false));
+      if (size > MAX_COLLECTION_VALUES) {
+        throw new Error(`Redis ${command.command} would return ${size} values; the limit is ${MAX_COLLECTION_VALUES}. Use ${command.command === "HGETALL" ? "HSCAN" : "SSCAN"}.`);
+      }
+    }
     const raw = await this.execute([command.command, ...(command.args ?? [])], false);
     const bytes = Buffer.byteLength(JSON.stringify(toJsonSafe(raw)), "utf8");
     if (bytes > MAX_RESPONSE_BYTES) throw new Error("Redis response exceeds the 1 MiB materialization limit.");
@@ -145,7 +186,7 @@ export class RedisAdapter implements BaseAdapter {
     const command = validateRedisWriteCommand(input);
     await this.connect();
     const key = command.args![0]!;
-    const [fingerprint, expiresAt] = await Promise.all([this.keyFingerprint(key), this.expirationIdentity(key)]);
+    const [fingerprint, expiresAt] = await Promise.all([this.keysFingerprint(writtenKeys(command)), this.expirationIdentity(key)]);
     return { key, fingerprint, expiresAt };
   }
 
@@ -161,8 +202,9 @@ export class RedisAdapter implements BaseAdapter {
     try {
       let raw: unknown;
       if (precondition) {
-        await this.execute(["WATCH", key], false);
-        const [fingerprint, expiresAt] = await Promise.all([this.keyFingerprint(key), this.expirationIdentity(key)]);
+        const keys = writtenKeys(command);
+        await this.execute(["WATCH", ...keys], false);
+        const [fingerprint, expiresAt] = await Promise.all([this.keysFingerprint(keys), this.expirationIdentity(key)]);
         const expiryChanged = precondition.expiresAt < 0
           ? expiresAt !== precondition.expiresAt
           : expiresAt < 0 || Math.abs(expiresAt - precondition.expiresAt) > 2_000;
@@ -260,6 +302,13 @@ export class RedisAdapter implements BaseAdapter {
   }
 
 
+  private async keysFingerprint(keys: string[]): Promise<string> {
+    if (keys.length === 1) return this.keyFingerprint(keys[0]!);
+    const fingerprints: string[] = [];
+    for (const key of keys) fingerprints.push(await this.keyFingerprint(key));
+    return hash(fingerprints);
+  }
+
   private async keyFingerprint(key: string): Promise<string> {
     const usage = await this.execute(["MEMORY", "USAGE", key], false);
     if (typeof usage === "number" && usage > MAX_RESPONSE_BYTES) {
@@ -320,6 +369,37 @@ function validateScanArgs(args: string[], keyed: boolean): void {
   }
 }
 
+function validateSetArgs(args: string[]): void {
+  requireRange(args, 2, 5);
+  let expiry = false;
+  let condition = false;
+  for (let index = 2; index < args.length; index += 1) {
+    const option = args[index]!.toUpperCase();
+    if ((option === "NX" || option === "XX") && !condition) {
+      condition = true;
+    } else if ((option === "EX" || option === "PX") && !expiry && index + 1 < args.length) {
+      expiry = true;
+      positiveInteger(args[++index]!, `SET ${option}`);
+    } else {
+      throw new Error("Redis SET only supports one of EX or PX and one of NX or XX.");
+    }
+  }
+}
+
+function integer(value: string, name: string): number {
+  const number = Number(value);
+  if (!/^-?\d+$/.test(value) || !Number.isSafeInteger(number)) throw new Error(`Redis ${name} requires an integer.`);
+  return number;
+}
+
+function positiveInteger(value: string, name: string): void {
+  if (integer(value, name) < 1) throw new Error(`Redis ${name} requires a positive integer.`);
+}
+
+function writtenKeys(command: RedisCommand): string[] {
+  return command.command === "DEL" || command.command === "UNLINK" ? command.args! : [command.args![0]!];
+}
+
 function requireCount(args: string[], count: number): void { if (args.length !== count) throw new Error(`Redis command requires ${count} argument(s).`); }
 function requireRange(args: string[], minimum: number, maximum: number): void { if (args.length < minimum || args.length > maximum) throw new Error(`Redis command requires ${minimum}-${maximum} arguments.`); }
 function boundedRange(startText: string, stopText: string): void {
@@ -340,6 +420,16 @@ function redisRows(command: RedisCommand, raw: unknown): RedisReadResult {
     const cursor = String(raw[0]);
     return { rows: toJsonSafe(rows), columns: inferColumns(rows), nextCursor: cursor === "0" ? null : cursor };
   }
+  if (command.command === "HGETALL" || (command.command === "ZRANGE" && command.args!.length === 4)) {
+    if (!Array.isArray(raw)) throw new Error(`Unexpected Redis ${command.command} response.`);
+    const [first, second] = command.command === "HGETALL" ? ["field", "value"] : ["value", "score"];
+    const rows = Array.from({ length: Math.ceil(raw.length / 2) }, (_, index) => ({ [first]: raw[index * 2], [second]: raw[index * 2 + 1] }));
+    return { rows: toJsonSafe(rows), columns: inferColumns(rows) };
+  }
+  if (command.command === "INFO" && typeof raw === "string") {
+    const rows = infoRows(raw);
+    return { rows, columns: inferColumns(rows) };
+  }
   if (Array.isArray(raw)) {
     const rows = raw.map((value, index) => ({ index, value }));
     return { rows: toJsonSafe(rows), columns: inferColumns(rows) };
@@ -347,7 +437,23 @@ function redisRows(command: RedisCommand, raw: unknown): RedisReadResult {
   const rows = [{ value: raw }];
   return { rows: toJsonSafe(rows), columns: inferColumns(rows) };
 }
+function infoRows(text: string): Row[] {
+  const rows: Row[] = [];
+  let section = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith("# ")) section = line.slice(2).trim().toLowerCase();
+    const separator = line.indexOf(":");
+    if (line.startsWith("#") || separator < 1) continue;
+    rows.push({ section, field: line.slice(0, separator), value: line.slice(separator + 1) });
+  }
+  return rows;
+}
 function inferColumns(rows: Row[]): Column[] { const first = rows[0] ?? {}; return Object.keys(first).map((name) => ({ name, type: typeof first[name] })); }
 function normalizeScalar(value: unknown): string | number | null { if (value === null || typeof value === "string" || typeof value === "number") return value; return JSON.stringify(toJsonSafe(value)); }
-function redisAffectedRows(command: string, result: string | number | null): number { if (typeof result === "number") return result; return command === "SET" && result === "OK" ? 1 : 0; }
+function redisAffectedRows(command: string, result: string | number | null): number {
+  // Counters return the new value, not a count.
+  if (COUNTERS.has(command)) return 1;
+  if (typeof result === "number") return result;
+  return command === "SET" && result === "OK" ? 1 : 0;
+}
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }

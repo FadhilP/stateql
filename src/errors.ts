@@ -87,6 +87,15 @@ const TRANSIENT_ERROR_NAMES = new Set([
   "ConnectionTimeoutError",
 ]);
 const TRANSIENT_SQLITE_MESSAGE = /database (table )?is locked|SQLITE_BUSY/i;
+const SQL_SYNTAX_MESSAGE = /syntax error|incomplete input|unrecognized token/i;
+
+/** True when the database rejected the SQL text itself, not its tables or data. */
+export function isSqlSyntaxError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const details = error as { code?: unknown; errno?: unknown };
+  if (details.code === "42601" || details.errno === 1064) return true;
+  return SQL_SYNTAX_MESSAGE.test(error.message);
+}
 
 // Permanent failures such as a missing table must not invite retries; unknown errors are not retryable.
 export function isTransientDatabaseError(error: unknown): boolean {

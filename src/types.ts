@@ -184,18 +184,35 @@ export interface MongoMutationOptions {
 }
 
 
+export type MongoExplainVerbosity = "queryPlanner" | "executionStats" | "allPlansExecution";
+
 export type MongoReadCommand =
   | {
       operation: "find";
       collection: string;
       filter?: MongoDocument;
       options?: MongoFindOptions;
+      explain?: MongoExplainVerbosity;
     }
   | {
       operation: "aggregate";
       collection: string;
       pipeline: MongoDocument[];
       options?: MongoAggregateOptions;
+      explain?: MongoExplainVerbosity;
+    }
+  | {
+      operation: "countDocuments";
+      collection: string;
+      filter?: MongoDocument;
+      options?: Pick<MongoFindOptions, "skip" | "limit" | "hint" | "collation">;
+    }
+  | {
+      operation: "distinct";
+      collection: string;
+      field: string;
+      filter?: MongoDocument;
+      options?: Pick<MongoFindOptions, "collation">;
     };
 
 export type MongoWriteCommand =
@@ -230,7 +247,27 @@ export type MongoWriteCommand =
       collection: string;
       filter: MongoDocument;
       options?: Omit<MongoMutationOptions, "upsert">;
+    }
+  | {
+      operation: "createIndex";
+      collection: string;
+      keys: Record<string, 1 | -1 | "text" | "2dsphere" | "2d" | "hashed">;
+      options?: MongoIndexOptions;
+    }
+  | {
+      operation: "dropIndex";
+      collection: string;
+      index: string;
     };
+
+export interface MongoIndexOptions {
+  name?: string;
+  unique?: boolean;
+  sparse?: boolean;
+  expireAfterSeconds?: number;
+  partialFilterExpression?: MongoDocument;
+  collation?: MongoDocument;
+}
 
 export interface MongoWriteOutcome {
   acknowledged: boolean;
@@ -242,6 +279,7 @@ export interface MongoWriteOutcome {
   upserted_count?: number;
   upserted_id?: unknown;
   deleted_count?: number;
+  index_name?: string;
 }
 
 export interface RedisCommand {
