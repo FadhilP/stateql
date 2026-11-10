@@ -1,7 +1,7 @@
 {
   "name": "@fadhilp/stateql",
   "version": "0.0.0",
-  "description": "Stateful, agent-oriented database CLI for safe result reuse",
+  "description": "Database CLI for AI agents: run a query once, then page, filter, and export the stored result. SQLite, PostgreSQL, MySQL, MongoDB, Redis.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/FadhilP/stateql.git"
