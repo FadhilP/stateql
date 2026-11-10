@@ -1,0 +1,33 @@
+{
+  "name": "@fadhilp/stateql",
+  "version": "0.0.0",
+  "description": "Stateful, agent-oriented database CLI for safe result reuse",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FadhilP/stateql.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "database",
+    "mysql",
+    "sqlite",
+    "postgresql",
+    "cli",
+    "agents",
+    "redis",
+    "sql"
+  ],
+  "bin": {
+    "stql": "bin/stql.js"
+  },
+  "files": [
+    "bin",
+    "skills"
+  ],
+  "scripts": {
+    "postinstall": "node bin/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

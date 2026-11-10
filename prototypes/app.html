@@ -1,0 +1,1395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>StateQL</title>
+<style>
+:root {
+  --paper: #FCFCFD;
+  --pane: #EEF1F4;
+  --ink: #18202B;
+  --muted: #626C79;
+  --line: #D8DDE4;
+  --hair: #E9ECF0;
+  --hover: #F4F6F9;
+  --accent: #2F3FC4;
+  --tint: #E6E9FB;
+  --mark: #FFE45C;
+  --mark-ink: #3B3200;
+  --danger: #B3261E;
+  --string: #0A6B55;
+  --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --side: 272px;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: grid;
+  grid-template: 44px minmax(0, 1fr) / var(--side) minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--pane);
+  color: var(--ink);
+  font: 13px/1.4 var(--ui);
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+svg { flex: none; }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+.error { color: var(--danger); }
+
+/* Title bar */
+#bar { grid-column: 1 / -1; display: flex; align-items: center; min-width: 0; }
+.conn { position: relative; width: var(--side); flex: none; padding: 0 8px; }
+#conn-btn {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; height: 30px; padding: 0 8px;
+  border: 0; border-radius: 5px; background: none;
+  font-weight: 600; text-align: left;
+}
+#conn-btn:hover, #conn-btn[aria-expanded="true"] { background: #E1E5EA; }
+#conn-btn span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu {
+  position: absolute; z-index: 20; top: 36px; left: 8px; right: 8px; padding: 4px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--paper);
+  box-shadow: 0 12px 32px rgba(24, 32, 43, .16);
+}
+.menu button {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; height: 30px; padding: 0 8px;
+  border: 0; border-radius: 5px; background: none; text-align: left; white-space: nowrap;
+}
+.menu button:hover, .menu button[aria-selected="true"] { background: var(--pane); }
+.menu hr { margin: 4px 0; border: 0; border-top: 1px solid var(--hair); }
+.menu p { margin: 6px 8px; color: var(--muted); }
+#menu, #complete { position: fixed; right: auto; min-width: 180px; }
+#complete { min-width: 160px; font-family: var(--mono); }
+.field {
+  display: flex; align-items: center; gap: 8px;
+  height: 30px; padding: 0 8px;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--paper); color: var(--muted);
+}
+.field:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.field input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; color: var(--ink); }
+.palette { position: relative; width: min(360px, 44vw); }
+.palette .menu { left: 0; right: 0; }
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: none;
+  border: 0; border-radius: 5px; background: none; color: var(--muted);
+}
+.icon-btn:hover { background: #E1E5EA; color: var(--ink); }
+.icon-btn[aria-pressed="true"] { background: var(--tint); color: var(--accent); }
+#side-toggle { display: none; margin-left: 8px; }
+#split { margin-right: 8px; }
+.caption { display: flex; align-self: stretch; }
+.caption i { display: grid; place-items: center; width: 46px; }
+
+/* Ledger */
+#side { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 2px 8px 8px; }
+#ledger { flex: 1; overflow: auto; min-height: 0; }
+.session {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; height: 26px; margin-top: 6px; padding: 0 8px;
+  border: 0; border-radius: 5px; background: none; color: var(--muted); font-size: 12px; text-align: left;
+}
+.session:first-child { margin-top: 0; }
+.session:hover { color: var(--ink); }
+.session[aria-expanded="false"] svg { transform: rotate(-90deg); }
+.item {
+  display: block; width: 100%; height: 28px; padding: 0 8px;
+  border: 0; border-radius: 5px; background: none; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.item:hover { background: #E1E5EA; }
+.item.beside { background: rgba(252, 252, 253, .6); }
+.item[aria-current="true"] { background: var(--paper); font-weight: 600; }
+.item.struck { color: var(--muted); text-decoration: line-through; }
+.item.running { color: var(--muted); font-style: italic; }
+.item.fresh { animation: fresh 1.8s ease-out; }
+@keyframes fresh { from { background: var(--mark); } }
+.none { margin: 10px 8px; color: var(--muted); }
+
+/* Panes */
+#main { display: flex; min-width: 0; min-height: 0; background: var(--paper); border-top-left-radius: 8px; overflow: hidden; }
+.pane { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.pane + .pane { border-left: 1px solid var(--line); }
+.pane.focused { box-shadow: inset 0 2px 0 var(--accent); }
+.btn {
+  height: 30px; padding: 0 12px; flex: none;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--paper);
+}
+.btn:hover { border-color: #B9C0CA; }
+.btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.btn:disabled { opacity: .6; cursor: default; }
+.link { padding: 0; border: 0; background: none; color: var(--accent); }
+.link:hover { text-decoration: underline; }
+.seg { display: inline-flex; flex: none; }
+.seg button { height: 30px; padding: 0 12px; margin-left: -1px; border: 1px solid var(--line); background: var(--paper); }
+.seg button:first-child { margin-left: 0; border-radius: 5px 0 0 5px; }
+.seg button:last-child { border-radius: 0 5px 5px 0; }
+.seg button[aria-pressed="true"] { position: relative; border-color: var(--ink); background: var(--ink); color: #fff; }
+
+/* Editor */
+.editor { flex: none; border-bottom: 1px solid var(--line); }
+.code { position: relative; }
+.hl, .sql {
+  margin: 0; padding: 14px 14px 10px;
+  font: 13px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; tab-size: 2;
+}
+.hl { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.sql {
+  position: relative; display: block; width: 100%; resize: none;
+  border: 0; outline: 0; background: none; color: transparent; caret-color: var(--ink);
+}
+.sql::placeholder { color: var(--muted); }
+.sql:focus-visible { box-shadow: inset 2px 0 0 var(--accent); }
+.k { color: var(--accent); }
+.s { color: var(--string); }
+.c { color: var(--muted); }
+.run-bar { display: flex; align-items: center; gap: 8px; padding: 0 14px 10px; }
+.run-bar .field { width: min(260px, 40%); }
+
+/* Grid */
+.work { display: flex; flex: 1; min-height: 0; }
+.grid-wrap { flex: 1; min-width: 0; overflow: auto; outline: 0; }
+.grid { table-layout: fixed; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
+.grid th {
+  position: sticky; top: 0; z-index: 2; height: 34px; padding: 0;
+  border-bottom: 1px solid var(--line); background: var(--paper);
+  font-weight: 600; text-align: left;
+}
+.th { position: relative; display: flex; align-items: center; height: 100%; }
+.th-name {
+  display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; height: 100%; padding: 0 2px 0 14px;
+  border: 0; background: none; font-weight: 600; text-align: left; white-space: nowrap; overflow: hidden;
+}
+th.num .th-name { justify-content: flex-end; }
+.th-menu { width: 22px; height: 22px; margin-right: 4px; opacity: 0; }
+th:hover .th-menu, .th-menu:focus-visible { opacity: 1; }
+.resize { position: absolute; top: 0; right: -4px; z-index: 1; width: 8px; height: 100%; cursor: col-resize; }
+.resize:hover { background: linear-gradient(var(--accent), var(--accent)) center / 2px 100% no-repeat; }
+.grid td {
+  height: 30px; padding: 0 14px;
+  border-bottom: 1px solid var(--hair); background: var(--paper);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; user-select: none;
+}
+.grid .num { text-align: right; }
+.grid .pin { position: sticky; left: 0; z-index: 1; box-shadow: inset -1px 0 0 var(--hair); }
+.grid th.pin { z-index: 3; }
+.grid tbody tr:hover td { background: var(--hover); }
+.grid td.null { color: var(--muted); }
+.grid tbody tr td.in { background: var(--tint); }
+.grid tbody tr td.marked { background: var(--mark); color: var(--mark-ink); }
+.grid tbody tr td.focus { box-shadow: inset 0 0 0 2px var(--accent); }
+.grid tbody tr.gap td { height: auto; padding: 0; border: 0; background: none; }
+.grid td.skel::before { content: ""; display: block; width: 62%; height: 8px; border-radius: 4px; background: var(--hair); }
+.grid td.num.skel::before { margin-left: auto; }
+.grid td.editing { padding: 0; }
+.grid td.editing input {
+  width: 100%; height: 29px; padding: 0 14px;
+  border: 0; outline: 0; background: #fff; box-shadow: inset 0 0 0 2px var(--accent); text-align: inherit;
+}
+.plain { table-layout: auto; width: auto; }
+.plain th { position: static; padding: 0 14px; white-space: nowrap; }
+.plain td { max-width: 440px; user-select: text; }
+.plain th:first-child, .plain td:first-child { padding-left: 0; }
+.receipt .plain tbody tr td:last-child { background: var(--mark); color: var(--mark-ink); }
+
+.inspector { width: 340px; flex: none; overflow: auto; padding: 12px 14px; border-left: 1px solid var(--line); }
+.inspector label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+.inspector textarea {
+  display: block; width: 100%; margin-top: 3px; padding: 5px 8px; resize: none;
+  border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--ink);
+  font: 13px/1.45 var(--ui);
+}
+.inspector textarea.json { font-family: var(--mono); font-size: 12.5px; }
+.inspector textarea[readonly] { background: var(--hover); }
+
+.note { flex: 1; overflow: auto; padding: 18px 14px; }
+.note > * { max-width: 76ch; margin: 0 0 14px; }
+.note > table { max-width: none; }
+.note pre { font: 13px/1.55 var(--mono); white-space: pre-wrap; }
+.note h2 { margin: 22px 0 4px; font-size: 13px; font-weight: 600; }
+.note h2:first-child { margin-top: 0; }
+.status {
+  display: flex; align-items: center; gap: 16px;
+  height: 30px; padding: 0 14px; flex: none;
+  border-top: 1px solid var(--hair); color: var(--muted); white-space: nowrap;
+}
+
+/* Dialogs */
+dialog {
+  width: min(540px, 92vw); max-height: 88vh; padding: 0; border: 0; border-radius: 10px;
+  background: var(--paper); color: var(--ink);
+  box-shadow: 0 24px 60px rgba(24, 32, 43, .28);
+}
+dialog::backdrop { background: rgba(24, 32, 43, .36); }
+dialog form { padding: 20px; }
+dialog h1 { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
+dialog .error { margin: 0 0 14px; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.fields > label { display: grid; gap: 4px; }
+.fields .wide { grid-column: 1 / -1; }
+.fields input:not([type="checkbox"], [type="radio"]), .fields select {
+  height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 5px; background: #fff;
+}
+.fields fieldset { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0; padding: 0; border: 0; }
+.fields legend { margin-bottom: 4px; padding: 0; }
+.fields fieldset label, .fields .check { display: flex; align-items: center; gap: 6px; }
+.fields input[type="checkbox"], .fields input[type="radio"] { accent-color: var(--accent); margin: 0; }
+.fields .columns { display: grid; grid-template-columns: repeat(3, 1fr); max-height: 150px; overflow: auto; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+#toast {
+  position: fixed; z-index: 30; left: 50%; bottom: 44px; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 14px; border-radius: 6px; background: var(--ink); color: #fff;
+  opacity: 0; pointer-events: none; transition: opacity .15s;
+}
+#toast.show { opacity: 1; pointer-events: auto; }
+#toast button { padding: 0; border: 0; background: none; color: var(--mark); font-weight: 600; }
+
+@media (prefers-reduced-motion: reduce) {
+  #toast { transition: none; }
+  .item.fresh { animation: none; }
+}
+@media (max-width: 760px) {
+  body { grid-template-columns: minmax(0, 1fr); }
+  .conn { width: auto; max-width: 42vw; }
+  .palette { flex: 1; margin-right: 8px; }
+  .caption, #bar .spacer, #split { display: none; }
+  #side-toggle { display: inline-flex; }
+  #side {
+    position: fixed; z-index: 15; top: 44px; bottom: 0; left: 0; width: var(--side);
+    background: var(--pane); box-shadow: 12px 0 32px rgba(24, 32, 43, .16);
+    transform: translateX(-110%);
+  }
+  body.side-open #side { transform: none; }
+  #main { border-radius: 0; }
+  .pane + .pane { display: none; }
+  .inspector { position: absolute; z-index: 5; right: 0; width: min(340px, 88vw); height: 100%; background: var(--paper); }
+  .work { position: relative; }
+  .run-bar { flex-wrap: wrap; }
+  .fields { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<header id="bar">
+  <button id="side-toggle" class="icon-btn" aria-label="Show results" data-act="side">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1 3.5h12M1 7h12M1 10.5h12"/></svg>
+  </button>
+  <div class="conn">
+    <button id="conn-btn" aria-haspopup="menu" aria-expanded="false" data-act="conn-menu"></button>
+    <div id="conn-menu" class="menu" role="menu" hidden></div>
+  </div>
+  <div class="palette">
+    <label class="field">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5.5" cy="5.5" r="4"/><path d="M8.5 8.5l3.5 3.5"/></svg>
+      <input id="open" placeholder="Open a table" aria-label="Open a table" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="open-list">
+    </label>
+    <div id="open-list" class="menu" role="listbox" hidden></div>
+  </div>
+  <span class="spacer"></span>
+  <button id="split" class="icon-btn" aria-label="Show two results side by side" title="Show two results side by side" aria-pressed="false" data-act="split">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="2" width="12" height="10" rx="1.5"/><path d="M7 2v10"/></svg>
+  </button>
+  <div class="caption" aria-hidden="true">
+    <i><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><path d="M0 5h10"/></svg></i>
+    <i><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><rect x=".5" y=".5" width="9" height="9"/></svg></i>
+    <i><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><path d="M0 0l10 10M10 0L0 10"/></svg></i>
+  </div>
+</header>
+
+<aside id="side">
+  <button class="btn" data-act="new">New query</button>
+  <label class="field">
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5.5" cy="5.5" r="4"/><path d="M8.5 8.5l3.5 3.5"/></svg>
+    <input id="find" placeholder="Find a statement" aria-label="Find a statement" autocomplete="off">
+  </label>
+  <nav id="ledger" aria-label="Results"></nav>
+</aside>
+
+<main id="main"></main>
+
+<dialog id="connect">
+  <form>
+    <h1>New connection</h1>
+    <div class="fields">
+      <label>Name <input name="name" required autocomplete="off"></label>
+      <label>Type <select name="kind"><option>PostgreSQL</option><option>MySQL</option><option>SQLite</option><option>MongoDB</option><option>Redis</option></select></label>
+      <fieldset class="wide">
+        <legend>Connect with</legend>
+        <label><input type="radio" name="source" value="details" checked> Connection details</label>
+        <label><input type="radio" name="source" value="env"> A URL in an environment variable</label>
+      </fieldset>
+      <label data-when="net">Host <input name="host" value="localhost" autocomplete="off"></label>
+      <label data-when="net">Port <input name="port" value="5432" inputmode="numeric" autocomplete="off"></label>
+      <label data-when="net">Database <input name="database" autocomplete="off"></label>
+      <label data-when="net">User <input name="user" autocomplete="off"></label>
+      <label data-when="net">Password <input name="password" type="password" autocomplete="off"></label>
+      <label data-when="net">Encryption <select name="tls"><option>Encrypt and verify the server</option><option>Encrypt without verifying</option><option>No encryption</option></select></label>
+      <label class="wide" data-when="file">File <input name="file" placeholder="C:\data\library.sqlite" autocomplete="off"></label>
+      <label class="wide" data-when="env">Variable <input name="variable" placeholder="DATABASE_URL" autocomplete="off"></label>
+      <label class="check wide"><input name="readonly" type="checkbox" checked> Read-only</label>
+    </div>
+    <p class="error" role="alert" hidden></p>
+    <div class="actions">
+      <button type="button" class="btn" data-act="close-dialog">Cancel</button>
+      <button class="btn primary">Connect</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="export">
+  <form>
+    <h1>Export</h1>
+    <div class="fields">
+      <fieldset class="wide">
+        <legend>Format</legend>
+        <label><input type="radio" name="format" value="csv" checked> CSV</label>
+        <label><input type="radio" name="format" value="json"> JSON</label>
+        <label><input type="radio" name="format" value="jsonl"> JSON Lines</label>
+      </fieldset>
+      <fieldset class="wide" id="export-rows"><legend>Rows</legend></fieldset>
+      <fieldset class="wide"><legend>Columns</legend><div class="columns" id="export-columns"></div></fieldset>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn" data-act="close-dialog">Cancel</button>
+      <button class="btn primary">Export</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="complete" class="menu" role="listbox" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const esc = value => String(value).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const count = value => value.toLocaleString("en-US");
+const now = () => new Date().toTimeString().slice(0, 5);
+const dateText = ms => new Date(ms).toISOString().slice(0, 10);
+const stampText = ms => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+const plain = value => typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
+const fmt = (value, column) => value === null ? "null" : column.type === "numeric" ? value.toFixed(2) : plain(value);
+const literal = value => value === null ? "null" : typeof value === "string" ? `'${value.replace(/'/g, "''")}'` : typeof value === "object" ? `'${JSON.stringify(value)}'` : String(value);
+const compare = (a, b) => a === b ? 0 : a === null ? 1 : b === null ? -1 : typeof a === "number" && typeof b === "number" ? a - b : plain(a).localeCompare(plain(b));
+const col = (name, type, more = {}) => ({ name, type, num: type === "integer" || type === "numeric", ...more });
+
+const LOCK = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" aria-label="Read-only"><rect x="2" y="5.5" width="8" height="5.5" rx="1"/><path d="M4 5.5V3.8a2 2 0 014 0v1.7"/></svg>';
+const CHEVRON = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 3.5l3 3 3-3"/></svg>';
+const ARROW = { 1: '<svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor" aria-label="Sorted ascending"><path d="M4.5 1.5l3.5 6h-7z"/></svg>', "-1": '<svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor" aria-label="Sorted descending"><path d="M4.5 7.5l3.5-6h-7z"/></svg>' };
+const ROW_ICON = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="2" width="12" height="10" rx="1.5"/><path d="M9 2v10"/></svg>';
+
+/* Sample data: a library with 24,812 loans. */
+const DAY = 864e5, HOUR = 36e5, LOANS = 24812, MEMBERS = 1840, BOOKS = 3206;
+const END = Date.UTC(2026, 10, 9, 18);
+const hash = (i, salt) => {
+  let x = Math.imul(i + 1, 2654435761) ^ Math.imul(salt + 7, 40503);
+  x ^= x >>> 15; x = Math.imul(x, 2246822519); x ^= x >>> 13; x = Math.imul(x, 3266489917); x ^= x >>> 16;
+  return x >>> 0;
+};
+const pick = (list, i, salt) => list[hash(i, salt) % list.length];
+const firstNames = ["Amara", "Bram", "Chen", "Dalia", "Emil", "Farah", "Goran", "Hana", "Ines", "Jonas", "Kavya", "Luca", "Mila", "Noor", "Otis", "Petra", "Quinn", "Ravi", "Sanne", "Tomas", "Uma", "Vera", "Wout", "Yara"];
+const lastNames = ["Okafor", "de Wit", "Jing", "Haddad", "Novak", "Aziz", "Petrov", "Sato", "Moreau", "Lind", "Rao", "Bianchi", "Visser", "Bakker", "Jansen", "Smit", "Mulder", "Bos", "Vos", "Peters", "Hendriks", "Dekker", "Brouwer", "Dijkstra"];
+const cities = ["Rotterdam", "Utrecht", "Leiden", "Delft", "Haarlem", "Gouda", "Breda", "Zwolle"];
+const staff = ["M. Visser", "S. Bakker", "T. Jansen", "R. Smit", "L. Mulder"];
+const titles = [
+  ["The Left Hand of Darkness", "Ursula K. Le Guin", 1969], ["Invisible Cities", "Italo Calvino", 1972], ["Kindred", "Octavia E. Butler", 1979],
+  ["The Name of the Rose", "Umberto Eco", 1980], ["Beloved", "Toni Morrison", 1987], ["The Remains of the Day", "Kazuo Ishiguro", 1989],
+  ["Snow Crash", "Neal Stephenson", 1992], ["The God of Small Things", "Arundhati Roy", 1997], ["Austerlitz", "W. G. Sebald", 2001],
+  ["Wolf Hall", "Hilary Mantel", 2009], ["The Dispossessed", "Ursula K. Le Guin", 1974], ["If on a Winter's Night a Traveler", "Italo Calvino", 1979],
+  ["Parable of the Sower", "Octavia E. Butler", 1993], ["Foucault's Pendulum", "Umberto Eco", 1988], ["Song of Solomon", "Toni Morrison", 1977],
+  ["Never Let Me Go", "Kazuo Ishiguro", 2005], ["The Rings of Saturn", "W. G. Sebald", 1995], ["Bring Up the Bodies", "Hilary Mantel", 2012],
+];
+const loanNotes = [
+  "Member reported a torn dust jacket on return. It was already noted at loan time, so no fee was charged.",
+  "Returned to a different branch than the loan. Transfer back was booked for the next courier run.",
+  "Member asked for a second renewal by phone. Granted once because no hold was waiting for this copy.",
+  "Water damage on the last thirty pages. Photographs are attached to the damage report for this copy.",
+];
+const loanRow = i => {
+  const at = END - (LOANS - i) * HOUR + hash(i, 9) % HOUR;
+  const draw = hash(i, 4);
+  const status = i > LOANS - 700 && draw % 3 ? "on_loan" : draw % 23 === 0 ? "overdue" : draw % 211 === 0 ? "lost" : "returned";
+  const renewals = hash(i, 5) % 7 < 4 ? 0 : hash(i, 5) % 4;
+  const returnedAt = status === "returned" ? at + (3 + hash(i, 6) % 24) * DAY + hash(i, 7) % DAY : null;
+  const fee = status === "overdue" || status === "lost" ? 0.5 + hash(i, 8) % 1800 / 100 : hash(i, 8) % 9 === 0 ? 0.5 + hash(i, 8) % 300 / 100 : 0;
+  const channel = pick(["desk", "desk", "kiosk", "app"], i, 10);
+  const metadata = { source: channel, reminders: hash(i, 11) % 4, receipt: hash(i, 12) % 2 === 0 };
+  if (hash(i, 13) % 5 === 0) metadata.hold_id = 5000 + hash(i, 13) % 4000;
+  return [100001 + i, 1 + hash(i, 1) % MEMBERS, 1 + hash(i, 2) % BOOKS, 1 + hash(i, 3) % 3, status, channel, channel === "desk" ? pick(staff, i, 14) : null,
+    stampText(at), dateText(at + (21 + renewals * 14) * DAY), returnedAt && stampText(returnedAt), renewals, Math.round(fee * 100) / 100, fee > 0 && hash(i, 15) % 3 !== 0,
+    pick(["good", "good", "good", "worn", "new"], i, 16), returnedAt ? pick(["good", "good", "worn", "damaged"], i, 17) : null,
+    hash(i, 18) % 17 === 0 ? pick(loanNotes, i, 19) : null, metadata, stampText(returnedAt ?? at)];
+};
+const memberRow = i => {
+  const first = pick(firstNames, i, 20), last = pick(lastNames, i, 21);
+  return [i + 1, `${first} ${last}`, `${first}.${last.replace(/ /g, "")}${i % 97}@example.org`.toLowerCase(), pick(cities, i, 22), pick(["standard", "standard", "student", "senior"], i, 23),
+    dateText(END - (hash(i, 24) % 2600) * DAY), hash(i, 25) % 11 !== 0, hash(i, 26) % 29 === 0 ? "Prefers reminders by post, not by email." : null];
+};
+const bookRow = i => {
+  const title = titles[hash(i, 27) % titles.length];
+  return [i + 1, title[0], title[1], title[2] + hash(i, 28) % 30, `978-90-${1000 + hash(i, 29) % 9000}-${100 + hash(i, 30) % 900}-${hash(i, 31) % 10}`, i === 6 ? 4 : 1 + hash(i, 32) % 6, `${"FGHK"[hash(i, 33) % 4]}-${1 + hash(i, 34) % 40}-${1 + hash(i, 35) % 6}`];
+};
+const make = (length, row) => Array.from({ length }, (_, i) => row(i));
+const pkey = table => ({ indexes: [[`${table}_pkey`, `CREATE UNIQUE INDEX ${table}_pkey ON public.${table} USING btree (id)`]], constraints: [[`${table}_pkey`, "PRIMARY KEY"]] });
+const tables = {
+  books: { columns: [col("id", "integer", { key: "primary key" }), col("title", "text"), col("author", "text"), col("year", "integer"), col("isbn", "text"), col("copies", "integer", { default: "1" }), col("shelf", "text", { nullable: true })],
+    rows: make(BOOKS, bookRow), ...pkey("books") },
+  branches: { columns: [col("id", "integer", { key: "primary key" }), col("name", "text"), col("city", "text"), col("opened_on", "date")],
+    rows: [[1, "Harbour", "Rotterdam", "1998-04-12"], [2, "Old Town", "Utrecht", "2004-09-01"], [3, "Riverside", "Leiden", "2015-02-20"]], ...pkey("branches") },
+  loans: { columns: [col("id", "integer", { key: "primary key" }), col("member_id", "integer", { ref: "members" }), col("book_id", "integer", { ref: "books" }), col("branch_id", "integer", { ref: "branches" }),
+      col("status", "text", { default: "'on_loan'" }), col("channel", "text"), col("staff", "text", { nullable: true }), col("loaned_at", "timestamptz", { default: "now()" }), col("due_on", "date"),
+      col("returned_at", "timestamptz", { nullable: true }), col("renewals", "integer", { default: "0" }), col("fee", "numeric", { default: "0" }), col("fee_paid", "boolean", { default: "false" }),
+      col("condition_out", "text"), col("condition_in", "text", { nullable: true }), col("notes", "text", { nullable: true }), col("metadata", "jsonb", { default: "'{}'" }), col("updated_at", "timestamptz", { default: "now()" })],
+    rows: make(LOANS, loanRow),
+    indexes: [["loans_pkey", "CREATE UNIQUE INDEX loans_pkey ON public.loans USING btree (id)"], ["loans_member_id_idx", "CREATE INDEX loans_member_id_idx ON public.loans USING btree (member_id)"], ["loans_status_due_on_idx", "CREATE INDEX loans_status_due_on_idx ON public.loans USING btree (status, due_on)"]],
+    constraints: [["loans_pkey", "PRIMARY KEY"], ["loans_member_id_fkey", "FOREIGN KEY"], ["loans_book_id_fkey", "FOREIGN KEY"], ["loans_branch_id_fkey", "FOREIGN KEY"], ["loans_renewals_check", "CHECK"]] },
+  members: { columns: [col("id", "integer", { key: "primary key" }), col("name", "text"), col("email", "text"), col("city", "text"), col("plan", "text", { default: "'standard'" }), col("joined_on", "date"), col("active", "boolean", { default: "true" }), col("notes", "text", { nullable: true })],
+    rows: make(MEMBERS, memberRow),
+    indexes: [["members_pkey", "CREATE UNIQUE INDEX members_pkey ON public.members USING btree (id)"], ["members_email_key", "CREATE UNIQUE INDEX members_email_key ON public.members USING btree (email)"]],
+    constraints: [["members_email_key", "UNIQUE"], ["members_pkey", "PRIMARY KEY"]] },
+};
+for (const table of Object.values(tables)) table.version = 0;
+const views = {
+  overdue_loans: () => ({ columns: [0, 1, 2, 8, 11].map(c => tables.loans.columns[c]), rows: tables.loans.rows.filter(r => r[4] === "overdue").map(r => [r[0], r[1], r[2], r[8], r[11]]) }),
+};
+const source = name => tables[name] ?? views[name]?.();
+
+/* A small reader for the prototype: one table, where, group by, order by, limit. */
+function distance(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] !== b[j - 1]));
+  return d[a.length][b.length];
+}
+function columnIndex(name, columns) {
+  const wanted = name.toLowerCase();
+  const c = columns.findIndex(column => column.name === wanted);
+  if (c >= 0) return c;
+  const near = columns.map(column => column.name).sort((a, b) => distance(a, wanted) - distance(b, wanted))[0];
+  throw { message: `column "${name}" does not exist`, hint: distance(near, wanted) <= 2 ? `Perhaps you meant "${near}".` : "Open Structure to see the column names." };
+}
+function condition(text, columns) {
+  const m = text.match(/^(\w+)\s*(is\s+not\s+null|is\s+null|!=|<>|<=|>=|=|<|>|:|like\b)\s*(.*)$/i);
+  if (!m) return null;
+  const c = columnIndex(m[1], columns);
+  const op = m[2].toLowerCase().replace(/\s+/g, " ");
+  if (op === "is null") return row => row[c] === null;
+  if (op === "is not null") return row => row[c] !== null;
+  const raw = m[3].trim().replace(/^'([\s\S]*)'$/, "$1");
+  if (op === ":" || op === "like") {
+    const needle = raw.replace(/%/g, "").toLowerCase();
+    return row => row[c] !== null && plain(row[c]).toLowerCase().includes(needle);
+  }
+  const want = columns[c].num ? Number(raw) : columns[c].type === "boolean" ? raw.toLowerCase() === "true" : raw;
+  const test = { "=": d => d === 0, "!=": d => d !== 0, "<>": d => d !== 0, "<": d => d < 0, ">": d => d > 0, "<=": d => d <= 0, ">=": d => d >= 0 }[op];
+  return row => row[c] !== null && test(compare(row[c], want));
+}
+function predicate(text, columns, strict) {
+  const anywhere = row => row.some(value => value !== null && plain(value).toLowerCase().includes(text.toLowerCase()));
+  try {
+    const tests = text.split(/\s+and\s+/i).map(part => condition(part.trim(), columns));
+    if (tests.every(Boolean)) return row => tests.every(test => test(row));
+  } catch (error) {
+    if (strict) throw error;
+    return anywhere;
+  }
+  if (strict) throw { message: `syntax error at or near "${text}"`, hint: "A condition looks like this: column = value" };
+  return anywhere;
+}
+function evaluate(sql) {
+  const text = sql.trim().replace(/;$/, "").replace(/\s+/g, " ");
+  if (/\bjoin\b/i.test(text)) throw { message: "This prototype reads one table at a time, so it cannot run a join.", hint: "" };
+  const m = text.match(/^select (.+?) from (\w+)(?: where (.+?))?(?: group by (\w+))?(?: order by (\w+)( desc| asc)?)?(?: limit (\d+))?$/i);
+  if (!m) throw { message: `syntax error at or near "${text.split(" ").pop()}"`, hint: "The prototype reads: select … from … where … group by … order by … limit …" };
+  const [, list, rawName, where, group, order, direction, limit] = m;
+  const name = rawName.toLowerCase();
+  const from = source(name);
+  if (!from) throw { message: `relation "${rawName}" does not exist`, hint: "Use “Open a table” to see the names." };
+  let rows = where ? from.rows.filter(predicate(where, from.columns, true)) : from.rows;
+  let columns = from.columns;
+  if (group) {
+    const g = columnIndex(group, columns);
+    const counts = new Map();
+    for (const row of rows) counts.set(row[g], (counts.get(row[g]) ?? 0) + 1);
+    columns = [columns[g], col("count", "integer")];
+    rows = [...counts];
+  } else if (list.trim() !== "*") {
+    const picked = list.split(",").map(part => columnIndex(part.trim(), from.columns));
+    columns = picked.map(c => from.columns[c]);
+    rows = rows.map(row => picked.map(c => row[c]));
+  }
+  if (order) {
+    const c = columnIndex(order, columns);
+    const dir = /desc/i.test(direction ?? "") ? -1 : 1;
+    rows = [...rows].sort((a, b) => compare(a[c], b[c]) * dir);
+  }
+  if (limit) rows = rows.slice(0, +limit);
+  const whole = list.trim() === "*" && !where && !group && !order && !limit && tables[name];
+  return { columns, rows, table: whole ? name : undefined };
+}
+const isWrite = sql => /^\s*(insert|update|delete|drop|alter|truncate|create|replace)\b/i.test(sql);
+function parseValue(text, column) {
+  const trimmed = text.trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "null") return null;
+  if (column.num) {
+    if (isNaN(trimmed)) throw `${column.name} needs a number.`;
+    return Number(trimmed);
+  }
+  if (column.type === "boolean") {
+    if (!/^(true|false)$/i.test(trimmed)) throw `${column.name} needs true or false.`;
+    return trimmed.toLowerCase() === "true";
+  }
+  if (column.type === "jsonb") {
+    try { return JSON.parse(trimmed); } catch { throw `${column.name} needs valid JSON.`; }
+  }
+  return text;
+}
+function execute(sql, override, mine) {
+  if (isWrite(sql)) {
+    if (mine && conn().readOnly) return { kind: "not-run", reason: `${conn().name} is read-only. Switch to a connection that allows writes.` };
+    const everyRow = /^\s*(update|delete)\b/i.test(sql) && !/\bwhere\b/i.test(sql);
+    if (everyRow && !override) return { kind: "not-run", canOverride: mine, reason: "This statement has no WHERE, so it would change every row." };
+    if (/^\s*(drop|alter|truncate)\b/i.test(sql) && !override) return { kind: "not-run", canOverride: mine, reason: "This statement removes data or changes the table." };
+    const table = sql.match(/^\s*(?:update|delete\s+from|insert\s+into|truncate(?:\s+table)?)\s+(\w+)/i)?.[1]?.toLowerCase();
+    const one = mine && sql.match(/^\s*update\s+\w+\s+set\s+(\w+)\s*=\s*(.+?)\s+where\s+id\s*=\s*(\d+)\s*;?\s*$/i);
+    if (one && tables[table]) {
+      try {
+        const c = columnIndex(one[1], tables[table].columns);
+        const row = tables[table].rows.find(r => r[0] === +one[3]);
+        if (!row) return { kind: "write", changed: 0 };
+        const change = { table, pk: row[0], c, before: row[c], after: parseValue(one[2].replace(/^'([\s\S]*)'$/, "$1"), tables[table].columns[c]) };
+        applyChange(change);
+        return { kind: "write", changed: 1, change };
+      } catch (error) {
+        return { kind: "failed", message: error.message ?? error, hint: error.hint ?? "" };
+      }
+    }
+    return { kind: "write", changed: everyRow ? tables[table]?.rows.length ?? 0 : 1 };
+  }
+  try {
+    const data = evaluate(sql);
+    return data.table && mine ? { kind: "table", table: data.table } : { kind: "read", data };
+  } catch (error) {
+    if (error instanceof Error) throw error;
+    return { kind: "failed", message: error.message, hint: error.hint };
+  }
+}
+
+/* State */
+const view = () => ({ tab: "rows", filter: "", sort: null, hidden: new Set(), widths: null, anchor: null, focus: null, inspector: false, top: 0, left: 0, loaded: new Set([0]), loading: new Set() });
+let nextId = 1;
+const entry = fields => ({ id: nextId++, v: view(), ...fields });
+const seed = (session, sql, time) => entry({ session, sql, time, ...execute(sql, false, false) });
+const clock = minutes => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+const report = [];
+for (const city of cities) report.push(
+  `select id, name, email from members where city = '${city}'`,
+  `select plan, count(*) from members where city = '${city}' group by plan`,
+  `select id, name, joined_on from members where city = '${city}' and active = false`,
+  `select * from members where city = '${city}' and plan = 'student'`,
+  `select id, name from members where city = '${city}' and joined_on > '2026-01-01' order by joined_on desc`);
+for (const plan of ["standard", "student", "senior"]) report.push(
+  `select city, count(*) from members where plan = '${plan}' group by city`,
+  `select id, email from members where plan = '${plan}' and active = true limit 200`);
+report.push("select city, count(*) from members group by city order by count desc", "select plan, count(*) from members group by plan", "select active, count(*) from members group by active",
+  "select * from members order by joined_on desc limit 50", "select id, name, city from members where notes is not null", "select * from members");
+const audit = ["select status, count(*) from loans group by status order by count desc", "select branch_id, count(*) from loans where status = 'on_loan' group by branch_id", "select * from loans where status = 'lost'",
+  "select id, member_id, fee from loans where fee > 15 and fee_paid = false order by fee desc", "select id, titel, copies from books where copies = 1", "select id, title, copies from books where copies = 1",
+  "select channel, count(*) from loans group by channel", "select * from branches"];
+const liveScript = ["select id, member_id, fee from loans where status = 'overdue' and fee > 10", "select id, name, email from members where id = 412", "update loans set fee = 12.50 where id = 124377",
+  "select status, count(*) from loans where fee_paid = false group by status", "update loans set fee_paid = true where id = 123904", "select id, due_on, fee from loans where member_id = 412",
+  "update loans set fee = 0", "update loans set fee = 0 where id = 124120", "select id, fee, fee_paid from loans where status = 'lost' and fee_paid = false", "select fee_paid, count(*) from loans where status = 'overdue' group by fee_paid"];
+
+const state = {
+  connections: [{ name: "library-staging", readOnly: false }, { name: "library-production", readOnly: true }],
+  conn: 0,
+  entries: [],
+  panes: [1],
+  focus: 0,
+  collapsed: new Set(["member-report"]),
+  find: "",
+  pick: 0,
+  marked: new Set(),
+  drag: null,
+  menu: null,
+  complete: null,
+  exporting: null,
+};
+const conn = () => state.connections[state.conn];
+state.entries = [
+  entry({ session: "You", kind: "table", table: "loans", sql: "select * from loans", time: "14:32" }),
+  entry({ session: "You", sql: "select status, count(*) from loans group by status order by count desc", time: "14:28", ...execute("select status, count(*) from loans group by status order by count desc", false, true) }),
+  entry({ session: "You", kind: "write", sql: "update books set copies = 4 where id = 7", time: "13:41", changed: 1, change: { table: "books", pk: 7, c: 5, before: 5, after: 4 } }),
+  seed("fix-late-fees", "update loans set renewals = 2 where id = 124017", "14:20"),
+  seed("fix-late-fees", "select id, member_id, due_on, fee from loans where status = 'overdue' and fee_paid = false", "14:19"),
+  seed("fix-late-fees", "delete from loans", "14:19"),
+  seed("fix-late-fees", "select * from loans where status = 'overdue' order by due_on limit 100", "14:18"),
+  ...report.map((sql, i) => seed("member-report", sql, clock(13 * 60 + 58 - i * 2))),
+  ...audit.map((sql, i) => seed("nightly-audit", sql, clock(2 * 60 + 14 - i))),
+];
+const ROW = 30, PAGE = 500;
+const entryOf = p => state.entries.find(e => e.id === state.panes[p]);
+const paneEl = p => $(`.pane[data-pane="${p}"]`);
+const paneOf = el => +el.closest(".pane").dataset.pane;
+const panesOf = e => state.panes.flatMap((id, p) => id === e.id ? [p] : []);
+const hasRows = e => e.kind === "table" || e.kind === "read";
+const dataOf = e => e.kind === "table" ? tables[e.table] : e.data;
+const editable = e => e.kind === "table" && !conn().readOnly;
+const whyLocked = e => e.kind === "table" ? `${conn().name} is read-only.` : "This is a stored result. Open the table to change its rows.";
+const visible = e => dataOf(e).columns.map((_, c) => c).filter(c => !e.v.hidden.has(c));
+const cellKey = (table, pk, c) => `${table}|${pk}|${c}`;
+
+function indexOf(e) {
+  const data = dataOf(e), v = e.v;
+  const key = `${v.filter}|${v.sort?.c}|${v.sort?.dir}|${data.rows.length}`;
+  if (v.key === key) return v.index;
+  const test = v.filter.trim() ? predicate(v.filter.trim(), data.columns, false) : null;
+  const index = [];
+  data.rows.forEach((row, i) => { if (!test || test(row)) index.push(i); });
+  if (v.sort) index.sort((a, b) => compare(data.rows[a][v.sort.c], data.rows[b][v.sort.c]) * v.sort.dir);
+  v.key = key;
+  v.index = index;
+  return index;
+}
+function range(e) {
+  const v = e.v;
+  if (!v.focus) return null;
+  const shown = visible(e), a = v.anchor ?? v.focus;
+  const [p0, p1] = [shown.indexOf(a.c), shown.indexOf(v.focus.c)].sort((x, y) => x - y);
+  return { r0: Math.min(a.r, v.focus.r), r1: Math.max(a.r, v.focus.r), p0: Math.max(p0, 0), p1, shown };
+}
+function defaultWidth(data, c) {
+  const column = data.columns[c];
+  let longest = column.name.length + 2;
+  for (let r = 0; r < Math.min(data.rows.length, 40); r++) longest = Math.max(longest, fmt(data.rows[r][c], column).length);
+  return Math.max(72, Math.min(Math.round(longest * 7) + 28, 300));
+}
+
+function toast(text, action) {
+  const el = $("#toast");
+  el.innerHTML = `<span>${esc(text)}</span>` + (action ? `<button data-act="toast-action">${action.label}</button>` : "");
+  toast.action = action?.run;
+  el.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.classList.remove("show"), action ? 6000 : 2600);
+}
+
+/* Rendering */
+function renderBar() {
+  $("#conn-btn").innerHTML = `${conn().readOnly ? LOCK : ""}<span>${esc(conn().name)}</span>${CHEVRON}`;
+  $("#conn-menu").innerHTML = state.connections.map((c, i) =>
+    `<button role="menuitem" data-act="connect-to" data-i="${i}">${c.readOnly ? LOCK : ""}${esc(c.name)}</button>`).join("") +
+    `<hr><button role="menuitem" data-act="new-connection">New connection…</button>`;
+  $("#split").setAttribute("aria-pressed", state.panes.length > 1);
+}
+function label(e) {
+  if (e.kind === "draft") return "New query";
+  if (e.kind === "table") return e.table;
+  return e.sql.replace(/\s+/g, " ").trim().replace(/^select .+? from /i, "");
+}
+function renderLedger() {
+  const find = state.find.trim().toLowerCase();
+  const sessions = ["You", ...new Set(state.entries.map(e => e.session).filter(s => s !== "You"))];
+  $("#ledger").innerHTML = sessions.map(session => {
+    const items = state.entries.filter(e => e.session === session && (!find || e.sql.toLowerCase().includes(find)));
+    if (find && !items.length) return "";
+    const open = Boolean(find) || !state.collapsed.has(session);
+    return `<button class="session" data-act="collapse" data-session="${esc(session)}" aria-expanded="${open}">${CHEVRON}${esc(session)}</button>` + (open ? items.map(e => {
+      const classes = ["item", ["not-run", "failed", "stopped"].includes(e.kind) && "struck", e.kind === "running" && "running", e.fresh && "fresh",
+        state.panes.includes(e.id) && e.id !== state.panes[state.focus] && "beside"].filter(Boolean).join(" ");
+      return `<button class="${classes}" data-act="show" data-id="${e.id}" title="${esc(e.sql.replace(/\s+/g, " "))}"${e.id === state.panes[state.focus] ? ' aria-current="true"' : ""}>${esc(label(e))}</button>`;
+    }).join("") : "");
+  }).join("") || `<p class="none">No statement contains “${esc(state.find.trim())}”.</p>`;
+}
+
+const KEYWORDS = "select from where and or not null is in like order by group having limit offset insert into values update set delete join left on as desc asc distinct count sum avg min max true false".split(" ");
+function highlight(text, caret = -1) {
+  let html = caret === 0 ? '<i class="caret"></i>' : "", at = 0;
+  for (const m of text.matchAll(/(--[^\n]*)|('(?:[^']|'')*'?)|(\b\d+(?:\.\d+)?\b)|(\b[a-z_]\w*\b)|([\s\S])/gi)) {
+    const kind = m[1] ? "c" : m[2] ? "s" : m[4] && KEYWORDS.includes(m[4].toLowerCase()) ? "k" : "";
+    const cut = caret - at;
+    const body = cut > 0 && cut <= m[0].length ? esc(m[0].slice(0, cut)) + '<i class="caret"></i>' + esc(m[0].slice(cut)) : esc(m[0]);
+    html += kind ? `<span class="${kind}">${body}</span>` : body;
+    at += m[0].length;
+  }
+  return html + "\n";
+}
+function paintCode(root) {
+  const area = $(".sql", root);
+  if (area) $(".hl", root).innerHTML = highlight(area.value, area === document.activeElement ? area.selectionStart : -1);
+}
+const lineCount = (text, e) => Math.min(Math.max(text.split("\n").length, e.kind === "draft" ? 3 : 1), 12);
+
+function editorHtml(e) {
+  const rows = hasRows(e);
+  return `<div class="editor">
+    <div class="code"><pre class="hl" aria-hidden="true"></pre><textarea class="sql" rows="${lineCount(e.sql, e)}" spellcheck="false" aria-label="Statement" placeholder="Write a statement">${esc(e.sql)}</textarea></div>
+    <div class="run-bar">
+      ${e.kind === "running" ? `<button class="btn" data-act="stop">Stop</button>` : `<button class="btn primary" data-act="run" title="Ctrl+Enter">Run</button>`}
+      ${rows ? `<div class="seg" role="group" aria-label="Show">${["rows", "structure", "summary"].map(tab =>
+        `<button aria-pressed="${e.v.tab === tab}" data-act="tab" data-tab="${tab}">${tab[0].toUpperCase() + tab.slice(1)}</button>`).join("")}</div>` : ""}
+      <span class="spacer"></span>
+      ${rows && e.v.tab === "rows" ? `<label class="field"><input class="filter" placeholder="Filter rows" aria-label="Filter rows" value="${esc(e.v.filter)}" autocomplete="off"></label>
+        <button class="icon-btn" aria-label="Show the selected row" title="Show the selected row" aria-pressed="${e.v.inspector}" data-act="inspector">${ROW_ICON}</button>` : ""}
+    </div>
+  </div>`;
+}
+function gridHtml(e) {
+  const data = dataOf(e), v = e.v;
+  v.widths ??= data.columns.map((_, c) => defaultWidth(data, c));
+  const shown = visible(e);
+  const total = shown.reduce((sum, c) => sum + v.widths[c], 0);
+  const head = shown.map((c, position) => {
+    const column = data.columns[c], sorted = v.sort?.c === c;
+    return `<th scope="col" class="${[column.num && "num", position === 0 && "pin"].filter(Boolean).join(" ")}"${sorted ? ` aria-sort="${v.sort.dir === 1 ? "ascending" : "descending"}"` : ""}><div class="th">
+      <button class="th-name" data-act="sort" data-c="${c}">${esc(column.name)}${sorted ? ARROW[v.sort.dir] : ""}</button>
+      <button class="icon-btn th-menu" data-act="column-menu" data-c="${c}" aria-label="Options for ${esc(column.name)}">${CHEVRON}</button>
+      <i class="resize" data-c="${c}"></i></div></th>`;
+  }).join("");
+  return `<div class="work">
+    <div class="grid-wrap" tabindex="0" role="grid" aria-label="Rows">
+      <table class="grid" style="width:max(100%, ${total}px)"><colgroup>${shown.map(c => `<col data-c="${c}" style="width:${v.widths[c]}px">`).join("")}<col></colgroup>
+      <thead><tr>${head}<th></th></tr></thead><tbody></tbody></table>
+    </div>
+    ${v.inspector ? `<aside class="inspector" aria-label="Selected row"></aside>` : ""}
+  </div>
+  <div class="status"><span class="total"></span><span class="spacer"></span><span class="picked"></span><button class="link" data-act="export">Export</button></div>`;
+}
+function plainTable(head, rows, numeric = []) {
+  return `<table class="grid plain"><thead><tr>${head.map((name, i) => `<th scope="col"${numeric.includes(i) ? ' class="num"' : ""}>${name}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map(row => `<tr>${row.map((value, i) => `<td class="${numeric.includes(i) ? "num" : ""}${value === "null" ? " null" : ""}" title="${esc(value)}">${esc(value)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+function structureHtml(e) {
+  const data = dataOf(e), table = e.kind === "table" ? tables[e.table] : null;
+  const columns = table
+    ? plainTable(["Name", "Type", "Null", "Default", "Key"], data.columns.map(c => [c.name, c.type, c.nullable ? "yes" : "no", c.default ?? "", c.key ?? (c.ref ? `references ${c.ref}` : "")]))
+    : plainTable(["Name", "Type"], data.columns.map(c => [c.name, c.type]));
+  return `<div class="note"><h2>Columns</h2>${columns}` + (table ? `<h2>Indexes</h2>${plainTable(["Name", "Definition"], table.indexes)}<h2>Constraints</h2>${plainTable(["Name", "Type"], table.constraints)}` : "") + `</div>`;
+}
+function summaryHtml(e) {
+  const data = dataOf(e);
+  const rows = data.columns.map((column, c) => {
+    let nulls = 0, min = null, max = null;
+    const distinct = new Set();
+    for (const row of data.rows) {
+      const value = row[c];
+      if (value === null) { nulls++; continue; }
+      distinct.add(typeof value === "object" ? JSON.stringify(value) : value);
+      if (column.type === "jsonb") continue;
+      if (min === null || compare(value, min) < 0) min = value;
+      if (max === null || compare(value, max) > 0) max = value;
+    }
+    return [column.name, count(nulls), count(distinct.size), min === null ? "" : fmt(min, column), max === null ? "" : fmt(max, column)];
+  });
+  return `<div class="note">${plainTable(["Column", "Nulls", "Distinct", "Min", "Max"], rows, [1, 2])}</div>`;
+}
+function bodyHtml(e) {
+  if (e.kind === "running") return `<div class="note"><p class="muted run-time">Running, 0.0 s</p></div>`;
+  if (e.kind === "stopped") return `<div class="note"><p>Stopped after ${e.took} s. Nothing was changed.</p></div>`;
+  if (e.kind === "failed") return `<div class="note"><p class="error" role="alert">${esc(e.message)}</p>${e.hint ? `<p>${esc(e.hint)}</p>` : ""}</div>`;
+  if (e.kind === "not-run") return `<div class="note"><p class="error" role="alert">Not run. ${esc(e.reason)}</p>${e.canOverride ? `<p><button class="btn" data-act="run-anyway">Run anyway</button></p>` : ""}</div>`;
+  if (e.kind === "draft") return `<div class="note"><p class="muted">Run the statement to see its rows here. Each result stays in the list on the left.</p></div>`;
+  return e.v.tab === "structure" ? structureHtml(e) : e.v.tab === "summary" ? summaryHtml(e) : gridHtml(e);
+}
+function receiptHtml(e) {
+  const verb = /^\s*delete/i.test(e.sql) ? "deleted" : "changed";
+  let detail = "";
+  if (e.change) {
+    const column = tables[e.change.table].columns[e.change.c];
+    detail = plainTable(["Column", "Before", "After"], [[column.name, fmt(e.change.before, column), fmt(e.change.after, column)]]);
+  }
+  const undoable = (e.change || e.removed) && !e.isUndo;
+  return `<div class="note receipt"><pre>${highlight(e.sql)}</pre><p>${count(e.changed)} ${e.changed === 1 ? "row" : "rows"} ${verb} at ${e.time}.</p>${detail}` +
+    (e.undone ? `<p class="muted">This change was undone.</p>` : undoable ? `<p><button class="btn" data-act="undo" data-id="${e.id}">Undo</button></p>` : "") + `</div>`;
+}
+
+function paintRows(p, top) {
+  const root = paneEl(p), e = entryOf(p), wrap = root && $(".grid-wrap", root);
+  if (!wrap) return;
+  const data = dataOf(e), v = e.v, index = indexOf(e), shown = visible(e), box = range(e);
+  const first = Math.max(0, Math.floor((top ?? wrap.scrollTop) / ROW) - 6);
+  const last = Math.min(index.length, first + Math.ceil(wrap.clientHeight / ROW) + 14);
+  const many = box && (box.r0 !== box.r1 || box.p0 !== box.p1);
+  let html = `<tr class="gap" style="height:${first * ROW}px"><td colspan="${shown.length + 1}"></td></tr>`;
+  for (let r = first; r < last; r++) {
+    const page = Math.floor(r / PAGE);
+    if (!v.loaded.has(page)) loadPage(e, page);
+    const row = data.rows[index[r]];
+    html += `<tr data-r="${r}">` + shown.map((c, position) => {
+      const column = data.columns[c];
+      const classes = [column.num && "num", position === 0 && "pin"];
+      if (!v.loaded.has(page)) return `<td class="${classes.concat("skel").filter(Boolean).join(" ")}"></td>`;
+      classes.push(row[c] === null && "null", e.kind === "table" && state.marked.has(cellKey(e.table, row[0], c)) && "marked",
+        many && r >= box.r0 && r <= box.r1 && position >= box.p0 && position <= box.p1 && "in", v.focus?.r === r && v.focus.c === c && "focus");
+      return `<td class="${classes.filter(Boolean).join(" ")}" data-c="${c}">${esc(fmt(row[c], column))}</td>`;
+    }).join("") + "<td></td></tr>";
+  }
+  $("tbody", wrap).innerHTML = html + `<tr class="gap" style="height:${(index.length - last) * ROW}px"><td colspan="${shown.length + 1}"></td></tr>`;
+  $(".total", root).textContent = `${index.length === data.rows.length ? count(index.length) : `${count(index.length)} of ${count(data.rows.length)}`} rows, read at ${e.time}`;
+  let picked = "";
+  if (many) {
+    const cells = (box.r1 - box.r0 + 1) * (box.p1 - box.p0 + 1);
+    const numeric = box.shown.slice(box.p0, box.p1 + 1).every(c => data.columns[c].num);
+    picked = `${count(cells)} cells`;
+    if (numeric && cells <= 200000) {
+      let sum = 0;
+      for (let r = box.r0; r <= box.r1; r++) for (let position = box.p0; position <= box.p1; position++) sum += data.rows[index[r]][box.shown[position]] ?? 0;
+      picked += `, sum ${count(Math.round(sum * 100) / 100)}`;
+    }
+  }
+  $(".picked", root).textContent = picked;
+  paintInspector(p);
+}
+function loadPage(e, page) {
+  if (e.v.loading.has(page)) return;
+  e.v.loading.add(page);
+  setTimeout(() => {
+    e.v.loaded.add(page);
+    e.v.loading.delete(page);
+    panesOf(e).forEach(paintRows);
+  }, 260);
+}
+function paintInspector(p) {
+  const root = paneEl(p), e = entryOf(p), box = $(".inspector", root);
+  if (!box) return;
+  const data = dataOf(e), at = e.v.focus ? indexOf(e)[e.v.focus.r] : undefined, row = data.rows[at];
+  const key = `${e.id}|${at}|${data.version}|${editable(e)}`;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  box.innerHTML = row ? data.columns.map((column, c) => {
+    const text = row[c] === null ? "" : column.type === "jsonb" ? JSON.stringify(row[c], null, 2) : fmt(row[c], column);
+    const lines = Math.min(Math.max(text.split("\n").length, Math.ceil(text.length / 40), 1), 10);
+    return `<label>${esc(column.name)}<textarea data-c="${c}" rows="${lines}" placeholder="null" spellcheck="false"${column.type === "jsonb" ? ' class="json"' : ""}${editable(e) && c > 0 ? "" : " readonly"}>${esc(text)}</textarea></label>`;
+  }).join("") : `<p class="muted">Select a row to see all its values.</p>`;
+}
+function mount(p) {
+  const root = paneEl(p), e = entryOf(p), wrap = $(".grid-wrap", root);
+  paintCode(root);
+  if (!wrap) return;
+  const { top, left } = e.v;
+  paintRows(p, top);
+  wrap.scrollTop = top;
+  wrap.scrollLeft = left;
+  let queued = false;
+  wrap.addEventListener("scroll", () => {
+    e.v.top = wrap.scrollTop;
+    e.v.left = wrap.scrollLeft;
+    closeMenu();
+    $(".editing input", wrap)?.blur();
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; if (wrap.isConnected) paintRows(p); });
+  });
+}
+function renderPane(p) {
+  const e = entryOf(p);
+  const html = `<section class="pane${state.panes.length > 1 && p === state.focus ? " focused" : ""}" data-pane="${p}">${e.kind === "write" ? receiptHtml(e) : editorHtml(e) + bodyHtml(e)}</section>`;
+  const old = paneEl(p);
+  if (old) old.outerHTML = html; else $("#main").insertAdjacentHTML("beforeend", html);
+  mount(p);
+}
+function render() {
+  renderBar();
+  renderLedger();
+  $("#main").innerHTML = "";
+  state.panes.forEach((_, p) => renderPane(p));
+}
+const refresh = e => { renderLedger(); panesOf(e).forEach(renderPane); };
+
+/* Running statements */
+function show(id, p = state.focus) {
+  state.panes[p] = id;
+  state.focus = p;
+  document.body.classList.remove("side-open");
+  render();
+}
+function place(made, replace) {
+  const at = replace ? state.entries.indexOf(replace) : -1;
+  if (at >= 0) state.entries.splice(at, 1, made); else state.entries.unshift(made);
+  show(made.id);
+}
+function run(p) {
+  const current = entryOf(p);
+  let sql = $(".sql", paneEl(p)).value.trim();
+  if (!sql) { toast("Write a statement first."); $(".sql", paneEl(p)).focus(); return; }
+  if (/^\w+$/.test(sql) && source(sql.toLowerCase())) sql = `select * from ${sql.toLowerCase()}`;
+  const made = entry({ session: "You", sql, time: now(), kind: "running", started: performance.now() });
+  state.focus = p;
+  place(made, current.kind === "draft" ? current : undefined);
+  made.tick = setInterval(() => {
+    const text = `Running, ${((performance.now() - made.started) / 1000).toFixed(1)} s`;
+    panesOf(made).forEach(pane => { const el = $(".run-time", paneEl(pane)); if (el) el.textContent = text; });
+  }, 100);
+  made.timer = setTimeout(() => settle(made, execute(sql, false, true)), /sleep/i.test(sql) ? 9000 : 420);
+}
+function settle(e, result) {
+  clearInterval(e.tick);
+  clearTimeout(e.timer);
+  Object.assign(e, result, { took: ((performance.now() - e.started) / 1000).toFixed(1) });
+  if (e.kind === "table") e.sql = `select * from ${e.table}`;
+  refresh(e);
+}
+function openTable(name, filter = "") {
+  let found = state.entries.find(e => e.session === "You" && e.kind === "table" && e.table === name);
+  if (!found) {
+    found = entry({ session: "You", sql: `select * from ${name}`, time: now(), ...execute(`select * from ${name}`, false, true) });
+    state.entries.unshift(found);
+  }
+  if (filter) Object.assign(found.v, { filter, tab: "rows", focus: null, anchor: null, top: 0 });
+  show(found.id);
+}
+
+/* Writes */
+function applyChange({ table, pk, c, after }) {
+  tables[table].rows.find(row => row[0] === pk)[c] = after;
+  tables[table].version++;
+  state.marked.add(cellKey(table, pk, c));
+}
+function saveCell(e, row, c, text) {
+  const column = dataOf(e).columns[c];
+  let after;
+  try { after = parseValue(text, column); } catch (message) { toast(`Not saved. ${message}`); return; }
+  if (plain(after) === plain(row[c])) return;
+  const change = { table: e.table, pk: row[0], c, before: row[c], after };
+  applyChange(change);
+  const made = entry({ session: "You", kind: "write", sql: `update ${e.table} set ${column.name} = ${literal(after)} where id = ${row[0]}`, time: now(), changed: 1, change });
+  state.entries.unshift(made);
+  renderLedger();
+  toast(`Changed ${column.name}`, { label: "Undo", run: () => undo(made) });
+}
+function removeRow(e, r) {
+  const table = tables[e.table], at = indexOf(e)[r], row = table.rows[at];
+  table.rows.splice(at, 1);
+  table.version++;
+  Object.assign(e.v, { focus: null, anchor: null });
+  const made = entry({ session: "You", kind: "write", sql: `delete from ${e.table} where id = ${row[0]}`, time: now(), changed: 1, removed: { table: e.table, at, row } });
+  state.entries.unshift(made);
+  render();
+  toast("Deleted 1 row", { label: "Undo", run: () => undo(made) });
+}
+function undo(e) {
+  if (e.undone) return;
+  e.undone = true;
+  let sql;
+  if (e.change) {
+    const { table, pk, c, before } = e.change;
+    applyChange({ table, pk, c, after: before });
+    state.marked.delete(cellKey(table, pk, c));
+    sql = `update ${table} set ${tables[table].columns[c].name} = ${literal(before)} where id = ${pk}`;
+  } else {
+    const { table, at, row } = e.removed;
+    tables[table].rows.splice(at, 0, row);
+    tables[table].version++;
+    sql = `insert into ${table} values (${row.map(literal).join(", ")})`;
+  }
+  state.entries.unshift(entry({ session: "You", kind: "write", sql, time: now(), changed: 1, isUndo: true }));
+  render();
+  toast("Undone");
+}
+
+/* Grid interaction */
+function reveal(p) {
+  const e = entryOf(p), wrap = $(".grid-wrap", paneEl(p)), top = e.v.focus.r * ROW, room = wrap.clientHeight - 34;
+  if (top < wrap.scrollTop) wrap.scrollTop = top;
+  else if (top + ROW > wrap.scrollTop + room) wrap.scrollTop = top + ROW - room;
+  paintRows(p);
+  $(".focus", wrap)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+function focusCell(p, r, c, extend) {
+  const e = entryOf(p);
+  e.v.focus = { r, c };
+  if (!extend) e.v.anchor = { r, c };
+}
+function startEdit(p, td) {
+  const e = entryOf(p), data = dataOf(e), r = +td.parentElement.dataset.r, c = +td.dataset.c, column = data.columns[c];
+  if (!editable(e)) { toast(whyLocked(e)); return; }
+  if (c === 0) { toast("The id identifies the row, so it cannot be changed."); return; }
+  const row = data.rows[indexOf(e)[r]];
+  if (column.type === "jsonb" || plain(row[c] ?? "").length > 48) {
+    e.v.inspector = true;
+    renderPane(p);
+    const field = $(`.inspector textarea[data-c="${c}"]`, paneEl(p));
+    field.focus();
+    field.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  td.classList.add("editing");
+  td.innerHTML = `<input aria-label="${esc(column.name)}" value="${esc(row[c] === null ? "" : fmt(row[c], column))}">`;
+  const input = td.firstChild;
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = save => {
+    if (done) return;
+    done = true;
+    if (save) saveCell(e, row, c, input.value);
+    panesOf(e).forEach(paintRows);
+    $(".grid-wrap", paneEl(p))?.focus({ preventScroll: true });
+  };
+  input.addEventListener("keydown", event => {
+    event.stopPropagation();
+    if (event.key === "Enter") finish(true);
+    if (event.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+function copyRange(p) {
+  const e = entryOf(p), box = range(e), data = dataOf(e), index = indexOf(e);
+  if (!box) return;
+  const lines = [];
+  for (let r = box.r0; r <= Math.min(box.r1, box.r0 + 4999); r++) lines.push(box.shown.slice(box.p0, box.p1 + 1).map(c => fmt(data.rows[index[r]][c], data.columns[c])).join("\t"));
+  navigator.clipboard?.writeText(lines.join("\n")).catch(() => {});
+  const cells = lines.length * (box.p1 - box.p0 + 1);
+  toast(`Copied ${count(cells)} ${cells === 1 ? "cell" : "cells"}`);
+}
+function setFilter(p, text, focus) {
+  const e = entryOf(p);
+  Object.assign(e.v, { filter: text, focus: null, anchor: null, top: 0, tab: "rows" });
+  renderPane(p);
+  if (!focus) return;
+  const input = $(".filter", paneEl(p));
+  input.focus();
+  input.setSelectionRange(text.length, text.length);
+}
+
+/* Menus, palette, completion */
+function openMenu(x, y, items) {
+  const el = $("#menu");
+  state.menu = items.filter(Boolean);
+  el.innerHTML = state.menu.map((item, i) => item === "-" ? "<hr>" : `<button role="menuitem" data-act="menu-item" data-i="${i}">${esc(item.label)}</button>`).join("");
+  el.hidden = false;
+  const size = el.getBoundingClientRect();
+  el.style.left = `${Math.max(8, Math.min(x, innerWidth - size.width - 8))}px`;
+  el.style.top = `${Math.max(8, Math.min(y, innerHeight - size.height - 8))}px`;
+}
+function closeMenu() { $("#menu").hidden = true; state.menu = null; }
+function columnMenu(p, c, anchor) {
+  const e = entryOf(p), v = e.v, name = dataOf(e).columns[c].name, at = anchor.getBoundingClientRect();
+  const sort = dir => () => { v.sort = dir ? { c, dir } : null; renderPane(p); };
+  openMenu(at.left - 120, at.bottom + 4, [
+    { label: "Sort ascending", run: sort(1) }, { label: "Sort descending", run: sort(-1) }, v.sort?.c === c && { label: "Clear sort", run: sort(0) }, "-",
+    { label: "Filter this column", run: () => setFilter(p, `${name}: `, true) },
+    visible(e).length > 1 && { label: "Hide column", run: () => { v.hidden.add(c); Object.assign(v, { focus: null, anchor: null }); renderPane(p); } },
+    v.hidden.size && { label: "Show all columns", run: () => { v.hidden.clear(); renderPane(p); } },
+  ]);
+}
+function cellMenu(p, td, x, y) {
+  const e = entryOf(p), data = dataOf(e), r = +td.parentElement.dataset.r, c = +td.dataset.c, column = data.columns[c], value = data.rows[indexOf(e)[r]][c];
+  openMenu(x, y, [
+    { label: "Copy", run: () => copyRange(p) },
+    column.type !== "jsonb" && { label: "Filter by this value", run: () => setFilter(p, value === null ? `${column.name} is null` : `${column.name} = ${fmt(value, column)}`) },
+    { label: "Show this row", run: () => { e.v.inspector = true; renderPane(p); } },
+    column.ref && value !== null && { label: `Go to ${column.ref} ${value}`, run: () => openTable(column.ref, `id = ${value}`) },
+    editable(e) && "-", editable(e) && { label: "Delete row", run: () => removeRow(e, r) },
+  ]);
+}
+function names() {
+  const text = $("#open").value.trim().toLowerCase();
+  return [...Object.keys(tables), ...Object.keys(views)].filter(name => name.includes(text));
+}
+function palette(open) {
+  const list = $("#open-list");
+  list.hidden = !open;
+  $("#open").setAttribute("aria-expanded", open);
+  if (!open) return;
+  const found = names();
+  state.pick = Math.min(state.pick, Math.max(found.length - 1, 0));
+  list.innerHTML = found.length ? found.map((name, i) => `<button role="option" aria-selected="${i === state.pick}" data-act="open" data-name="${name}">${name}</button>`).join("") :
+    `<p>No table matches “${esc($("#open").value.trim())}”.</p>`;
+}
+function connMenu(open = $("#conn-menu").hidden) {
+  $("#conn-menu").hidden = !open;
+  $("#conn-btn").setAttribute("aria-expanded", open);
+}
+function complete(area) {
+  const before = area.value.slice(0, area.selectionStart);
+  const word = (before.match(/[a-z_]\w*$/i)?.[0] ?? "").toLowerCase();
+  let list = [];
+  if (word) {
+    const relations = [...Object.keys(tables), ...Object.keys(views)];
+    const named = Object.keys(tables).filter(name => new RegExp(`\\b${name}\\b`, "i").test(area.value));
+    const columns = (named.length ? named : Object.keys(tables)).flatMap(name => tables[name].columns.map(column => column.name));
+    const pool = /\b(from|join|update|into)\s+\w*$/i.test(before) ? relations : [...new Set([...columns, ...relations, ...KEYWORDS])];
+    list = pool.filter(name => name.startsWith(word) && name !== word).slice(0, 8);
+  }
+  state.complete = list.length ? { area, word, list, pick: 0 } : null;
+  paintComplete();
+}
+function paintComplete() {
+  const el = $("#complete"), c = state.complete;
+  el.hidden = !c;
+  if (!c) return;
+  el.innerHTML = c.list.map((name, i) => `<button role="option" aria-selected="${i === c.pick}" data-act="complete" data-i="${i}">${name}</button>`).join("");
+  const mark = $(".caret", c.area.parentElement)?.getBoundingClientRect();
+  if (!mark) return;
+  el.style.left = `${Math.min(mark.left, innerWidth - 200)}px`;
+  el.style.top = `${mark.bottom + 4}px`;
+}
+function acceptComplete(i) {
+  const { area, word, list } = state.complete, at = area.selectionStart;
+  area.setRangeText(list[i], at - word.length, at, "end");
+  state.complete = null;
+  area.dispatchEvent(new Event("input", { bubbles: true }));
+  area.focus();
+}
+
+/* Dialogs */
+const PORTS = { PostgreSQL: 5432, MySQL: 3306, MongoDB: 27017, Redis: 6379 };
+function syncConnect(kindChanged = true) {
+  const form = $("#connect form"), fromEnv = form.elements.source.value === "env", file = form.elements.kind.value === "SQLite";
+  const mode = fromEnv ? "env" : file ? "file" : "net";
+  $$("[data-when]", form).forEach(el => { el.hidden = el.dataset.when !== mode; });
+  if (kindChanged && PORTS[form.elements.kind.value]) form.elements.port.value = PORTS[form.elements.kind.value];
+  $(".error", form).hidden = true;
+}
+function openExport(p) {
+  const e = entryOf(p), data = dataOf(e), all = data.rows.length, shown = indexOf(e).length;
+  state.exporting = e;
+  $("#export-rows").innerHTML = `<legend>Rows</legend><label><input type="radio" name="rows" value="${all}" ${shown === all ? "checked" : ""}> All ${count(all)} rows</label>` +
+    (shown === all ? "" : `<label><input type="radio" name="rows" value="${shown}" checked> The ${count(shown)} filtered rows</label>`);
+  $("#export-columns").innerHTML = data.columns.map((column, c) => `<label><input type="checkbox" name="column" ${e.v.hidden.has(c) ? "" : "checked"}> ${esc(column.name)}</label>`).join("");
+  $("#export").showModal();
+}
+
+const actions = {
+  side: () => document.body.classList.toggle("side-open"),
+  "conn-menu": () => connMenu(),
+  "connect-to": el => { connMenu(false); state.conn = +el.dataset.i; render(); },
+  "new-connection": () => { connMenu(false); $("#connect form").reset(); syncConnect(); $("#connect").showModal(); },
+  "close-dialog": el => el.closest("dialog").close(),
+  split: () => {
+    if (state.panes.length > 1) { state.panes = [state.panes[state.focus]]; state.focus = 0; }
+    else { state.panes.push(state.entries.find(e => hasRows(e) && e.id !== state.panes[0])?.id ?? state.panes[0]); state.focus = 1; }
+    render();
+  },
+  new: () => {
+    const draft = state.entries.find(e => e.kind === "draft");
+    if (draft) show(draft.id); else place(entry({ session: "You", kind: "draft", sql: "", time: now() }));
+    $(".sql", paneEl(state.focus)).focus();
+  },
+  collapse: el => { const s = el.dataset.session; if (!state.collapsed.delete(s)) state.collapsed.add(s); renderLedger(); },
+  show: (el, event) => {
+    if ((event.ctrlKey || event.metaKey) && innerWidth > 760) show(+el.dataset.id, state.panes.length > 1 ? 1 - state.focus : 1);
+    else show(+el.dataset.id);
+  },
+  open: el => { $("#open").value = ""; palette(false); openTable(el.dataset.name); },
+  run: el => run(paneOf(el)),
+  stop: el => { const e = entryOf(paneOf(el)); settle(e, { kind: "stopped" }); },
+  "run-anyway": el => { const e = entryOf(paneOf(el)); e.started = performance.now(); settle(e, execute(e.sql, true, true)); },
+  tab: el => { const p = paneOf(el); entryOf(p).v.tab = el.dataset.tab; renderPane(p); },
+  inspector: el => { const p = paneOf(el), v = entryOf(p).v; v.inspector = !v.inspector; renderPane(p); },
+  sort: el => {
+    const p = paneOf(el), v = entryOf(p).v, c = +el.dataset.c;
+    v.sort = v.sort?.c !== c ? { c, dir: 1 } : v.sort.dir === 1 ? { c, dir: -1 } : null;
+    renderPane(p);
+  },
+  "column-menu": el => columnMenu(paneOf(el), +el.dataset.c, el),
+  "menu-item": el => { const item = state.menu[+el.dataset.i]; closeMenu(); item.run(); },
+  complete: el => acceptComplete(+el.dataset.i),
+  undo: el => undo(state.entries.find(e => e.id === +el.dataset.id)),
+  "toast-action": () => { $("#toast").classList.remove("show"); toast.action?.(); },
+  export: el => openExport(paneOf(el)),
+};
+
+/* Events */
+document.addEventListener("pointerdown", event => {
+  const pane = event.target.closest(".pane");
+  if (pane && state.panes.length > 1 && +pane.dataset.pane !== state.focus) {
+    state.focus = +pane.dataset.pane;
+    $$(".pane").forEach(el => el.classList.toggle("focused", el === pane));
+    renderLedger();
+  }
+  if (!event.target.closest("#menu")) closeMenu();
+  if (!event.target.closest("#complete, .sql")) { state.complete = null; paintComplete(); }
+  const handle = event.target.closest(".resize");
+  if (handle) {
+    const p = paneOf(handle), e = entryOf(p), c = +handle.dataset.c;
+    state.drag = { kind: "resize", p, e, c, x: event.clientX, width: e.v.widths[c] };
+    event.preventDefault();
+    return;
+  }
+  const td = event.button === 0 && event.target.closest(".grid-wrap td[data-c]");
+  if (td && !td.classList.contains("editing")) {
+    const p = paneOf(td);
+    focusCell(p, +td.parentElement.dataset.r, +td.dataset.c, event.shiftKey);
+    state.drag = { kind: "cells", p };
+    paintRows(p);
+    $(".grid-wrap", paneEl(p)).focus({ preventScroll: true });
+    event.preventDefault();
+  }
+});
+document.addEventListener("pointermove", event => {
+  const drag = state.drag;
+  if (!drag) return;
+  if (drag.kind === "resize") {
+    const v = drag.e.v, root = paneEl(drag.p);
+    v.widths[drag.c] = Math.max(56, Math.min(drag.width + event.clientX - drag.x, 640));
+    $(`col[data-c="${drag.c}"]`, root).style.width = `${v.widths[drag.c]}px`;
+    $(".grid", root).style.width = `max(100%, ${visible(drag.e).reduce((sum, c) => sum + v.widths[c], 0)}px)`;
+    return;
+  }
+  const td = document.elementFromPoint(event.clientX, event.clientY)?.closest(".grid-wrap td[data-c]");
+  if (!td || paneOf(td) !== drag.p) return;
+  const v = entryOf(drag.p).v, r = +td.parentElement.dataset.r, c = +td.dataset.c;
+  if (v.focus.r === r && v.focus.c === c) return;
+  v.focus = { r, c };
+  paintRows(drag.p);
+});
+document.addEventListener("pointerup", () => { state.drag = null; });
+document.addEventListener("click", event => {
+  const el = event.target.closest("[data-act]");
+  if (!event.target.closest(".conn")) connMenu(false);
+  if (!event.target.closest(".palette")) palette(false);
+  if (el) actions[el.dataset.act](el, event);
+});
+document.addEventListener("dblclick", event => {
+  const td = event.target.closest(".grid-wrap td[data-c]");
+  if (td && !td.classList.contains("editing")) startEdit(paneOf(td), td);
+});
+document.addEventListener("contextmenu", event => {
+  const td = event.target.closest(".grid-wrap td[data-c]");
+  if (!td) return;
+  event.preventDefault();
+  const p = paneOf(td), box = range(entryOf(p)), r = +td.parentElement.dataset.r;
+  if (!box || r < box.r0 || r > box.r1) { focusCell(p, r, +td.dataset.c, false); paintRows(p); }
+  cellMenu(p, $(`.grid-wrap tr[data-r="${r}"] td[data-c="${td.dataset.c}"]`, paneEl(p)), event.clientX, event.clientY);
+});
+document.addEventListener("keydown", event => {
+  const mod = event.ctrlKey || event.metaKey, target = event.target;
+  if (event.key === "Escape") { connMenu(false); palette(false); closeMenu(); }
+  if (mod && event.key.toLowerCase() === "k") { event.preventDefault(); $("#open").focus(); return; }
+  if (target.matches(".sql")) {
+    const c = state.complete;
+    if (mod && event.key === "Enter") { event.preventDefault(); state.complete = null; paintComplete(); run(paneOf(target)); }
+    else if (c && (event.key === "ArrowDown" || event.key === "ArrowUp")) { event.preventDefault(); c.pick = (c.pick + (event.key === "ArrowDown" ? 1 : c.list.length - 1)) % c.list.length; paintComplete(); }
+    else if (c && (event.key === "Enter" || event.key === "Tab")) { event.preventDefault(); acceptComplete(c.pick); }
+    else if (c && event.key === "Escape") { state.complete = null; paintComplete(); }
+    return;
+  }
+  if (target.id === "open") {
+    const found = names();
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      state.pick = (state.pick + (event.key === "ArrowDown" ? 1 : found.length - 1)) % Math.max(found.length, 1);
+      palette(true);
+    } else if (event.key === "Enter" && found[state.pick]) {
+      actions.open({ dataset: { name: found[state.pick] } });
+      target.blur();
+    }
+    return;
+  }
+  if (target.matches(".inspector textarea") && mod && event.key === "Enter") { target.blur(); return; }
+  if (!target.matches(".grid-wrap")) return;
+  const p = paneOf(target), e = entryOf(p), v = e.v, shown = visible(e), rows = indexOf(e).length;
+  if (!rows) return;
+  const at = v.focus ?? { r: 0, c: shown[0] }, position = Math.max(shown.indexOf(at.c), 0), jump = Math.max(Math.floor(target.clientHeight / ROW) - 2, 1);
+  const move = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], PageUp: [-jump, 0], PageDown: [jump, 0] }[event.key];
+  if (move) {
+    event.preventDefault();
+    focusCell(p, Math.max(0, Math.min(at.r + move[0], rows - 1)), shown[Math.max(0, Math.min(position + move[1], shown.length - 1))], event.shiftKey);
+    reveal(p);
+  } else if ((event.key === "Enter" || event.key === "F2") && v.focus) {
+    event.preventDefault();
+    const td = $(`tr[data-r="${v.focus.r}"] td[data-c="${v.focus.c}"]`, target);
+    if (td) startEdit(p, td);
+  } else if (mod && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    copyRange(p);
+  }
+});
+document.addEventListener("focusin", event => {
+  if (event.target.id === "open") { state.pick = 0; palette(true); }
+  if (event.target.matches(".sql")) paintCode(event.target.closest(".pane"));
+});
+document.addEventListener("focusout", event => {
+  if (event.target.matches(".sql")) paintCode(event.target.closest(".pane"));
+});
+let filterTimer;
+document.addEventListener("input", event => {
+  const target = event.target;
+  if (target.id === "open") { state.pick = 0; palette(true); }
+  if (target.id === "find") { state.find = target.value; renderLedger(); }
+  if (target.matches(".sql")) {
+    const p = paneOf(target), e = entryOf(p);
+    e.sql = target.value;
+    target.rows = lineCount(target.value, e);
+    paintCode(paneEl(p));
+    complete(target);
+  }
+  if (target.matches(".filter")) {
+    const p = paneOf(target), e = entryOf(p);
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => {
+      Object.assign(e.v, { filter: target.value, focus: null, anchor: null, top: 0 });
+      const wrap = $(".grid-wrap", paneEl(p));
+      wrap.scrollTop = 0;
+      paintRows(p);
+    }, 140);
+  }
+});
+document.addEventListener("change", event => {
+  const target = event.target;
+  if (target.closest("#connect")) syncConnect(target.name === "kind");
+  if (!target.matches(".inspector textarea") || target.readOnly) return;
+  const p = paneOf(target), e = entryOf(p), row = dataOf(e).rows[indexOf(e)[e.v.focus.r]];
+  saveCell(e, row, +target.dataset.c, target.value);
+  panesOf(e).forEach(paintRows);
+});
+$("#connect form").addEventListener("submit", event => {
+  event.preventDefault();
+  const form = event.target, fields = form.elements, button = $(".primary", form), error = $(".error", form);
+  const net = fields.source.value === "details" && fields.kind.value !== "SQLite";
+  error.hidden = true;
+  button.disabled = true;
+  button.textContent = "Connecting…";
+  setTimeout(() => {
+    button.disabled = false;
+    button.textContent = "Connect";
+    if (net && !fields.password.value) {
+      error.textContent = `Cannot connect: password authentication failed for user “${fields.user.value || "postgres"}”. Check the user and the password, then connect again.`;
+      error.hidden = false;
+      fields.password.focus();
+      return;
+    }
+    state.connections.push({ name: fields.name.value.trim(), readOnly: fields.readonly.checked });
+    state.conn = state.connections.length - 1;
+    $("#connect").close();
+    render();
+    toast(`Connected to ${conn().name}`);
+  }, 700);
+});
+$("#export form").addEventListener("submit", event => {
+  event.preventDefault();
+  const fields = event.target.elements, e = state.exporting;
+  $("#export").close();
+  toast(`Exported ${count(+fields.rows.value)} rows to Downloads\\${e.table ?? "result"}.${fields.format.value}`);
+});
+addEventListener("resize", () => state.panes.forEach((_, p) => paintRows(p)));
+
+let liveAt = 0;
+const live = setInterval(() => {
+  if (liveAt === liveScript.length) { clearInterval(live); return; }
+  const made = seed("fix-late-fees", liveScript[liveAt++], now());
+  made.fresh = true;
+  setTimeout(() => { made.fresh = false; }, 1800);
+  state.entries.unshift(made);
+  renderLedger();
+}, 6000);
+
+render();
+</script>
+</body>
+</html>

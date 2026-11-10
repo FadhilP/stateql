@@ -1,73 +1,102 @@
-# Writes, plans, and transactions
+# Writes
 
 All writes need a read-write connection (`stql connect ... --read-write`) and a
-change the user asked for.
+change that the user asked for. `connect <profile> --read-only` refuses writes,
+also when the profile was saved with `--read-write`.
 
 ## Safety gates
 
 | Statement | Needs |
 | --- | --- |
-| `UPDATE`/`DELETE` without `WHERE`, `TRUNCATE` | `--allow-unbounded` |
-| `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `REPLACE`, SQLite `INSERT/UPDATE OR REPLACE` | `--allow-destructive` |
-| MongoDB empty update/replace/delete filter | `--allow-unbounded` |
-| MongoDB `deleteOne`, `deleteMany`, `replaceOne` | `--allow-destructive` |
+| `UPDATE` or `DELETE` without `WHERE`, `TRUNCATE` | `--allow-unbounded` |
+| `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `REPLACE`, `INSERT/UPDATE OR REPLACE`, upsert that updates (`ON CONFLICT DO UPDATE`, `ON DUPLICATE KEY UPDATE`) | `--allow-destructive` |
+| SQL that `stql` cannot parse | both flags |
+| MongoDB update, replace, or delete with an empty filter | `--allow-unbounded` |
+| MongoDB `deleteOne`, `deleteMany`, `replaceOne`, `dropIndex` | `--allow-destructive` |
+| Redis `DEL`, `UNLINK`, `HDEL`, `SREM`, `ZREM` | `--allow-destructive` |
 
-The two flags are independent: a `DELETE` without `WHERE` needs both. Add a
-flag only after the user approved that exact operation. When a gate blocks a
-command, the error has `override_flag`; show the user the statement and ask.
+The flags are independent. A `DELETE` without `WHERE` needs both. When a gate
+stops a command, nothing runs (`executed:false`), and `hint` names the flag.
+Show the statement to the user. Add the flag only after the user approves
+that operation.
 
-## Direct write
+## Write
 
 ```bash
-stql exec 'UPDATE jobs SET claimed = 1 WHERE id = $1' --param 42 --idempotency-key claim-job-42
+stql exec 'UPDATE jobs SET claimed = 1 WHERE id = $1' --param 42 --expect-rows 1 --idempotency-key claim-job-42
 ```
 
 ```json
-{"ok":true,"handle":"op_...","statement_type":"update","affected_rows":1,"status":"committed","state_version_after":"sv_1"}
+{"ok":true,"handle":"wck68sz","status":"committed","statement_type":"update","affected_rows":1}
 ```
 
+- `exec` runs exactly one statement. `query` does not run writes (`READ_ONLY`),
+  and `exec` does not run reads.
 - Check `affected_rows` against what you expected.
-- Use `--idempotency-key` for any write you might retry. The same key never
-  runs twice.
-- Running the same statement with the same parameters again returns
-  `POTENTIAL_DUPLICATE_WRITE` with `previous_operation_id`. Add `--replay` only
-  if the user wants it to run again.
-- `OUTCOME_UNKNOWN` (timeout or lost connection during the write) blocks
-  automatic replay. Query the data to find out whether the write happened, tell
-  the user, and only then decide about `--replay`.
-- `stql receipt <op-handle>` shows the full record of a write.
+- `stql receipt <write-handle>` shows the full record: statement, status, and
+  times. It does not show parameter values.
 
-## Plan, then apply
+## Check the row count: `--expect-rows N`
 
-Use a plan when the user should review a write before it runs.
+Use `--expect-rows` when you know how many rows must change.
+
+- **SQL:** the write runs in a transaction. If the count is not `N`, `stql`
+  rolls back and returns `ROW_COUNT_MISMATCH` with `actual_rows`. Nothing is
+  kept (`executed:false`).
+- **MySQL:** a DDL statement or SQL that `stql` cannot parse returns
+  `UNSUPPORTED` with `--expect-rows`, because MySQL commits DDL at once.
+  MySQL counts rows that match, also when a value does not change.
+- **MongoDB:** only for `updateOne`, `updateMany`, `replaceOne`, `deleteOne`,
+  and `deleteMany`. `stql` runs `countDocuments(filter)` first, and writes only
+  if the count is `N`. These are two steps, not one transaction. A change
+  between them is not found. For `updateOne` and `deleteOne`, `N` is the count
+  of matching documents, not the count that will change.
+- **Redis:** `UNSUPPORTED`.
+
+## Retries: `--idempotency-key`
+
+Give a key to each write that you can retry.
+
+- The same key with the same statement and parameters:
+  - after a committed write: returns the first receipt. The write does not run
+    again.
+  - after a write that failed or was rolled back: runs the write again.
+  - after a write with an unknown outcome, or one that has not finished:
+    returns `OUTCOME_UNKNOWN` with `previous_operation`.
+- The same key with a different statement returns `IDEMPOTENCY_CONFLICT`.
+
+## Unknown outcome: `OUTCOME_UNKNOWN`
+
+A timeout or a lost connection during a write gives `OUTCOME_UNKNOWN`
+(`executed:"unknown"`). The write may or may not have run.
+
+1. Query the data to find out if the write ran.
+2. Tell the user what you found.
+3. The same statement with the same parameters in this session now returns
+   `OUTCOME_UNKNOWN` with `previous_operation`. It does not run. Add `--replay`
+   only if the user wants it to run again.
+
+A write that committed does not stop the same write from running again. Use an
+idempotency key to prevent a second run.
+
+## Many writes in one transaction: `pipe --atomic`
 
 ```bash
-stql plan 'DELETE FROM sessions WHERE expires_at < $1' --param 2026-01-01 --allow-destructive
-# show the user statement_type, estimated_rows, required_overrides, and expires_at
-stql apply <plan-handle>
+printf '%s\n' \
+  '{"command":"exec","stmt":"UPDATE accounts SET balance = balance - $1 WHERE id = $2","params":[50,1],"expect_rows":1}' \
+  '{"command":"exec","stmt":"UPDATE accounts SET balance = balance + $1 WHERE id = $2","params":[50,2],"expect_rows":1}' \
+  | stql pipe --atomic --isolation repeatable-read
 ```
 
-- `estimated_rows` is the number of rows the `WHERE` clause matched when the
-  plan was made. It is present only for single-table `UPDATE` and `DELETE`
-  without `ORDER BY`/`LIMIT`. If it is absent, count the rows with a query.
-- A plan keeps only the approval flags given to `plan`; `apply` never adds any.
-- If data changed after `plan`, `apply` returns `STALE_PLAN`. Create a new plan.
-- Plans expire after 10 minutes.
-
-## Staged transactions
-
-```bash
-stql transaction begin                       # optional: --isolation 'repeatable read'
-stql exec 'UPDATE accounts SET balance = balance - $1 WHERE id = $2' --params '[50, 1]'
-stql exec 'UPDATE accounts SET balance = balance + $1 WHERE id = $2' --params '[50, 2]'
-stql transaction status
-stql transaction commit                      # or: stql transaction rollback
-```
-
-- Writes are stored locally (`status: "pending"`) and run atomically at commit.
-- While a transaction is open, reads, plans, and connection changes return
-  `TRANSACTION_FAILED`. Query what you need before `begin`.
-- Isolation: SQLite `serializable`; PostgreSQL and MySQL also `repeatable read`,
-  `read committed`, `read uncommitted`.
-- MySQL transactions reject DDL. MongoDB transactions need a replica set and use
-  `snapshot` isolation. Redis has no staged transactions.
+- All lines run in one transaction. `stql` commits after the last line. Until
+  then, each write reports `status:"pending"`.
+- An error on any line, also `ROW_COUNT_MISMATCH`, rolls back all lines and
+  stops the pipe.
+- Reads in the pipe see the writes of the pipe.
+- `--isolation`: `read-committed`, `repeatable-read`, `serializable`
+  (PostgreSQL and MySQL). SQLite always uses `BEGIN IMMEDIATE`.
+- MySQL: DDL returns `UNSUPPORTED`, because it commits at once. A read that
+  `stql` cannot parse is refused. Writes to MyISAM tables are not rolled back.
+- MongoDB and Redis: `UNSUPPORTED`.
+- If a line does not stop at its deadline, the process exits (code 4). The
+  transaction does not commit, and the pipe writes read as `OUTCOME_UNKNOWN`.

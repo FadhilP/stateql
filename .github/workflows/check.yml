@@ -10,33 +10,22 @@ permissions:
   contents: read
 
 jobs:
-  core:
-    name: Core (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        node: [22.16.x, 24.x]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm test
-      - name: Smoke-test the packed artifact
-        shell: bash
-        run: |
-          TARBALL="$(npm pack --ignore-scripts)"
-          PROJECT="$(mktemp -d)"
-          cd "$PROJECT"
-          npm init --yes
-          npm install --ignore-scripts "$GITHUB_WORKSPACE/$TARBALL"
-          node --input-type=module -e "import '@fadhilp/stateql'"
-          ./node_modules/.bin/stql --version
-          ./node_modules/.bin/stql --help
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo build --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
 
   postgres:
     name: PostgreSQL ${{ matrix.postgres }} integration
@@ -60,16 +49,12 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      STQL_POSTGRES_URL: postgresql://stql_ci:stql_ci_password@127.0.0.1:5432/stql_ci?sslmode=disable
+      STQL_TEST_POSTGRES_URL: postgresql://stql_ci:stql_ci_password@127.0.0.1:5432/stql_ci?sslmode=disable
+      STQL_TEST_REQUIRE: STQL_TEST_POSTGRES_URL
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: node --test dist/test/postgres.test.js dist/test/panel.test.js
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test postgres
 
   mysql:
     name: MySQL integration
@@ -90,28 +75,21 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      STQL_MYSQL_URL: mysql://stql_ci:stql_ci_password@127.0.0.1:3306/stql_ci
+      STQL_TEST_MYSQL_URL: mysql://stql_ci:stql_ci_password@127.0.0.1:3306/stql_ci
+      STQL_TEST_REQUIRE: STQL_TEST_MYSQL_URL
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: node --test dist/test/mysql.test.js dist/test/panel.test.js
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test mysql
 
   mongodb:
     name: MongoDB integration
     runs-on: ubuntu-latest
     env:
-      STQL_MONGODB_URL: mongodb://127.0.0.1:27017/stql_ci?replicaSet=rs0&directConnection=true
+      STQL_TEST_MONGODB_URL: mongodb://127.0.0.1:27017/stql_ci?replicaSet=rs0&directConnection=true
+      STQL_TEST_REQUIRE: STQL_TEST_MONGODB_URL
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
-          cache: npm
       # Transactions need a replica set, which service containers cannot initiate.
       - name: Start a single-node MongoDB replica set
         run: |
@@ -126,9 +104,8 @@ jobs:
             sleep 2
           done
           exit 1
-      - run: npm ci
-      - run: npm run build
-      - run: node --test dist/test/mongodb.test.js dist/test/panel.test.js
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test mongo
 
   redis:
     name: Redis integration
@@ -144,13 +121,9 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      STQL_REDIS_URL: redis://127.0.0.1:6379
+      STQL_TEST_REDIS_URL: redis://127.0.0.1:6379
+      STQL_TEST_REQUIRE: STQL_TEST_REDIS_URL
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.x
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: node --test dist/test/redis.test.js
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --test redis

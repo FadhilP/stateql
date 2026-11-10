@@ -6,3 +6,8 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+target/
+/npm/stateql/bin/*/
+/npm/stateql/skills
+/npm/stateql/README.md
+/npm/stateql/LICENSE

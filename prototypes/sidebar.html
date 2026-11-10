@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>StateQL sidebar</title>
+<style>
+:root {
+  --paper: #FCFCFD;
+  --pane: #EEF1F4;
+  --ink: #18202B;
+  --muted: #626C79;
+  --line: #D8DDE4;
+  --hair: #E9ECF0;
+  --accent: #2F3FC4;
+  --mark: #FFE45C;
+  --danger: #B3261E;
+  --string: #0A6B55;
+  --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --side: 300px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: grid;
+  grid-template: 44px minmax(0, 1fr) / var(--side) minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--pane);
+  color: var(--ink);
+  font: 13px/1.4 var(--ui);
+}
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+svg { flex: none; }
+.muted { color: var(--muted); }
+
+#bar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; }
+.caption { display: flex; align-self: stretch; }
+.caption i { display: grid; place-items: center; width: 46px; }
+
+#side { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 2px 8px 8px; }
+.field {
+  display: flex; align-items: center; gap: 8px; flex: none;
+  height: 30px; padding: 0 8px;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--paper); color: var(--muted);
+}
+.field:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.field input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; color: var(--ink); }
+#tree { flex: 1; overflow: auto; min-height: 0; }
+#tree h2 { margin: 4px 8px; font-size: 12px; font-weight: 400; color: var(--muted); }
+.row {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; height: 28px; padding: 0 8px;
+  border: 0; border-radius: 5px; background: none; text-align: left;
+}
+.row:hover { background: #E1E5EA; }
+.row[aria-current="true"] { background: var(--paper); }
+.row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile { margin-top: 10px; font-weight: 600; }
+.profile[aria-expanded="false"] .chevron { transform: rotate(-90deg); }
+.session { padding-left: 26px; }
+.session[aria-expanded="true"] { font-weight: 600; }
+.dot { width: 6px; height: 6px; flex: none; border-radius: 50%; }
+.live .dot { background: var(--accent); }
+.item { padding-left: 44px; }
+.fold { color: var(--muted); }
+.need { box-shadow: inset 3px 0 0 var(--mark); padding-left: 14px; }
+.fresh { animation: fresh 1.8s ease-out; }
+@keyframes fresh { from { background: var(--mark); } }
+.none { margin: 10px 8px; color: var(--muted); }
+
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--paper); border-top-left-radius: 8px; }
+.note { flex: 1; overflow: auto; padding: 18px 16px; }
+.note > * { max-width: 76ch; margin: 0 0 14px; }
+.note > table { max-width: none; }
+.note pre { font: 13px/1.55 var(--mono); white-space: pre-wrap; }
+.note h1 { font-size: 15px; font-weight: 600; }
+.error { color: var(--danger); }
+.k { color: var(--accent); }
+.s { color: var(--string); }
+.btn { height: 30px; margin-right: 8px; padding: 0 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.btn:hover { border-color: #B9C0CA; }
+.btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { height: 30px; padding: 0 14px 0 0; border-bottom: 1px solid var(--hair); text-align: left; white-space: nowrap; }
+th { font-weight: 600; border-color: var(--line); }
+td.sql { max-width: 640px; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 12.5px; }
+.status { flex: none; height: 30px; padding: 0 16px; border-top: 1px solid var(--hair); color: var(--muted); line-height: 30px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#toast {
+  position: fixed; left: 50%; bottom: 44px; transform: translateX(-50%);
+  padding: 8px 14px; border-radius: 6px; background: var(--ink); color: #fff;
+  opacity: 0; pointer-events: none; transition: opacity .15s;
+}
+#toast.show { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { #toast { transition: none; } .fresh { animation: none; } }
+@media (max-width: 760px) {
+  body { grid-template: 44px minmax(0, 1fr) minmax(0, 1fr) / minmax(0, 1fr); }
+  .caption { display: none; }
+  #main { border-radius: 0; }
+}
+</style>
+</head>
+<body>
+
+<header id="bar">
+  <div class="caption" aria-hidden="true">
+    <i><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><path d="M0 5h10"/></svg></i>
+    <i><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor"><rect x=".5" y=".5" width="9" height="9"/></svg></i>
+    <i><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><path d="M0 0l10 10M10 0L0 10"/></svg></i>
+  </div>
+</header>
+
+<aside id="side">
+  <label class="field">
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5.5" cy="5.5" r="4"/><path d="M8.5 8.5l3.5 3.5"/></svg>
+    <input id="find" placeholder="Find a statement" aria-label="Find a statement" autocomplete="off">
+  </label>
+  <nav id="tree" aria-label="Profiles, sessions and statements"></nav>
+</aside>
+
+<main id="main">
+  <div id="detail" class="note"></div>
+  <div id="count" class="status"></div>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = selector => document.querySelector(selector);
+const esc = value => String(value).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const count = value => value.toLocaleString("en-US");
+const plural = (n, one, many = `${one}s`) => `${count(n)} ${n === 1 ? one : many}`;
+const clock = t => new Date(t).toTimeString().slice(0, 5);
+const DAY = 864e5, MINUTE = 6e4, CAP = 8;
+const hash = (i, salt) => {
+  let x = Math.imul(i + 1, 2654435761) ^ Math.imul(salt + 7, 40503);
+  x ^= x >>> 15; x = Math.imul(x, 2246822519); x ^= x >>> 13; x = Math.imul(x, 3266489917); x ^= x >>> 16;
+  return x >>> 0;
+};
+const pick = (list, i, salt) => list[hash(i, salt) % list.length];
+
+const LOCK = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" aria-label="Read-only"><rect x="2" y="5.5" width="8" height="5.5" rx="1"/><path d="M4 5.5V3.8a2 2 0 014 0v1.7"/></svg>';
+const CHEVRON = '<svg class="chevron" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 3.5l3 3 3-3"/></svg>';
+
+/* Sample data: 1,000 operations in 10 sessions on 6 profiles. */
+const catalog = {
+  library: { loans: ["status", "fee", "due_on", "renewals", "member_id"], members: ["city", "plan", "active", "email"], books: ["copies", "shelf", "title"], branches: ["city", "name"] },
+  orders: { orders: ["status", "total", "customer_id"], refunds: ["amount", "state", "order_id"], customers: ["email", "tier"] },
+  notes: { notes: ["title", "body"], labels: ["name"] },
+};
+const profiles = [
+  { name: "library-staging", db: "library", readOnly: false },
+  { name: "library-production", db: "library", readOnly: true },
+  { name: "orders-staging", db: "orders", readOnly: false },
+  { name: "library-archive", db: "library", readOnly: true },
+  { name: "analytics-replica", db: "orders", readOnly: true },
+  { name: "notes.sqlite", db: "notes", readOnly: false },
+];
+// profile, session, operations, minutes ago of the first and the last one, tables, one write in every N (0 = none)
+const specs = [
+  ["library-staging", "You", 35, 190, 4, ["loans", "members"], 9],
+  ["library-staging", "fix-late-fees", 380, 75, 0, ["loans", "members"], 16],
+  ["library-staging", "import-check", 110, 400, 250, ["books", "branches", "loans"], 0],
+  ["library-staging", "dedupe-members", 40, 1900, 1750, ["members"], 3],
+  ["library-staging", "schema-audit", 30, 4400, 4380, ["loans", "books", "members", "branches"], 0],
+  ["library-production", "member-report", 170, 300, 120, ["members", "loans"], 0],
+  ["library-production", "nightly-audit", 90, 720, 700, ["loans", "books", "branches"], 0],
+  ["library-production", "default", 50, 1000, 30, ["loans", "members", "books"], 0],
+  ["orders-staging", "You", 15, 1300, 1260, ["orders", "refunds"], 5],
+  ["orders-staging", "refund-sync", 80, 95, 20, ["refunds", "orders", "customers"], 6],
+];
+const START = Date.now();
+let nextOp = 1;
+function makeOp(session, i, t) {
+  const tables = session.tables, columns = catalog[session.db];
+  const table = tables[hash(Math.floor(i / (4 + session.id % 5)), session.id) % tables.length];
+  const column = pick(columns[table], i, 1), other = pick(columns[table], i, 2), id = 100 + hash(i, 3) % 9000;
+  const value = pick(["'overdue'", "'Utrecht'", "true", "12.50", "'student'", "0", "'pending'"], i, 4);
+  const op = { id: nextOp++, t, table };
+  const backfill = session.name === "fix-late-fees" && i >= 200 && i < 240;
+  if (backfill || (session.every && i % session.every === session.every - 1)) {
+    const verb = backfill ? "update" : pick(["update", "update", "update", "insert", "delete"], i, 5);
+    const sql = verb === "update" ? `update ${table} set ${column} = ${value} where id = ${id}` : verb === "insert" ? `insert into ${table} (${column}) values (${value})` : `delete from ${table} where id = ${id}`;
+    return { ...op, kind: "write", verb, rows: 1, sql };
+  }
+  if (hash(i, 6) % 60 === 0) return { ...op, kind: "failed", sql: `select id, ${column}s from ${table} where ${other} = ${value}`, message: `column "${column}s" does not exist. Perhaps you meant "${column}".` };
+  const shape = hash(i, 7) % 4;
+  if (shape === 0) return { ...op, kind: "read", rows: 1, sql: `select * from ${table} where id = ${id}` };
+  if (shape === 1) return { ...op, kind: "read", rows: hash(i, 8) % 400, sql: `select id, ${column} from ${table} where ${other} = ${value}` };
+  if (shape === 2) return { ...op, kind: "read", rows: 2 + hash(i, 8) % 8, sql: `select ${column}, count(*) from ${table} group by ${column}` };
+  return { ...op, kind: "read", rows: hash(i, 8) % 100, sql: `select * from ${table} where ${column} is null limit 100` };
+}
+const sessions = specs.map(([profile, name, total, first, last, tables, every], index) => {
+  const session = { id: index + 1, profile, name, mine: name === "You", db: profiles.find(p => p.name === profile).db, tables, every, live: last === 0, ops: [] };
+  for (let i = 0; i < total; i++) session.ops.push(makeOp(session, i, START - (first - (first - last) * i / (total - 1)) * MINUTE));
+  return session;
+});
+const named = (session, at, name) => { const op = sessions[session].ops[at]; Object.assign(op, { kind: "read", name, rows: 40 + at, sql: op.sql.startsWith("select") ? op.sql : `select * from ${op.table}` }); };
+named(0, 21, "overdue_fees");
+named(0, 30, "members_by_city");
+named(1, 371, "unpaid");
+
+const state = {
+  open: 1,
+  selected: null,
+  closed: new Set(["library-archive", "analytics-replica", "notes.sqlite"]),
+  find: "",
+  needs: [
+    { id: 1, session: 2, kind: "approve", text: "fix-late-fees asks to delete every loan", sql: "delete from loans", rows: 24812, verb: "delete", table: "loans",
+      reason: "fix-late-fees wants to run this on library-staging. It has no WHERE, so it deletes all 24,812 rows." },
+    { id: 2, session: 10, kind: "unknown", text: "refund-sync has a write that may not have finished", sql: "update refunds set state = 'paid' where id = 4417", rows: 1, verb: "update", table: "refunds",
+      reason: "refund-sync started this write on orders-staging and did not report a result. The row is changed, or it is not." },
+  ],
+};
+const sessionOf = id => sessions.find(s => s.id === id);
+const isRecent = session => session.mine || !session.ops.length || START - session.ops.at(-1).t < DAY;
+
+/* The fold: what a session shows in the sidebar. */
+const label = sql => sql.replace(/\s+/g, " ").trim().replace(/^select .+? from /i, "");
+const writeText = (verb, rows, table) => verb === "insert" ? `Added ${plural(rows, "row")} to ${table}` : verb === "delete" ? `Deleted ${plural(rows, "row")} from ${table}` : `Changed ${plural(rows, "row")} in ${table}`;
+function opText(op) {
+  if (op.kind === "draft") return "New query";
+  if (op.name) return op.name;
+  if (op.kind === "read") return label(op.sql);
+  if (op.kind === "write") return writeText(op.verb, op.rows, op.table);
+  return `${op.kind === "refused" ? "Refused" : "Failed"}: ${op.kind === "refused" ? op.sql : label(op.sql)}`;
+}
+function listing(names) {
+  if (names.length > 3) return `${names.length} tables`;
+  return names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+function lineText(line) {
+  const ops = line.ops, first = ops[0];
+  if (line.kind === "earlier") return "Earlier in this session";
+  if (line.kind === "one") return opText(first);
+  if (line.kind === "read") return `Read ${listing([...new Set(ops.map(op => op.table))])} ${count(ops.length)} times`;
+  if (line.kind === "write") return writeText(ops.every(op => op.verb === first.verb) ? first.verb : "update", ops.reduce((sum, op) => sum + op.rows, 0), first.table);
+  return line.kind === "failed" ? `${count(ops.length)} reads failed on ${first.table}` : `Refused ${count(ops.length)} statements on ${first.table}`;
+}
+function fold(session) {
+  const kept = session.ops.filter(op => op.kind !== "read" || Date.now() - op.t < DAY);
+  const lines = [];
+  const push = (kind, ops) => lines.push({ kind, ops, key: `${session.id}:${kind}:${ops.at(-1).id}` });
+  let i = kept.length - 1;
+  if (i >= 0 && kept[i].kind === "read") push("one", [kept[i--]]);
+  while (i >= 0) {
+    const op = kept[i], run = [op];
+    const joins = other => !op.name && !other.name && other.kind === op.kind && (op.kind === "read" || other.table === op.table);
+    while (i - run.length >= 0 && joins(kept[i - run.length])) run.push(kept[i - run.length]);
+    i -= run.length;
+    push(run.length === 1 ? "one" : op.kind, run);
+  }
+  if (lines.length <= CAP) return lines;
+  return [...lines.slice(0, CAP - 1), { kind: "earlier", ops: lines.slice(CAP - 1).flatMap(line => line.ops), key: `${session.id}:earlier` }];
+}
+
+/* Sidebar */
+function row(classes, key, text, more = "") {
+  return `<button class="row ${classes}" data-key="${esc(key)}" title="${esc(text)}"${state.selected === key ? ' aria-current="true"' : ""}${more}><span>${esc(text)}</span></button>`;
+}
+function sessionRow(session, open) {
+  return `<button class="row session${session.live ? " live" : ""}" data-session="${session.id}" aria-expanded="${open}"><i class="dot"></i><span>${esc(session.name)}</span></button>`;
+}
+function treeHtml(fresh) {
+  const find = state.find.trim().toLowerCase();
+  const needs = state.needs.filter(need => !find || need.sql.includes(find) || need.text.toLowerCase().includes(find));
+  let html = needs.length ? `<h2>Needs you</h2>` + needs.map(need => row("need", `need:${need.id}`, need.text)).join("") : "";
+  for (const profile of profiles) {
+    const all = sessions.filter(s => s.profile === profile.name);
+    let body = "";
+    if (find) {
+      for (const session of all) {
+        const hits = session.ops.filter(op => op.sql.toLowerCase().includes(find)).reverse();
+        if (!hits.length) continue;
+        body += sessionRow(session, true) + hits.slice(0, 12).map(op => row("item", `${session.id}:op:${op.id}`, opText(op))).join("") +
+          (hits.length > 12 ? row("item fold", `${session.id}:find`, `${count(hits.length - 12)} more`) : "");
+      }
+      if (body) html += `<div class="row profile">${profile.readOnly ? LOCK : ""}<span>${esc(profile.name)}</span></div>${body}`;
+      continue;
+    }
+    const open = !state.closed.has(profile.name);
+    html += `<button class="row profile" data-profile="${esc(profile.name)}" aria-expanded="${open}">${CHEVRON}${profile.readOnly ? LOCK : ""}<span>${esc(profile.name)}</span></button>`;
+    if (!open) continue;
+    if (!all.some(s => s.mine)) html += `<button class="row session" data-start="${esc(profile.name)}"><i class="dot"></i><span>You</span></button>`;
+    const recent = all.filter(isRecent).sort((a, b) => b.mine - a.mine || b.live - a.live || (b.ops.at(-1)?.t ?? 0) - (a.ops.at(-1)?.t ?? 0));
+    for (const session of recent) {
+      const isOpen = state.open === session.id;
+      html += sessionRow(session, isOpen);
+      if (isOpen) html += fold(session).map((line, at) => row(`item${line.ops.length > 1 ? " fold" : ""}${fresh === session.id && at === 0 ? " fresh" : ""}`, line.key, lineText(line))).join("");
+    }
+    if (all.some(s => !isRecent(s))) html += row("session fold", `earlier:${profile.name}`, "Earlier sessions").replace("<span>", '<i class="dot"></i><span>');
+  }
+  return html || `<p class="none">No statement contains “${esc(state.find.trim())}”.</p>`;
+}
+
+/* Main area: only enough to show what a line holds. */
+function resolve(key) {
+  if (!key) return null;
+  const [head, kind, id] = key.split(":");
+  if (head === "need") return { need: state.needs.find(need => need.id === +kind) };
+  if (head === "earlier") return { earlier: sessions.filter(s => s.profile === key.slice(8) && !isRecent(s)) };
+  const session = sessionOf(+head);
+  if (kind === "op") return { ops: session.ops.filter(op => op.id === +id) };
+  if (kind === "find") return { ops: session.ops.filter(op => op.sql.toLowerCase().includes(state.find.trim().toLowerCase())).reverse().slice(12) };
+  return fold(session).find(line => line.key === key) ?? null;
+}
+const KEYWORDS = "select from where and or not null is like order by group limit insert into values update set delete count".split(" ");
+const highlight = sql => esc(sql).replace(/('[^']*')|\b([a-z_]+)\b/gi, (all, text, word) => text ? `<span class="s">${text}</span>` : KEYWORDS.includes(word.toLowerCase()) ? `<span class="k">${word}</span>` : all);
+function outcome(op) {
+  if (op.kind === "read") return plural(op.rows, "row");
+  if (op.kind === "write") return writeText(op.verb, op.rows, op.table).replace(/ (in|to|from) \w+$/, "");
+  return op.kind === "refused" ? "Refused" : "Failed";
+}
+function detailHtml() {
+  const found = resolve(state.selected);
+  if (!found?.need && !found?.earlier && !found?.ops?.length) return `<p class="muted">Pick a line on the left to see what it holds.</p>`;
+  if (found.need) {
+    const need = found.need;
+    return `<pre>${highlight(need.sql)}</pre><p>${esc(need.reason)}</p><p>` + (need.kind === "approve"
+      ? `<button class="btn primary" data-need="allow">Allow once</button><button class="btn" data-need="refuse">Refuse</button>`
+      : `<button class="btn primary" data-need="allow">Run it again</button><button class="btn" data-need="leave">Leave it</button>`) + `</p>`;
+  }
+  if (found.earlier) {
+    return `<h1>Earlier sessions</h1><p>Stored rows are kept for 24 hours. After that, a session keeps only its changes.</p><table><thead><tr><th>Session</th><th>Last used</th><th>Changes</th></tr></thead><tbody>` +
+      found.earlier.map(s => `<tr><td>${esc(s.name)}</td><td>${new Date(s.ops.at(-1).t).toISOString().slice(0, 10)}</td><td>${count(s.ops.filter(op => op.kind === "write").length)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+  if (found.ops.length === 1) {
+    const op = found.ops[0];
+    if (op.kind === "draft") return `<p class="muted">A new query on ${esc(sessionOf(+state.selected.split(":")[0]).profile)}. The editor opens here.</p>`;
+    const result = op.kind === "read" ? `${plural(op.rows, "row")}, read at ${clock(op.t)}. The rows open here.` : op.kind === "write" ? `${outcome(op)} at ${clock(op.t)}.` :
+      op.kind === "refused" ? "Not run. A person refused this statement." : op.message;
+    return `<pre>${highlight(op.sql)}</pre><p${op.kind === "failed" ? ' class="error"' : ""}>${esc(result)}</p>`;
+  }
+  const shown = found.ops.slice(0, 300);
+  return `<h1>${esc(found.kind ? lineText(found) : `${plural(found.ops.length, "more statement")}`)}</h1><table><thead><tr><th>Time</th><th>Statement</th><th>Result</th></tr></thead><tbody>` +
+    shown.map(op => `<tr><td>${clock(op.t)}</td><td class="sql" title="${esc(op.sql)}">${highlight(op.sql)}</td><td>${esc(outcome(op))}</td></tr>`).join("") + `</tbody></table>` +
+    (found.ops.length > shown.length ? `<p class="muted">${count(found.ops.length - shown.length)} more are not shown here.</p>` : "");
+}
+
+function toast(text) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.classList.remove("show"), 2600);
+}
+function paint(fresh) {
+  $("#tree").innerHTML = treeHtml(fresh);
+  $("#detail").innerHTML = detailHtml();
+  const total = sessions.reduce((sum, s) => sum + s.ops.filter(op => op.kind !== "draft").length, 0);
+  const lines = document.querySelectorAll("#tree .row").length;
+  $("#count").textContent = `${plural(total, "operation")} in ${plural(sessions.length, "session")} on ${plural(profiles.length, "profile")}. The sidebar shows ${plural(lines, "line")}.`;
+}
+
+document.addEventListener("click", event => {
+  const el = event.target.closest("[data-profile], [data-session], [data-start], [data-key], [data-need]");
+  if (!el) return;
+  const data = el.dataset;
+  if (data.profile) {
+    if (!state.closed.delete(data.profile)) state.closed.add(data.profile);
+  } else if (data.session) {
+    state.open = state.open === +data.session ? null : +data.session;
+  } else if (data.start) {
+    const profile = profiles.find(p => p.name === data.start);
+    const session = { id: sessions.length + 1, profile: profile.name, name: "You", mine: true, db: profile.db, tables: Object.keys(catalog[profile.db]), every: 0, live: false, ops: [{ id: nextOp++, t: Date.now(), kind: "draft", sql: "", table: "" }] };
+    sessions.push(session);
+    state.open = session.id;
+    state.selected = `${session.id}:one:${session.ops[0].id}`;
+    toast(`Connected to ${profile.name}`);
+  } else if (data.key) {
+    state.selected = data.key;
+  } else {
+    const need = resolve(state.selected).need, session = sessionOf(need.session);
+    state.needs.splice(state.needs.indexOf(need), 1);
+    if (data.need !== "leave") session.ops.push({ id: nextOp++, t: Date.now(), table: need.table, sql: need.sql, verb: need.verb, rows: need.rows, kind: data.need === "allow" ? "write" : "refused" });
+    state.open = session.id;
+    state.closed.delete(session.profile);
+    state.selected = data.need === "leave" ? null : fold(session)[0].key;
+    toast({ allow: need.kind === "approve" ? "Allowed once" : "Ran it again", refuse: "Refused", leave: "Left as it is" }[data.need]);
+  }
+  paint();
+});
+$("#find").addEventListener("input", event => { state.find = event.target.value; paint(); });
+
+/* fix-late-fees is running: it adds an operation every few seconds. */
+let tick = 0;
+setInterval(() => {
+  const session = sessions[1];
+  session.ops.push(makeOp(session, 380 + tick, Date.now()));
+  if (++tick === 5) state.needs.push({ id: 3, session: 2, kind: "approve", text: "fix-late-fees asks to change every member", sql: "update members set active = false", rows: 1840, verb: "update", table: "members",
+    reason: "fix-late-fees wants to run this on library-staging. It has no WHERE, so it changes all 1,840 rows." });
+  const top = $("#tree").scrollTop;
+  paint(session.id);
+  $("#tree").scrollTop = top;
+}, 3000);
+
+paint();
+</script>
+</body>
+</html>

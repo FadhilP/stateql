@@ -1,0 +1,38 @@
+[package]
+name = "stateql"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "stql"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "column_decltype", "fallible_uint"] }
+sqlparser = { version = "0.64", features = ["visitor"] }
+postgres = "0.19"
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+mongodb = { version = "3.10", features = ["sync"] }
+redis = { version = "1.8", default-features = false, features = ["tls-rustls", "tls-rustls-insecure", "tls-rustls-webpki-roots"] }
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+toml = "1"
+sha2 = "0.11"
+base64 = "0.22"
+url = "2"
+percent-encoding = "2"
+bytes = "1"
+getrandom = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

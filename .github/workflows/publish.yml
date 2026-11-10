@@ -1,4 +1,4 @@
-name: Publish to npm
+name: Publish
 
 on:
   release:
@@ -6,21 +6,94 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # npm is the directory in npm/stateql/bin that bin/binary.js looks for.
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, npm: linux-x64-musl, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, npm: linux-arm64-musl, musl: true }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, npm: darwin-x64 }
+          - { target: aarch64-apple-darwin, os: macos-latest, npm: darwin-arm64 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, npm: win32-x64-msvc }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, npm: win32-arm64-msvc }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Tag matches the crate version
+        shell: bash
+        run: test "$(cargo pkgid | sed 's/.*[@#]//')" = "${GITHUB_REF_NAME#v}"
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage binary and archive
+        shell: bash
+        run: |
+          exe=stql; [[ "${{ matrix.target }}" == *windows* ]] && exe=stql.exe
+          mkdir -p "npm/stateql/bin/${{ matrix.npm }}"
+          cp "target/${{ matrix.target }}/release/$exe" "npm/stateql/bin/${{ matrix.npm }}/"
+          tar -czf "stql-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "$exe"
+      - name: Smoke test through npm
+        shell: bash
+        run: |
+          mkdir -p smoke
+          # A tarball installs as a copy, like the registry; a directory install is a symlink.
+          (cd npm/stateql && npm pack --pack-destination ../../smoke)
+          cd smoke && npm init -y >/dev/null && npm install ./*.tgz --no-save
+          npx stql --version
+          # A global install must point the command at the binary, not at Node.
+          npm install -g --prefix "$PWD/global" ./*.tgz
+          PATH="$PWD/global:$PWD/global/bin:$PATH" stql --version
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            grep -q 'stql\.exe' global/stql.cmd
+          else
+            [[ "$(readlink global/bin/stql)" == */stql ]]
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.npm }}
+          path: |
+            npm/stateql/bin/${{ matrix.npm }}
+            stql-${{ matrix.target }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - name: Verify release tag matches package version
+      - name: Attach archives to the release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: node -e 'const packageVersion = require("./package.json").version; if (process.env.RELEASE_TAG.replace(/^v/, "") !== packageVersion) throw new Error(`Release tag ${process.env.RELEASE_TAG} does not match package version ${packageVersion}`)'
-      - run: npm ci
-      - run: npm publish --access public
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" artifacts/*/stql-*.tar.gz --clobber
+      # Trusted publishing (OIDC): no token. A rerun skips a version that is already published.
+      - name: npm publish
+        working-directory: npm/stateql
+        run: |
+          cp -r ../../artifacts/*/npm/stateql/bin/* bin/
+          # Artifacts lose the executable bit, and npm only restores it for `bin` entries.
+          chmod +x bin/*/stql
+          cp -r ../../skills ../../README.md ../../LICENSE .
+          npm pkg set version="${GITHUB_REF_NAME#v}"
+          if npm view "@fadhilp/stateql@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
+            echo "already published"
+          else
+            npm publish --access public
+          fi
