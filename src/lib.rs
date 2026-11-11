@@ -9,7 +9,7 @@ mod secret;
 mod store;
 
 use std::fs;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -54,7 +54,7 @@ pub fn spawn_watchdog() {
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{}", json_line(&Err(error)));
                 let _ = out.flush();
-                std::process::exit(Code::DeadlineExceeded.exit_code());
+                std::process::exit(i32::from(Code::DeadlineExceeded.exit_code()));
             }
         }
     });
@@ -266,7 +266,7 @@ impl Session<'_> {
                     params: merge_params(param, params)?,
                 };
                 let limits = PageLimits::new(max_cell_characters, max_bytes);
-                self.query(stmt, name, preview_rows, max_rows, limits, deadline)
+                self.query(&stmt, name, preview_rows, max_rows, limits, deadline)
             }
             Command::Exec {
                 stmt,
@@ -290,7 +290,7 @@ impl Session<'_> {
                     allow_destructive,
                     expect_rows,
                 };
-                self.exec(stmt, request, deadline)
+                self.exec(&stmt, &request, deadline)
             }
             Command::Receipt { handle } => self.receipt(&handle),
             Command::Rows {
@@ -315,7 +315,7 @@ impl Session<'_> {
             } => {
                 let params = merge_params(param, params)?;
                 let limits = PageLimits::new(max_cell_characters, max_bytes);
-                self.filter(&handle, &predicate, params, name, limits)
+                self.filter(&handle, &predicate, &params, name, limits)
             }
             Command::Summarize { handle } => self.summarize(&handle),
             Command::Export {
@@ -372,7 +372,8 @@ impl Session<'_> {
         };
         let read_only = read_only.unwrap_or(default_read_only);
         self.connection = None;
-        let connection = self.open_connection(&source, read_only, deadline)?;
+        let mut connection = self.open_connection(&source, read_only, deadline)?;
+        connection.driver.verify(deadline)?;
         self.store.set_session(&self.name, &source, read_only)?;
         let response = Response::default()
             .with("session", &self.name)
@@ -496,7 +497,7 @@ impl Session<'_> {
 
     fn query(
         &mut self,
-        stmt: Statement,
+        stmt: &Statement,
         name: Option<String>,
         preview_rows: Option<u64>,
         max_rows: Option<u64>,
@@ -514,7 +515,7 @@ impl Session<'_> {
             preview as usize,
         )?;
         let connection = self.connection(deadline)?;
-        let next_cursor = connection.driver.read(&stmt, &mut sink, deadline)?;
+        let next_cursor = connection.driver.read(stmt, &mut sink, deadline)?;
         let source = connection.identity.clone();
         self.store_result(sink, id, name, source, next_cursor, limits)
     }
@@ -590,7 +591,7 @@ impl Session<'_> {
         &mut self,
         handle: &str,
         predicate: &str,
-        params: Vec<Value>,
+        params: &[Value],
         name: Option<String>,
         limits: PageLimits,
     ) -> Result<Response> {
@@ -603,7 +604,7 @@ impl Session<'_> {
             &path,
             &source.columns,
             predicate,
-            &params,
+            params,
         )?;
         let meta = ResultMeta {
             id,
@@ -724,8 +725,8 @@ impl Session<'_> {
 
     fn exec(
         &mut self,
-        stmt: Statement,
-        request: WriteRequest,
+        stmt: &Statement,
+        request: &WriteRequest,
         deadline: Instant,
     ) -> Result<Response> {
         let session = self.name.clone();
@@ -734,8 +735,8 @@ impl Session<'_> {
             return Err(Error::new(Code::ReadOnly, "This session is read-only.")
                 .with_hint("stql connect <target> --read-write"));
         }
-        let kind = connection.driver.classify(&stmt)?;
-        check_gates(&kind, &request)?;
+        let kind = connection.driver.classify(stmt)?;
+        check_gates(&kind, request)?;
         if request.expect_rows.is_some() && connection.backend == Backend::Redis {
             return Err(driver::unsupported(
                 "--expect-rows does not work with Redis.",
@@ -779,8 +780,8 @@ impl Session<'_> {
             .expect("connection opened above")
             .driver;
         let outcome = match request.expect_rows {
-            None => driver.execute(&stmt, deadline),
-            Some(expected) => driver.write_expecting(&stmt, expected, deadline),
+            None => driver.execute(stmt, deadline),
+            Some(expected) => driver.write_expecting(stmt, expected, deadline),
         };
         let ids = [id.clone()];
         let affected = match outcome {
@@ -854,17 +855,27 @@ impl Session<'_> {
         input: impl BufRead,
         output: &mut dyn Write,
         mode: PipeMode,
-    ) -> Result<i32> {
+    ) -> Result<u8> {
         if let PipeMode::Atomic(isolation) = mode {
             return self.atomic_pipe(input, output, isolation);
         }
+        let mut input = BufReader::new(input);
+        let mut buffer = String::new();
         let mut exit = 0;
-        for line in input.lines() {
-            let line = line?;
+        loop {
+            // A read stays open only while the next line is already here, so it holds no lock while the caller waits.
+            if !input.buffer().contains(&b'\n') {
+                self.close_read();
+            }
+            buffer.clear();
+            if input.read_line(&mut buffer)? == 0 {
+                break;
+            }
+            let line = buffer.trim_end_matches(['\n', '\r']);
             if line.trim().is_empty() {
                 continue;
             }
-            let result = parse_pipe_line(&line).and_then(|command| self.run(command));
+            let result = parse_pipe_line(line).and_then(|command| self.run(command));
             writeln!(output, "{}", json_line(&result))?;
             output.flush()?;
             if let Err(error) = result {
@@ -879,12 +890,20 @@ impl Session<'_> {
         Ok(exit)
     }
 
+    // A failed ROLLBACK stays owed: the next command sends it again or reports the broken connection.
+    fn close_read(&mut self) {
+        let _ = self.with_watchdog(|session, _| match &mut session.connection {
+            Some(connection) => connection.driver.close_read(),
+            None => Ok(()),
+        });
+    }
+
     fn atomic_pipe(
         &mut self,
         input: impl BufRead,
         output: &mut dyn Write,
         isolation: Option<Isolation>,
-    ) -> Result<i32> {
+    ) -> Result<u8> {
         let begun =
             self.with_watchdog(|session, deadline| session.begin_atomic(isolation, deadline));
         if let Err(error) = begun {
@@ -894,7 +913,15 @@ impl Session<'_> {
         self.atomic = Some(Vec::new());
         let mut failure = None;
         for line in input.lines() {
-            let line = line?;
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    let error = Error::from(error);
+                    let _ = writeln!(output, "{}", json_line(&Err(error.clone())));
+                    failure = Some(error);
+                    break;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -902,10 +929,13 @@ impl Session<'_> {
                 .extend_atomic_deadline()
                 .and_then(|()| parse_pipe_line(&line))
                 .and_then(|command| self.run(command));
-            writeln!(output, "{}", json_line(&result))?;
-            output.flush()?;
+            let written = writeln!(output, "{}", json_line(&result)).and_then(|()| output.flush());
             if let Err(error) = result {
                 failure = Some(error);
+                break;
+            }
+            if let Err(error) = written {
+                failure = Some(error.into());
                 break;
             }
         }
@@ -981,11 +1011,16 @@ impl Session<'_> {
             session
                 .store
                 .set_deadline(&pending, &deadline_at(deadline))?;
-            session.finish_atomic(&pending, commit)
+            session.finish_atomic(&pending, commit, deadline)
         })
     }
 
-    fn finish_atomic(&mut self, pending: &[String], commit: bool) -> Result<Response> {
+    fn finish_atomic(
+        &mut self,
+        pending: &[String],
+        commit: bool,
+        deadline: Instant,
+    ) -> Result<Response> {
         let driver = &mut self
             .connection
             .as_mut()
@@ -998,7 +1033,7 @@ impl Session<'_> {
             rolled_back?;
             return Ok(Response::default());
         }
-        match driver.commit() {
+        match driver.commit(deadline) {
             Ok(()) => {
                 self.store
                     .finish_operations(pending, Status::Committed, None, None)?;
@@ -1063,58 +1098,11 @@ fn parse_pipe_line(line: &str) -> Result<Command> {
     Ok(command)
 }
 
-fn load_statement(command: Command) -> Result<Command> {
-    match command {
-        Command::Query {
-            stmt,
-            file,
-            param,
-            params,
-            name,
-            preview_rows,
-            max_rows,
-            max_cell_characters,
-            max_bytes,
-        } => {
-            let stmt = Some(statement_text(stmt, file)?);
-            Ok(Command::Query {
-                stmt,
-                file: None,
-                param,
-                params,
-                name,
-                preview_rows,
-                max_rows,
-                max_cell_characters,
-                max_bytes,
-            })
-        }
-        Command::Exec {
-            stmt,
-            file,
-            param,
-            params,
-            idempotency_key,
-            replay,
-            allow_unbounded,
-            allow_destructive,
-            expect_rows,
-        } => {
-            let stmt = Some(statement_text(stmt, file)?);
-            Ok(Command::Exec {
-                stmt,
-                file: None,
-                param,
-                params,
-                idempotency_key,
-                replay,
-                allow_unbounded,
-                allow_destructive,
-                expect_rows,
-            })
-        }
-        other => Ok(other),
+fn load_statement(mut command: Command) -> Result<Command> {
+    if let Command::Query { stmt, file, .. } | Command::Exec { stmt, file, .. } = &mut command {
+        *stmt = Some(statement_text(stmt.take(), file.take())?);
     }
+    Ok(command)
 }
 
 fn statement_text(stmt: Option<String>, file: Option<PathBuf>) -> Result<String> {
@@ -1405,10 +1393,7 @@ fn new_id(prefix: char) -> String {
 }
 
 fn sha256_hex(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    secret::hex(&Sha256::digest(text.as_bytes()))
 }
 
 #[cfg(test)]

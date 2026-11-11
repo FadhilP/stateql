@@ -27,7 +27,7 @@ pub enum Code {
 }
 
 impl Code {
-    pub fn exit_code(self) -> i32 {
+    pub fn exit_code(self) -> u8 {
         use Code::*;
         match self {
             InvalidCommand | InvalidSql => 2,

@@ -189,7 +189,13 @@ impl Store {
         }
         crate::config::restrict_file(&db_path)?;
         enable_wal(&conn)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        // In WAL mode, NORMAL keeps the store consistent after a crash; write_durable covers what must survive power loss.
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL")?;
+        // Each command is a new process; a checkpoint at every close made each command pay a sync.
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         crate::config::create_private_dir(&results_dir)?;
         let mut store = Store { conn, results_dir };
         store.write(|tx| {
@@ -214,6 +220,14 @@ impl Store {
         let value = work(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    // Write claims and outcomes decide if a retry may run a write again, so they must survive power loss.
+    fn write_durable<T>(&mut self, work: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("PRAGMA synchronous = FULL")?;
+        let value = self.write(work);
+        self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        value
     }
 
     pub fn quick_check(&self) -> Result<String> {
@@ -377,7 +391,7 @@ impl Store {
         running: &[String],
     ) -> Result<Claim> {
         let now = now();
-        self.write(|tx| {
+        self.write_durable(|tx| {
             if let Some(key) = op.idempotency_key
                 && let Some(previous) = find_operation(tx, "idempotency_key = ?2", op.session, key)?
             {
@@ -415,7 +429,7 @@ impl Store {
     ) -> Result<()> {
         let error_json = error.map(|error| json!(error).to_string());
         let now = now();
-        self.write(|tx| {
+        self.write_durable(|tx| {
             for id in ids {
                 tx.execute(
                     "UPDATE operations SET status = ?2, affected_rows = coalesce(?3, affected_rows), error_json = ?4, finished_at = ?5
@@ -428,7 +442,7 @@ impl Store {
     }
 
     pub fn record_affected(&mut self, id: &str, affected_rows: u64) -> Result<()> {
-        self.write(|tx| {
+        self.write_durable(|tx| {
             tx.execute(
                 "UPDATE operations SET affected_rows = ?2 WHERE id = ?1",
                 params![id, affected_rows],
@@ -438,7 +452,7 @@ impl Store {
     }
 
     pub fn set_deadline(&mut self, ids: &[String], deadline_at: &str) -> Result<()> {
-        self.write(|tx| {
+        self.write_durable(|tx| {
             for id in ids {
                 tx.execute(
                     "UPDATE operations SET deadline_at = ?2 WHERE id = ?1",

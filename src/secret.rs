@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command as Process;
 
@@ -606,8 +607,11 @@ fn destination_identity(url: &url::Url) -> Option<String> {
     Some(identity.to_string())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 enum TsPassword {

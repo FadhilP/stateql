@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     // Not locked for the whole pipe: the watchdog thread must be able to print.
     let mut stdout = std::io::stdout();
     match session.pipe(std::io::stdin().lock(), &mut stdout, mode) {
-        Ok(code) => ExitCode::from(code as u8),
+        Ok(code) => ExitCode::from(code),
         Err(error) => finish(&Err(error), false),
     }
 }
@@ -107,6 +107,6 @@ fn finish(result: &Result<stateql::Response, Error>, as_text: bool) -> ExitCode 
     let _ = stdout.flush();
     match result {
         Ok(_) => ExitCode::SUCCESS,
-        Err(error) => ExitCode::from(error.code.exit_code() as u8),
+        Err(error) => ExitCode::from(error.code.exit_code()),
     }
 }

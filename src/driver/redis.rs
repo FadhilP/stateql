@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use redis::Value as RedisValue;
+use redis::{IntoConnectionInfo, Value as RedisValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -436,13 +436,17 @@ pub struct RedisDriver {
 
 impl RedisDriver {
     pub fn open(target: &str, deadline: Instant) -> Result<RedisDriver> {
-        let client = redis::Client::open(target).map_err(super::connection_failed)?;
+        let info = target
+            .into_connection_info()
+            .map_err(super::connection_failed)?;
+        // Without a password or database, the library name would be the only setup round trip.
+        let settings = info.redis_settings().clone().set_skip_set_lib_name();
+        let client = redis::Client::open(info.set_redis_settings(settings))
+            .map_err(super::connection_failed)?;
         let conn = client
             .get_connection_with_timeout(remaining(deadline)?)
             .map_err(super::connection_failed)?;
-        let mut driver = RedisDriver { conn };
-        driver.run(&["PING".to_string()], deadline, super::connection_failed)?;
-        Ok(driver)
+        Ok(RedisDriver { conn })
     }
 
     fn run(
@@ -581,7 +585,7 @@ impl Driver for RedisDriver {
         ))
     }
 
-    fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self, _deadline: Instant) -> Result<()> {
         Ok(())
     }
 
@@ -591,6 +595,11 @@ impl Driver for RedisDriver {
 
     fn in_transaction(&self) -> bool {
         false
+    }
+
+    fn verify(&mut self, deadline: Instant) -> Result<()> {
+        self.run(&["PING".to_string()], deadline, super::connection_failed)?;
+        Ok(())
     }
 
     fn objects(

@@ -57,9 +57,22 @@ const OTHER_TYPES: [&str; 21] = [
     "macaddr",
 ];
 
+const RELEASE_READ: &str = "ROLLBACK TO SAVEPOINT stql_read; RELEASE SAVEPOINT stql_read";
+
+// An open read ends with the next batch, or the disconnect at exit ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transaction {
+    Idle,
+    OpenRead,
+    Atomic,
+    // The savepoint of the last read inside pipe --atomic.
+    AtomicRead,
+}
+
 pub struct PostgresDriver {
     client: Client,
-    in_transaction: bool,
+    read_only: bool,
+    transaction: Transaction,
 }
 
 impl PostgresDriver {
@@ -75,19 +88,26 @@ impl PostgresDriver {
                 .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls)),
         };
         // The postgres error text hides the cause, for example an unknown certificate issuer.
-        let mut client = client.map_err(|error| match std::error::Error::source(&error) {
+        let client = client.map_err(|error| match std::error::Error::source(&error) {
             Some(cause) => super::connection_failed(format!("{error}: {cause}")),
             None => super::connection_failed(error),
         })?;
-        if read_only {
-            client
-                .batch_execute("SET default_transaction_read_only = on")
-                .map_err(super::connection_failed)?;
-        }
         Ok(PostgresDriver {
             client,
-            in_transaction: false,
+            read_only,
+            transaction: Transaction::Idle,
         })
+    }
+
+    fn batch(&mut self, sql: &str) -> std::result::Result<(), postgres::Error> {
+        let (end, after) = match self.transaction {
+            Transaction::Idle | Transaction::Atomic => return self.client.batch_execute(sql),
+            Transaction::OpenRead => ("ROLLBACK", Transaction::Idle),
+            Transaction::AtomicRead => (RELEASE_READ, Transaction::Atomic),
+        };
+        self.client.batch_execute(&format!("{end}; {sql}"))?;
+        self.transaction = after;
+        Ok(())
     }
 
     fn read_only_scope<T>(
@@ -96,26 +116,21 @@ impl PostgresDriver {
         work: impl FnOnce(&mut Client) -> Result<T>,
     ) -> Result<T> {
         let timeout = remaining(deadline)?.as_millis();
-        // Inside pipe --atomic a savepoint makes the read read-only and undoes the setting afterwards.
-        let (open, close) = if self.in_transaction {
-            (
-                format!(
-                    "SAVEPOINT stql_read; SET LOCAL transaction_read_only = on; SET LOCAL statement_timeout = {timeout}"
-                ),
-                "ROLLBACK TO SAVEPOINT stql_read; RELEASE SAVEPOINT stql_read",
-            )
-        } else {
-            (
-                format!("BEGIN READ ONLY; SET LOCAL statement_timeout = {timeout}"),
-                "ROLLBACK",
-            )
-        };
-        self.client.batch_execute(&open).map_err(read_error)?;
-        let result = work(&mut self.client);
-        let closed = self.client.batch_execute(close).map_err(read_error);
-        let value = result?;
-        closed?;
-        Ok(value)
+        if let Transaction::Atomic | Transaction::AtomicRead = self.transaction {
+            // Inside pipe --atomic a savepoint makes the read read-only; its release undoes the setting.
+            self.batch(&format!(
+                "SAVEPOINT stql_read; SET LOCAL transaction_read_only = on; SET LOCAL statement_timeout = {timeout}"
+            ))
+            .map_err(read_error)?;
+            self.transaction = Transaction::AtomicRead;
+            return work(&mut self.client);
+        }
+        let opened = self.batch(&format!(
+            "BEGIN READ ONLY; SET LOCAL statement_timeout = {timeout}"
+        ));
+        self.transaction = Transaction::OpenRead;
+        opened.map_err(read_error)?;
+        work(&mut self.client)
     }
 
     fn text_rows(
@@ -536,7 +551,11 @@ fn timestamp_text(micros: i64, suffix: &str) -> String {
     match micros {
         i64::MAX => "infinity".to_string(),
         i64::MIN => "-infinity".to_string(),
-        micros => format!("{}{suffix}", format_timestamp(micros + PG_EPOCH_MICROS)),
+        micros => {
+            let mut text = format_timestamp(micros + PG_EPOCH_MICROS);
+            text.push_str(suffix);
+            text
+        }
     }
 }
 
@@ -628,7 +647,7 @@ fn inet_text(ty: &Type, raw: &[u8]) -> Result<String> {
 
 fn uuid_text(ty: &Type, raw: &[u8]) -> Result<String> {
     let bytes: [u8; 16] = be(ty, raw, 0)?;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = crate::secret::hex(&bytes);
     Ok(format!(
         "{}-{}-{}-{}-{}",
         &hex[..8],
@@ -644,9 +663,8 @@ fn numeric_text(ty: &Type, raw: &[u8]) -> Result<String> {
     let weight = i16::from_be_bytes(be(ty, raw, 2)?);
     let sign = u16::from_be_bytes(be(ty, raw, 4)?);
     let scale = usize::from(u16::from_be_bytes(be(ty, raw, 6)?));
-    let digits = (0..ndigits)
-        .map(|index| be::<2>(ty, raw, 8 + 2 * index as usize).map(i16::from_be_bytes))
-        .collect::<Result<Vec<_>>>()?;
+    let ndigits = usize::try_from(ndigits).unwrap_or(0);
+    let digits = raw.get(8..8 + 2 * ndigits).ok_or_else(|| malformed(ty))?;
     match sign {
         0xC000 => return Ok("NaN".to_string()),
         0xD000 => return Ok("Infinity".to_string()),
@@ -656,11 +674,10 @@ fn numeric_text(ty: &Type, raw: &[u8]) -> Result<String> {
     let digit = |index: i32| {
         usize::try_from(index)
             .ok()
-            .and_then(|index| digits.get(index))
-            .copied()
-            .unwrap_or(0)
+            .and_then(|index| digits.get(2 * index..2 * index + 2))
+            .map_or(0, |pair| i16::from_be_bytes([pair[0], pair[1]]))
     };
-    let mut out = String::new();
+    let mut out = String::with_capacity(scale + 16);
     if sign == 0x4000 {
         out.push('-');
     }
@@ -675,15 +692,14 @@ fn numeric_text(ty: &Type, raw: &[u8]) -> Result<String> {
         };
     }
     if scale > 0 {
-        let mut fraction = String::new();
+        out.push('.');
+        let end = out.len() + scale;
         let mut index = i32::from(weight) + 1;
-        while fraction.len() < scale {
-            let _ = write!(fraction, "{:04}", digit(index));
+        while out.len() < end {
+            let _ = write!(out, "{:04}", digit(index));
             index += 1;
         }
-        fraction.truncate(scale);
-        out.push('.');
-        out.push_str(&fraction);
+        out.truncate(end);
     }
     Ok(out)
 }
@@ -761,8 +777,12 @@ impl Driver for PostgresDriver {
 
     fn execute(&mut self, stmt: &Statement, deadline: Instant) -> Result<u64> {
         let timeout = remaining(deadline)?.as_millis();
-        self.client
-            .batch_execute(&format!("SET statement_timeout = {timeout}"))
+        let mode = if self.read_only {
+            "SET default_transaction_read_only = on; "
+        } else {
+            ""
+        };
+        self.batch(&format!("{mode}SET statement_timeout = {timeout}"))
             .map_err(read_error)?;
         let statement = self.client.prepare(&stmt.text).map_err(read_error)?;
         check_param_count(&statement, &stmt.params)?;
@@ -781,25 +801,45 @@ impl Driver for PostgresDriver {
             Some(Isolation::RepeatableRead) => " ISOLATION LEVEL REPEATABLE READ",
             Some(Isolation::Serializable) => " ISOLATION LEVEL SERIALIZABLE",
         };
-        self.client
-            .batch_execute(&format!("BEGIN{level}"))
+        let mode = if self.read_only { " READ ONLY" } else { "" };
+        self.batch(&format!("BEGIN{mode}{level}"))
             .map_err(read_error)?;
-        self.in_transaction = true;
+        self.transaction = Transaction::Atomic;
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<()> {
-        self.in_transaction = false;
-        self.client.batch_execute("COMMIT").map_err(write_error)
+    // execute leaves statement_timeout at the time its own write had left; COMMIT gets a fresh one.
+    fn commit(&mut self, deadline: Instant) -> Result<()> {
+        let timeout = match remaining(deadline) {
+            Ok(left) => left.as_millis(),
+            // A transaction left open here would take the next writes with it, and they would never commit.
+            Err(late) => {
+                let _ = self.rollback();
+                return Err(late);
+            }
+        };
+        let committed = self.batch(&format!("SET statement_timeout = {timeout}; COMMIT"));
+        self.transaction = Transaction::Idle;
+        committed.map_err(write_error)
     }
 
     fn rollback(&mut self) -> Result<()> {
-        self.in_transaction = false;
+        self.transaction = Transaction::Idle;
         self.client.batch_execute("ROLLBACK").map_err(read_error)
     }
 
     fn in_transaction(&self) -> bool {
-        self.in_transaction
+        matches!(
+            self.transaction,
+            Transaction::Atomic | Transaction::AtomicRead
+        )
+    }
+
+    fn close_read(&mut self) -> Result<()> {
+        if matches!(self.transaction, Transaction::Idle | Transaction::Atomic) {
+            return Ok(());
+        }
+        self.batch("").map_err(read_error)
     }
 
     fn objects(

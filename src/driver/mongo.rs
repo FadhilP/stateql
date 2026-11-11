@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use mongodb::IndexModel;
-use mongodb::bson::{self, Bson, Document, doc};
+use mongodb::bson::spec::ElementType;
+use mongodb::bson::{self, Bson, Document, RawBsonRef, RawDocument, RawDocumentBuf, doc};
 use mongodb::error::{ErrorKind, WriteFailure};
 use mongodb::options::{
     AggregateOptions, ClientOptions, CountOptions, DeleteOptions, DistinctOptions, FindOptions,
@@ -413,7 +415,10 @@ fn read_error(error: mongodb::error::Error) -> Error {
         ErrorKind::Command(command) if command.code == 13 => {
             Error::new(Code::PermissionDenied, command.message.clone())
         }
-        ErrorKind::ServerSelection { .. } => super::connection_failed(error),
+        // The client connects at its first command, so connection errors can come from any command.
+        ErrorKind::ServerSelection { .. } | ErrorKind::Authentication { .. } => {
+            super::connection_failed(error)
+        }
         _ => Error::query(error),
     }
 }
@@ -437,29 +442,29 @@ fn write_error(error: mongodb::error::Error, operation: &str) -> Error {
     }
 }
 
-fn type_name(value: &Bson) -> String {
-    let name = match value {
-        Bson::Null | Bson::Undefined => "null",
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => "number",
-        Bson::String(_) => "string",
-        Bson::Boolean(_) => "boolean",
-        Bson::Document(_) => "object",
-        Bson::Array(_) => "array",
-        Bson::DateTime(_) => "date",
-        Bson::ObjectId(_) => "objectId",
-        Bson::Binary(_) => "binary",
-        Bson::Decimal128(_) => "decimal128",
-        other => return format!("{:?}", other.element_type()).to_lowercase(),
+fn type_name(kind: ElementType) -> Cow<'static, str> {
+    let name = match kind {
+        ElementType::Null | ElementType::Undefined => "null",
+        ElementType::Int32 | ElementType::Int64 | ElementType::Double => "number",
+        ElementType::String => "string",
+        ElementType::Boolean => "boolean",
+        ElementType::EmbeddedDocument => "object",
+        ElementType::Array => "array",
+        ElementType::DateTime => "date",
+        ElementType::ObjectId => "objectId",
+        ElementType::Binary => "binary",
+        ElementType::Decimal128 => "decimal128",
+        other => return Cow::Owned(format!("{other:?}").to_lowercase()),
     };
-    name.to_string()
+    Cow::Borrowed(name)
 }
 
-fn is_nested(value: &Bson) -> bool {
-    matches!(value, Bson::Document(_) | Bson::Array(_))
+fn is_nested(kind: ElementType) -> bool {
+    matches!(kind, ElementType::EmbeddedDocument | ElementType::Array)
 }
 
 // A JSON column keeps every text cell as JSON, so a string stays a string in the output.
-fn cell(value: Bson, json_column: bool) -> Cell {
+fn cell(value: RawBsonRef<'_>, json_column: bool) -> Result<Cell> {
     let text = |text: String| {
         if json_column {
             Cell::Text(Value::String(text).to_string())
@@ -467,22 +472,26 @@ fn cell(value: Bson, json_column: bool) -> Cell {
             Cell::Text(text)
         }
     };
-    match value {
-        Bson::Null | Bson::Undefined => Cell::Null,
-        Bson::Int32(number) => Cell::Integer(number.into()),
-        Bson::Int64(number) => Cell::Integer(number),
-        Bson::Boolean(flag) => Cell::Integer(flag.into()),
-        Bson::Double(number) if number.is_finite() => Cell::Real(number),
-        Bson::String(value) => text(value),
-        Bson::Binary(binary) => Cell::Blob(binary.bytes),
-        Bson::ObjectId(id) => text(id.to_hex()),
-        Bson::DateTime(date) => text(
+    let cell = match value {
+        RawBsonRef::Null | RawBsonRef::Undefined => Cell::Null,
+        RawBsonRef::Int32(number) => Cell::Integer(number.into()),
+        RawBsonRef::Int64(number) => Cell::Integer(number),
+        RawBsonRef::Boolean(flag) => Cell::Integer(flag.into()),
+        RawBsonRef::Double(number) if number.is_finite() => Cell::Real(number),
+        RawBsonRef::String(value) => text(value.to_string()),
+        RawBsonRef::Binary(binary) => Cell::Blob(binary.bytes.to_vec()),
+        RawBsonRef::ObjectId(id) => text(id.to_hex()),
+        RawBsonRef::DateTime(date) => text(
             date.try_to_rfc3339_string()
                 .unwrap_or_else(|_| date.timestamp_millis().to_string()),
         ),
-        Bson::Decimal128(number) => text(number.to_string()),
-        other => Cell::Text(other.into_relaxed_extjson().to_string()),
-    }
+        RawBsonRef::Decimal128(number) => text(number.to_string()),
+        other => {
+            let owned = Bson::try_from(other.to_raw_bson()).map_err(Error::query)?;
+            Cell::Text(owned.into_relaxed_extjson().to_string())
+        }
+    };
+    Ok(cell)
 }
 
 #[derive(Default)]
@@ -493,42 +502,51 @@ struct Flattener {
 }
 
 impl Flattener {
-    fn push(&mut self, sink: &mut RowSink, document: Document) -> Result<()> {
-        let mut entries: Vec<(String, Bson)> = document.into_iter().collect();
-        entries.sort_by_key(|(key, _)| key != "_id");
+    // Raw BSON, because building an owned Document for each row cost more than the rest of the read.
+    fn push(&mut self, sink: &mut RowSink, document: &RawDocument) -> Result<()> {
+        let mut entries: Vec<(&str, RawBsonRef<'_>)> = document
+            .iter()
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Error::query)?;
+        entries.sort_by_key(|(key, _)| *key != "_id");
         let mut placed = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            let index = self.column(sink, key, &value)?;
+            let index = self.column(sink, key, value.element_type())?;
             placed.push((index, value));
         }
         let mut row = vec![Cell::Null; self.types.len()];
         for (index, value) in placed {
-            row[index] = cell(value, self.json[index]);
+            row[index] = cell(value, self.json[index])?;
         }
         sink.push(row)
     }
 
-    fn column(&mut self, sink: &mut RowSink, key: String, value: &Bson) -> Result<usize> {
-        let kind = type_name(value);
-        let Some(&index) = self.index.get(&key) else {
+    fn push_document(&mut self, sink: &mut RowSink, document: &Document) -> Result<()> {
+        let raw = RawDocumentBuf::from_document(document).map_err(Error::internal)?;
+        self.push(sink, &raw)
+    }
+
+    fn column(&mut self, sink: &mut RowSink, key: &str, kind: ElementType) -> Result<usize> {
+        let name = type_name(kind);
+        let Some(&index) = self.index.get(key) else {
             sink.add_column(Column {
-                name: key.clone(),
-                type_name: kind.clone(),
-                json: is_nested(value),
+                name: key.to_string(),
+                type_name: name.to_string(),
+                json: is_nested(kind),
             })?;
-            self.index.insert(key, self.types.len());
-            self.types.push(kind);
-            self.json.push(is_nested(value));
+            self.index.insert(key.to_string(), self.types.len());
+            self.types.push(name.into_owned());
+            self.json.push(is_nested(kind));
             return Ok(self.types.len() - 1);
         };
         let previous = &self.types[index];
-        if *previous == kind || kind == "null" {
+        if *previous == name || name == "null" {
             return Ok(index);
         }
         // Only NULL cells exist before the first typed value, so the JSON flag can still change.
         if previous == "null" {
-            self.json[index] = is_nested(value);
-            self.types[index] = kind;
+            self.json[index] = is_nested(kind);
+            self.types[index] = name.into_owned();
         } else {
             self.types[index] = "mixed".to_string();
         }
@@ -566,11 +584,9 @@ impl MongoDriver {
             ));
         };
         let client = Client::with_options(options).map_err(super::connection_failed)?;
-        let db = client.database(&name);
-        db.run_command(doc! {"ping": 1})
-            .run()
-            .map_err(super::connection_failed)?;
-        Ok(MongoDriver { db })
+        Ok(MongoDriver {
+            db: client.database(&name),
+        })
     }
 
     fn collection(&self, command: &MongoCommand) -> Collection<Document> {
@@ -702,7 +718,7 @@ impl Driver for MongoDriver {
         let mut rows = Flattener::default();
         let options = command.options();
         if let Some(Bson::String(verbosity)) = command.body.get("explain") {
-            rows.push(sink, self.explain(&command, verbosity)?)?;
+            rows.push_document(sink, &self.explain(&command, verbosity)?)?;
             return Ok(None);
         }
         match command.operation.as_str() {
@@ -715,7 +731,7 @@ impl Driver for MongoDriver {
                     .with_options(options)
                     .run()
                     .map_err(read_error)?;
-                rows.push(sink, doc! {"count": count as i64})?;
+                rows.push_document(sink, &doc! {"count": count as i64})?;
             }
             "distinct" => {
                 let mut options: DistinctOptions = typed(options, &["collation"])?;
@@ -727,7 +743,7 @@ impl Driver for MongoDriver {
                     .run()
                     .map_err(read_error)?;
                 for value in values {
-                    rows.push(sink, doc! {"value": value})?;
+                    rows.push_document(sink, &doc! {"value": value})?;
                 }
                 rows.finish(sink, "value")?;
             }
@@ -738,12 +754,13 @@ impl Driver for MongoDriver {
                 )?;
                 options.max_time = Some(max_time);
                 let cursor = collection
+                    .clone_with_type::<RawDocumentBuf>()
                     .find(command.filter())
                     .with_options(options)
                     .run()
                     .map_err(read_error)?;
                 for document in cursor {
-                    rows.push(sink, document.map_err(read_error)?)?;
+                    rows.push(sink, &document.map_err(read_error)?)?;
                 }
                 rows.finish(sink, "_id")?;
             }
@@ -754,10 +771,11 @@ impl Driver for MongoDriver {
                 let cursor = collection
                     .aggregate(command.documents("pipeline"))
                     .with_options(options)
+                    .with_type::<RawDocumentBuf>()
                     .run()
                     .map_err(read_error)?;
                 for document in cursor {
-                    rows.push(sink, document.map_err(read_error)?)?;
+                    rows.push(sink, &document.map_err(read_error)?)?;
                 }
                 rows.finish(sink, "_id")?;
             }
@@ -824,7 +842,7 @@ impl Driver for MongoDriver {
         ))
     }
 
-    fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self, _deadline: Instant) -> Result<()> {
         Ok(())
     }
 
@@ -834,6 +852,14 @@ impl Driver for MongoDriver {
 
     fn in_transaction(&self) -> bool {
         false
+    }
+
+    fn verify(&mut self, _deadline: Instant) -> Result<()> {
+        self.db
+            .run_command(doc! {"ping": 1})
+            .run()
+            .map_err(super::connection_failed)?;
+        Ok(())
     }
 
     fn objects(
@@ -925,7 +951,7 @@ impl Driver for MongoDriver {
         for document in sample {
             sampled += 1;
             for (key, value) in document.map_err(read_error)? {
-                let kind = type_name(&value);
+                let kind = type_name(value.element_type()).into_owned();
                 match fields.iter_mut().find(|(name, _)| *name == key) {
                     None => fields.push((key, kind)),
                     Some((_, previous)) if previous == "null" => *previous = kind,

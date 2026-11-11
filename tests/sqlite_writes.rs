@@ -19,7 +19,7 @@ fn pipe_lines(
     session: &mut stateql::Session<'_>,
     lines: &[String],
     mode: PipeMode,
-) -> (i32, Vec<Value>) {
+) -> (u8, Vec<Value>) {
     let input = lines.join("\n");
     let mut output = Vec::new();
     let exit = session.pipe(input.as_bytes(), &mut output, mode).unwrap();
@@ -418,6 +418,35 @@ fn gate_errors_exit_with_code_five_and_the_documented_json() {
         "2",
     ]);
     assert_eq!(output.status.code(), Some(7));
+}
+
+#[test]
+fn atomic_pipe_rolls_back_when_stdin_breaks() {
+    let (home, target) = setup();
+    let db = home.file("app.db");
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, true));
+    let mut input = exec_json("INSERT INTO audit (note) VALUES ('a')", json!({})).into_bytes();
+    input.extend(b"\n\xff\n");
+    let mut output = Vec::new();
+    let exit = session
+        .pipe(input.as_slice(), &mut output, PipeMode::Atomic(None))
+        .unwrap();
+    let lines: Vec<Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_ne!(exit, 0);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["ok"], false);
+    assert_eq!(count(&db, "audit"), 0);
+    let receipt = ok(
+        &mut session,
+        &json!({"command":"receipt","handle":lines[0]["handle"]}).to_string(),
+    );
+    assert_eq!(receipt.status.as_deref(), Some("rolled_back"));
 }
 
 fn store(home: &Home) -> rusqlite::Connection {

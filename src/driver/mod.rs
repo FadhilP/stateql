@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,9 +67,17 @@ pub trait Driver {
     fn classify(&self, stmt: &Statement) -> Result<WriteKind>;
     fn execute(&mut self, stmt: &Statement, deadline: Instant) -> Result<u64>;
     fn begin(&mut self, isolation: Option<Isolation>) -> Result<()>;
-    fn commit(&mut self) -> Result<()>;
+    fn commit(&mut self, deadline: Instant) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
     fn in_transaction(&self) -> bool;
+    // connect must prove the server answers; drivers that connect lazily need one request for it.
+    fn verify(&mut self, _deadline: Instant) -> Result<()> {
+        Ok(())
+    }
+    // A driver may leave its last read open to save a round trip; this ends it before the caller waits.
+    fn close_read(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn objects(
         &mut self,
         query: &ObjectQuery,
@@ -103,7 +112,7 @@ pub trait Driver {
             return Err(row_count_mismatch(expected, affected));
         }
         if own_transaction {
-            self.commit()?;
+            self.commit(deadline)?;
         }
         Ok(affected)
     }
@@ -296,30 +305,50 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 pub fn format_date(days: i64) -> String {
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}")
+    let mut out = String::with_capacity(10);
+    write_date(&mut out, days);
+    out
 }
 
 pub fn format_time(micros: i64) -> String {
+    let mut out = String::with_capacity(15);
+    write_time(&mut out, micros);
+    out
+}
+
+// Each timestamp cell goes through here, so it writes into one buffer.
+pub fn format_timestamp(unix_micros: i64) -> String {
+    let mut out = String::with_capacity(32);
+    write_date(&mut out, unix_micros.div_euclid(86_400_000_000));
+    out.push('T');
+    write_time(&mut out, unix_micros.rem_euclid(86_400_000_000));
+    out
+}
+
+pub fn write_date(out: &mut String, days: i64) {
+    let (year, month, day) = civil_from_days(days);
+    let _ = write!(out, "{year:04}-{month:02}-{day:02}");
+}
+
+pub fn write_time(out: &mut String, micros: i64) {
     let seconds = micros.div_euclid(1_000_000);
-    let fraction = micros.rem_euclid(1_000_000);
-    let text = format!(
+    let _ = write!(
+        out,
         "{:02}:{:02}:{:02}",
         seconds / 3600,
         seconds / 60 % 60,
         seconds % 60
     );
+    let mut fraction = micros.rem_euclid(1_000_000);
     if fraction == 0 {
-        return text;
+        return;
     }
-    let digits = format!("{fraction:06}");
-    format!("{text}.{}", digits.trim_end_matches('0'))
-}
-
-pub fn format_timestamp(unix_micros: i64) -> String {
-    let days = unix_micros.div_euclid(86_400_000_000);
-    let micros = unix_micros.rem_euclid(86_400_000_000);
-    format!("{}T{}", format_date(days), format_time(micros))
+    let mut width = 6;
+    while fraction % 10 == 0 {
+        fraction /= 10;
+        width -= 1;
+    }
+    let _ = write!(out, ".{fraction:0width$}");
 }
 
 pub fn now_millis() -> i64 {

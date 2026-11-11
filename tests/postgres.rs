@@ -179,6 +179,83 @@ fn values_map_to_cells_and_keep_database_type_names() {
     assert_eq!(filtered.total, Some(1));
 }
 
+// A type lookup that runs while rows wait unread stalls the connection once its buffer is full.
+#[test]
+fn large_results_with_custom_types_finish() {
+    let Some(mut pg) = pg() else { return };
+    pg.admin
+        .batch_execute(&format!(
+            "SET search_path = {};
+             CREATE TYPE level AS ENUM ('low', 'high');
+             CREATE TABLE many AS SELECT g AS id, (CASE WHEN g % 2 = 0 THEN 'low' ELSE 'high' END)::level AS l
+             FROM generate_series(1, 100000) g;",
+            pg.schema
+        ))
+        .expect("custom type fixture");
+    let home = Home::new();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &pg.connect(false));
+    let response = ok(&mut session, &query_json("SELECT * FROM many"));
+    assert_eq!(response.total, Some(100_000));
+}
+
+#[test]
+fn filter_and_summarize_compare_numeric_as_numbers_and_keep_its_text() {
+    let Some(mut pg) = pg() else { return };
+    let sql = format!(
+        "INSERT INTO {}.users (name, score) VALUES ('Alan', 10.75)",
+        pg.schema
+    );
+    pg.admin.batch_execute(&sql).expect("insert");
+    let home = Home::new();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &pg.connect(false));
+    let response = ok(
+        &mut session,
+        &query_json("SELECT name, score FROM users ORDER BY id"),
+    );
+
+    let filtered = ok(
+        &mut session,
+        &json!({"command": "filter", "handle": response.handle, "predicate": "score > 7.5"})
+            .to_string(),
+    );
+    assert_eq!(
+        json!(filtered.rows),
+        json!([["Ada", "9.50"], ["Grace", "8.00"], ["Alan", "10.75"]])
+    );
+    let summary = ok(
+        &mut session,
+        &json!({"command": "summarize", "handle": response.handle}).to_string(),
+    );
+    assert_eq!(
+        summary.data["summary"][1],
+        json!({"name": "score", "type": "numeric", "nulls": 1, "distinct": 5, "min": "6.00", "max": "10.75"})
+    );
+
+    let special = ok(
+        &mut session,
+        &query_json(
+            "SELECT v FROM (VALUES ('0'::numeric), ('NaN'), ('-Infinity'), ('2.5')) AS t (v)",
+        ),
+    );
+    let filtered = ok(
+        &mut session,
+        &json!({"command": "filter", "handle": special.handle, "predicate": "v >= 0"}).to_string(),
+    );
+    assert_eq!(json!(filtered.rows), json!([["0"], ["NaN"], ["2.5"]]));
+    let summary = ok(
+        &mut session,
+        &json!({"command": "summarize", "handle": special.handle}).to_string(),
+    );
+    assert_eq!(
+        summary.data["summary"][0],
+        json!({"name": "v", "type": "numeric", "nulls": 0, "distinct": 4, "min": "-Infinity", "max": "NaN"})
+    );
+}
+
 #[test]
 fn unsupported_types_fail_with_a_cast_hint_and_leave_no_file() {
     let Some(pg) = pg() else { return };
@@ -410,6 +487,37 @@ fn reads_inside_an_atomic_pipe_see_its_writes_and_stay_read_only() {
 }
 
 #[test]
+fn reads_in_a_pipe_survive_a_failed_read_and_see_earlier_writes() {
+    let Some(mut pg) = pg() else { return };
+    let home = Home::new();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &pg.connect(true));
+    let lines = [
+        query_json("SELECT count(*) AS n FROM users"),
+        query_json("SELECT missing FROM users"),
+        query_json("SELECT count(*) AS n FROM users"),
+        exec_json("INSERT INTO audit (note) VALUES ('x')", json!({})),
+        query_json("SELECT count(*) AS n FROM audit"),
+    ]
+    .join("\n");
+    let mut output = Vec::new();
+    session
+        .pipe(lines.as_bytes(), &mut output, PipeMode::ContinueOnError)
+        .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    let values: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(values[0]["rows"], json!([[5]]), "{output}");
+    assert_eq!(values[1]["ok"], json!(false), "{output}");
+    assert_eq!(values[2]["rows"], json!([[5]]), "{output}");
+    assert_eq!(values[4]["rows"], json!([[1]]), "{output}");
+    assert_eq!(pg.count("audit"), 1);
+}
+
+#[test]
 fn params_bind_as_text_and_their_count_is_checked() {
     let Some(pg) = pg() else { return };
     let home = Home::new();
@@ -421,9 +529,23 @@ fn params_bind_as_text_and_their_count_is_checked() {
         &json!({"command": "query", "stmt": "SELECT id, name FROM users WHERE id < $1 AND name <> $2 AND $3::text IS NULL ORDER BY id", "params": [3, "Ada", null]}).to_string(),
     );
     assert_eq!(response.rows, Some(vec![vec![json!(2), json!("Grace")]]));
+    let empty = ok(
+        &mut session,
+        &json!({"command": "query", "stmt": "SELECT id, name FROM users WHERE id < $1", "params": [0]}).to_string(),
+    );
+    assert_eq!(
+        empty.columns,
+        Some(vec!["id".to_string(), "name".to_string()])
+    );
     expect_code(
         &mut session,
         &json!({"command": "query", "stmt": "SELECT $1::int AS n", "params": [1, 2]}).to_string(),
+        Code::InvalidCommand,
+    );
+    expect_code(
+        &mut session,
+        &json!({"command": "query", "stmt": "SELECT $1::int + $2::int AS n", "params": [1]})
+            .to_string(),
         Code::InvalidCommand,
     );
     expect_code(

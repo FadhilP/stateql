@@ -16,7 +16,6 @@ use crate::results::{RowSink, json_param};
 pub struct SqliteDriver {
     conn: Connection,
     read_only: bool,
-    in_transaction: bool,
 }
 
 impl SqliteDriver {
@@ -32,11 +31,7 @@ impl SqliteDriver {
             .map_err(super::connection_failed)?;
         conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
             .map_err(|error| super::connection_failed(format!("{}: {error}", path.display())))?;
-        Ok(SqliteDriver {
-            conn,
-            read_only,
-            in_transaction: false,
-        })
+        Ok(SqliteDriver { conn, read_only })
     }
 
     // query_only alone lets PRAGMA journal_mode rewrite the file, so reads also run under an authorizer.
@@ -225,27 +220,23 @@ impl Driver for SqliteDriver {
     fn begin(&mut self, _isolation: Option<Isolation>) -> Result<()> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|error| map_error(error, false))?;
-        self.in_transaction = true;
-        Ok(())
+            .map_err(|error| map_error(error, false))
     }
 
-    fn commit(&mut self) -> Result<()> {
-        self.in_transaction = false;
+    fn commit(&mut self, _deadline: Instant) -> Result<()> {
         self.conn
             .execute_batch("COMMIT")
             .map_err(|error| map_error(error, false))
     }
 
     fn rollback(&mut self) -> Result<()> {
-        self.in_transaction = false;
         self.conn
             .execute_batch("ROLLBACK")
             .map_err(|error| map_error(error, false))
     }
 
     fn in_transaction(&self) -> bool {
-        self.in_transaction
+        !self.conn.is_autocommit()
     }
 
     fn objects(

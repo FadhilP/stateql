@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -6,20 +7,32 @@ use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, OptsBuilder, Params, SslOpts, Value as MyValue};
 use serde_json::{Value, json};
 
-use super::{Cell, Column, Driver, ObjectQuery, Statement, WriteKind, format_time, remaining};
+use super::{Cell, Column, Driver, ObjectQuery, Statement, WriteKind, remaining, write_time};
 use crate::command::Isolation;
 use crate::error::{Code, Error, Executed, Result};
 use crate::guard::{self, Dialect};
 use crate::results::RowSink;
 
 const BINARY_CHARSET: u16 = 63;
+// The protocol maximum. The client value limits only the packets stql sends, and its statements are small.
+const MAX_PACKET_BYTES: usize = 1 << 30;
 const STATEMENTS_WITH_IMPLICIT_COMMIT: [&str; 5] =
     ["create", "alter", "drop", "truncate", "unparsed"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transaction {
+    Idle,
+    // The end of a finished read goes with the next batch, or the disconnect at exit ends the read.
+    OpenRead,
+    Atomic,
+}
 
 pub struct MysqlDriver {
     conn: Conn,
     read_only: bool,
-    in_transaction: bool,
+    transaction: Transaction,
+    // The session setup goes with the first batch, so it costs no round trip of its own.
+    setup: Option<String>,
 }
 
 impl MysqlDriver {
@@ -28,9 +41,9 @@ impl MysqlDriver {
         let opts = Opts::from_url(&url).map_err(super::connection_failed)?;
         let tls = ssl_opts(tls, opts.get_ssl_opts())?;
         let timeout = remaining(deadline)?;
-        let mut init = vec!["SET time_zone = '+00:00'"];
+        let mut setup = "SET time_zone = '+00:00'".to_string();
         if read_only {
-            init.push("SET SESSION transaction_read_only = ON");
+            setup.push_str(", SESSION transaction_read_only = ON");
         }
         let builder = OptsBuilder::from_opts(opts)
             .tcp_connect_timeout(Some(timeout))
@@ -38,14 +51,42 @@ impl MysqlDriver {
             .read_timeout(Some(timeout + Duration::from_secs(1)))
             .write_timeout(Some(timeout + Duration::from_secs(1)))
             .additional_capabilities(CapabilityFlags::CLIENT_FOUND_ROWS)
-            .ssl_opts(tls)
-            .init(init);
+            // Each saves work at connect: a query for the server value, and a second connection through the socket.
+            .max_allowed_packet(Some(MAX_PACKET_BYTES))
+            .prefer_socket(false)
+            .ssl_opts(tls);
         let conn = Conn::new(builder).map_err(super::connection_failed)?;
         Ok(MysqlDriver {
             conn,
             read_only,
-            in_transaction: false,
+            transaction: Transaction::Idle,
+            setup: Some(setup),
         })
+    }
+
+    fn batch(&mut self, sql: &str) -> mysql::Result<()> {
+        let end_read = if self.read_only {
+            "ROLLBACK"
+        } else {
+            "ROLLBACK; SET SESSION transaction_read_only = OFF"
+        };
+        let mut parts: Vec<&str> = self.setup.as_deref().into_iter().collect();
+        if self.transaction == Transaction::OpenRead {
+            parts.push(end_read);
+        }
+        if !sql.is_empty() {
+            parts.push(sql);
+        }
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let text = parts.join("; ");
+        run_all(&mut self.conn, &text)?;
+        self.setup = None;
+        if self.transaction == Transaction::OpenRead {
+            self.transaction = Transaction::Idle;
+        }
+        Ok(())
     }
 
     fn read_only_scope<T>(
@@ -54,32 +95,25 @@ impl MysqlDriver {
         work: impl FnOnce(&mut Conn) -> Result<T>,
     ) -> Result<T> {
         let timeout = remaining(deadline)?.as_millis();
-        let conn = &mut self.conn;
-        conn.query_drop(format!("SET SESSION max_execution_time = {timeout}"))
-            .map_err(read_error)?;
+        if self.transaction != Transaction::Atomic {
+            let opened = self.batch(&format!(
+                "SET SESSION max_execution_time = {timeout}, SESSION transaction_read_only = ON; START TRANSACTION READ ONLY"
+            ));
+            self.transaction = Transaction::OpenRead;
+            opened.map_err(read_error)?;
+            return finish_before(deadline, work(&mut self.conn));
+        }
         // MySQL has no read-only savepoint, so a read inside pipe --atomic undoes its own changes.
-        if self.in_transaction {
-            conn.query_drop("SAVEPOINT stql_read").map_err(read_error)?;
-            let result = finish_before(deadline, work(conn));
-            let closed = conn
-                .query_drop("ROLLBACK TO SAVEPOINT stql_read")
-                .and_then(|()| conn.query_drop("RELEASE SAVEPOINT stql_read"))
-                .map_err(read_error);
-            let value = result?;
-            closed?;
-            return Ok(value);
-        }
-        conn.query_drop("SET SESSION transaction_read_only = ON")
-            .map_err(read_error)?;
-        conn.query_drop("START TRANSACTION READ ONLY")
-            .map_err(read_error)?;
-        let result = finish_before(deadline, work(conn));
-        let mut closed = conn.query_drop("ROLLBACK").map_err(read_error);
-        if !self.read_only && closed.is_ok() {
-            closed = conn
-                .query_drop("SET SESSION transaction_read_only = OFF")
-                .map_err(read_error);
-        }
+        self.batch(&format!(
+            "SET SESSION max_execution_time = {timeout}; SAVEPOINT stql_read"
+        ))
+        .map_err(read_error)?;
+        let result = finish_before(deadline, work(&mut self.conn));
+        let closed = run_all(
+            &mut self.conn,
+            "ROLLBACK TO SAVEPOINT stql_read; RELEASE SAVEPOINT stql_read",
+        )
+        .map_err(read_error);
         let value = result?;
         closed?;
         Ok(value)
@@ -183,6 +217,17 @@ fn read_error(error: mysql::Error) -> Error {
         1064 | 1149 | 1295 => Error::new(Code::InvalidSql, db.message.clone()),
         _ => Error::query(db.message.clone()),
     }
+}
+
+// query_drop ignores the errors of every statement after the first.
+fn run_all(conn: &mut Conn, sql: &str) -> mysql::Result<()> {
+    let mut result = conn.query_iter(sql)?;
+    while let Some(set) = result.iter() {
+        for row in set {
+            row?;
+        }
+    }
+    Ok(())
 }
 
 // max_execution_time can end SLEEP or BENCHMARK with a normal value, and a socket timeout is a
@@ -316,29 +361,29 @@ fn decode(column: &mysql::Column, value: MyValue) -> Cell {
         MyValue::Float(float) => Cell::Real(float.to_string().parse().unwrap_or(f64::from(float))),
         MyValue::Double(double) => Cell::Real(double),
         MyValue::Date(year, month, day, hour, minute, second, micros) => {
-            let date = format!("{year:04}-{month:02}-{day:02}");
-            match column.column_type() {
-                MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => Cell::Text(date),
-                kind => {
-                    let zone = if matches!(kind, MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2) {
-                        "Z"
-                    } else {
-                        ""
-                    };
-                    let time = format_time(day_micros(u32::from(hour), minute, second, micros));
-                    Cell::Text(format!("{date}T{time}{zone}"))
+            let mut text = String::with_capacity(32);
+            let _ = write!(text, "{year:04}-{month:02}-{day:02}");
+            let kind = column.column_type();
+            if !matches!(kind, MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE) {
+                text.push('T');
+                write_time(
+                    &mut text,
+                    day_micros(u32::from(hour), minute, second, micros),
+                );
+                if matches!(kind, MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2) {
+                    text.push('Z');
                 }
             }
+            Cell::Text(text)
         }
         MyValue::Time(negative, days, hours, minutes, seconds, micros) => {
-            let sign = if negative { "-" } else { "" };
-            let time = format_time(day_micros(
-                days * 24 + u32::from(hours),
-                minutes,
-                seconds,
-                micros,
-            ));
-            Cell::Text(format!("{sign}{time}"))
+            let mut text = String::with_capacity(20);
+            if negative {
+                text.push('-');
+            }
+            let hours = days * 24 + u32::from(hours);
+            write_time(&mut text, day_micros(hours, minutes, seconds, micros));
+            Cell::Text(text)
         }
         MyValue::Bytes(bytes) if column.column_type() == MYSQL_TYPE_BIT => bit_value(&bytes),
         MyValue::Bytes(bytes) if column.column_type() == MYSQL_TYPE_JSON => {
@@ -425,7 +470,7 @@ impl Driver for MysqlDriver {
         guard::check_read(Dialect::Mysql, &stmt.text)?;
         // Inside pipe --atomic MySQL cannot make one statement read-only, and a savepoint does not undo
         // MyISAM writes, so a read there must parse and contain no write.
-        if self.in_transaction && guard::may_write(Dialect::Mysql, &stmt.text) {
+        if self.transaction == Transaction::Atomic && guard::may_write(Dialect::Mysql, &stmt.text) {
             return Err(super::read_only_error());
         }
         self.read_only_scope(deadline, |conn| {
@@ -440,7 +485,7 @@ impl Driver for MysqlDriver {
 
     fn execute(&mut self, stmt: &Statement, deadline: Instant) -> Result<u64> {
         remaining(deadline)?;
-        if self.in_transaction {
+        if self.transaction == Transaction::Atomic {
             let kind = self.classify(stmt)?;
             if STATEMENTS_WITH_IMPLICIT_COMMIT.contains(&kind.statement_type.as_str()) {
                 return Err(super::unsupported(
@@ -449,6 +494,7 @@ impl Driver for MysqlDriver {
                 .with_hint("run it with exec outside pipe --atomic and without --expect-rows"));
             }
         }
+        self.batch("").map_err(read_error)?;
         let prepared = self.conn.prep(&stmt.text).map_err(read_error)?;
         check_param_count(&prepared, &stmt.params)?;
         self.conn
@@ -464,30 +510,34 @@ impl Driver for MysqlDriver {
             Some(Isolation::RepeatableRead) => Some("REPEATABLE READ"),
             Some(Isolation::Serializable) => Some("SERIALIZABLE"),
         };
-        if let Some(level) = level {
-            self.conn
-                .query_drop(format!("SET TRANSACTION ISOLATION LEVEL {level}"))
-                .map_err(read_error)?;
-        }
-        self.conn
-            .query_drop("START TRANSACTION")
-            .map_err(read_error)?;
-        self.in_transaction = true;
+        let start = match level {
+            Some(level) => format!("SET TRANSACTION ISOLATION LEVEL {level}; START TRANSACTION"),
+            None => "START TRANSACTION".to_string(),
+        };
+        self.batch(&start).map_err(read_error)?;
+        self.transaction = Transaction::Atomic;
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<()> {
-        self.in_transaction = false;
+    fn commit(&mut self, _deadline: Instant) -> Result<()> {
+        self.transaction = Transaction::Idle;
         self.conn.query_drop("COMMIT").map_err(write_error)
     }
 
     fn rollback(&mut self) -> Result<()> {
-        self.in_transaction = false;
+        self.transaction = Transaction::Idle;
         self.conn.query_drop("ROLLBACK").map_err(read_error)
     }
 
     fn in_transaction(&self) -> bool {
-        self.in_transaction
+        self.transaction == Transaction::Atomic
+    }
+
+    fn close_read(&mut self) -> Result<()> {
+        if self.transaction != Transaction::OpenRead {
+            return Ok(());
+        }
+        self.batch("").map_err(read_error)
     }
 
     fn objects(

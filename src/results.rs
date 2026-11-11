@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::{self, JoinHandle};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -15,14 +18,63 @@ use crate::error::{Code, Error, Result};
 
 pub const DEFAULT_MAX_ROWS: u64 = 100_000;
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+// Above this result size, summarize sorts in temp files, so its memory stays small on any machine.
+const MEMORY_SORT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+// Each thread has its own page cache, so more threads cost memory for little time.
+const SUMMARIZE_MAX_THREADS: usize = 4;
 pub const MAX_CELL_CHARS: usize = 200;
 const MAX_INLINE_BYTES: usize = 150;
 
+const BATCH_ROWS: usize = 1024;
+
+enum Job {
+    Execute(String),
+    Insert(String, Vec<Vec<Cell>>),
+}
+
+// SQLite writes run on their own thread, so they overlap with reading rows from the database.
+struct Writer {
+    jobs: SyncSender<Job>,
+    thread: JoinHandle<rusqlite::Result<Connection>>,
+}
+
+impl Writer {
+    fn spawn(conn: Connection) -> Writer {
+        let (jobs, queue) = mpsc::sync_channel(4);
+        let thread = thread::spawn(move || write_jobs(conn, &queue));
+        Writer { jobs, thread }
+    }
+
+    fn join(self) -> Result<Connection> {
+        drop(self.jobs);
+        match self.thread.join() {
+            Ok(conn) => Ok(conn?),
+            Err(_) => Err(Error::internal("The result writer stopped.")),
+        }
+    }
+}
+
+fn write_jobs(conn: Connection, queue: &Receiver<Job>) -> rusqlite::Result<Connection> {
+    for job in queue {
+        match job {
+            Job::Execute(sql) => conn.execute_batch(&sql)?,
+            Job::Insert(sql, rows) => {
+                let mut statement = conn.prepare_cached(&sql)?;
+                for row in rows {
+                    statement.execute(params_from_iter(row.iter()))?;
+                }
+            }
+        }
+    }
+    Ok(conn)
+}
+
 pub struct RowSink {
-    conn: Option<Connection>,
+    writer: Option<Writer>,
     path: PathBuf,
     columns: Vec<Column>,
     insert_sql: String,
+    pending: Vec<Vec<Cell>>,
     total: u64,
     bytes: u64,
     max_rows: u64,
@@ -40,12 +92,12 @@ pub struct Finished {
 impl RowSink {
     pub fn create(path: PathBuf, max_rows: u64, preview_rows: usize) -> Result<RowSink> {
         File::create_new(&path)?;
-        let conn = Connection::open(&path)?;
-        let sink = RowSink {
-            conn: Some(conn),
+        let mut sink = RowSink {
+            writer: None,
             path,
             columns: Vec::new(),
             insert_sql: String::new(),
+            pending: Vec::with_capacity(BATCH_ROWS),
             total: 0,
             bytes: 0,
             max_rows,
@@ -53,19 +105,43 @@ impl RowSink {
             preview_rows,
         };
         crate::config::restrict_file(&sink.path)?;
-        let conn = sink.conn();
+        let conn = Connection::open(&sink.path)?;
         conn.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; BEGIN")?;
+        sink.writer = Some(Writer::spawn(conn));
         Ok(sink)
-    }
-
-    fn conn(&self) -> &Connection {
-        self.conn
-            .as_ref()
-            .expect("result connection stays open until finish")
     }
 
     pub fn total(&self) -> u64 {
         self.total
+    }
+
+    fn send(&mut self, job: Job) -> Result<()> {
+        let sent = self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.jobs.send(job).is_ok());
+        if sent {
+            return Ok(());
+        }
+        match self.stop_writer() {
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::internal("The result writer stopped.")),
+        }
+    }
+
+    fn stop_writer(&mut self) -> Result<Connection> {
+        match self.writer.take() {
+            Some(writer) => writer.join(),
+            None => Err(Error::internal("The result writer stopped.")),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::replace(&mut self.pending, Vec::with_capacity(BATCH_ROWS));
+        self.send(Job::Insert(self.insert_sql.clone(), rows))
     }
 
     pub fn add_column(&mut self, mut column: Column) -> Result<()> {
@@ -76,7 +152,9 @@ impl RowSink {
         } else {
             format!("ALTER TABLE r ADD COLUMN {quoted}")
         };
-        self.conn().execute_batch(&sql)?;
+        // Pending rows have the old column count, so they go before the new column.
+        self.flush()?;
+        self.send(Job::Execute(sql))?;
         self.columns.push(column);
         let placeholders = vec!["?"; self.columns.len()].join(", ");
         self.insert_sql = format!("INSERT INTO r VALUES ({placeholders})");
@@ -111,15 +189,13 @@ impl RowSink {
                     .with_hint("select fewer columns or add a LIMIT"),
             );
         }
-        let conn = self
-            .conn
-            .as_ref()
-            .expect("result connection stays open until finish");
-        conn.prepare_cached(&self.insert_sql)?
-            .execute(params_from_iter(row.iter()))?;
         self.total += 1;
         if self.preview.len() < self.preview_rows {
-            self.preview.push(row);
+            self.preview.push(row.clone());
+        }
+        self.pending.push(row);
+        if self.pending.len() >= BATCH_ROWS {
+            self.flush()?;
         }
         Ok(())
     }
@@ -128,10 +204,8 @@ impl RowSink {
         if self.columns.is_empty() {
             return Err(Error::query("The statement returned no columns."));
         }
-        let conn = self
-            .conn
-            .take()
-            .expect("result connection stays open until finish");
+        self.flush()?;
+        let conn = self.stop_writer()?;
         conn.execute_batch("COMMIT")?;
         conn.close().map_err(|(_, error)| error)?;
         let bytes = fs::metadata(&self.path)?.len();
@@ -152,7 +226,10 @@ impl RowSink {
 
 impl Drop for RowSink {
     fn drop(&mut self) {
-        drop(self.conn.take());
+        // Windows cannot delete the file while the writer holds it open.
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         if !self.path.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.path);
         }
@@ -218,6 +295,47 @@ fn select_list(columns: &[Column]) -> String {
         .join(", ")
 }
 
+// Exact decimals are stored as text, and SQLite orders all text after all numbers.
+fn is_decimal_text(column: &Column) -> bool {
+    matches!(
+        column.type_name.as_str(),
+        "numeric" | "decimal" | "decimal128" | "bigint unsigned"
+    )
+}
+
+fn compare_key(column: &Column) -> String {
+    let name = quote(&column.name);
+    if is_decimal_text(column) {
+        // CAST makes these words 0. PostgreSQL sorts NaN above all numbers, so it compares as infinity.
+        // The outer CAST keeps numeric affinity, so a quoted number in a predicate compares as a number.
+        return format!(
+            "CAST(CASE {name} WHEN 'NaN' THEN '9e999' WHEN 'Infinity' THEN '9e999' \
+             WHEN '-Infinity' THEN '-9e999' ELSE {name} END AS NUMERIC)"
+        );
+    }
+    name
+}
+
+// A column named rowid hides the row id, so this picks a name for it that no column has.
+fn row_id(columns: &[Column]) -> &'static str {
+    ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|alias| {
+            !columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(alias))
+        })
+        .unwrap_or("rowid")
+}
+
+fn compare_list(columns: &[Column]) -> String {
+    columns
+        .iter()
+        .map(|column| format!("{} AS {}", compare_key(column), quote(&column.name)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn read_page(
     path: &Path,
     columns: &[Column],
@@ -228,8 +346,9 @@ pub fn read_page(
         return Ok(Vec::new());
     }
     let conn = open_read(path)?;
+    let id = row_id(columns);
     let sql = format!(
-        "SELECT {} FROM r WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+        "SELECT {} FROM r WHERE {id} > ?1 ORDER BY {id} LIMIT ?2",
         select_list(columns)
     );
     let mut statement = conn.prepare(&sql)?;
@@ -315,8 +434,13 @@ fn fill_filtered(
     ))?;
     conn.execute("ATTACH DATABASE ?1 AS src", [sqlite_uri(source)])?;
     conn.authorizer(Some(filter_authorizer))?;
-    let sql =
-        format!("INSERT INTO main.r SELECT {names} FROM src.r WHERE ({predicate}) ORDER BY rowid");
+    // The predicate sees decimals as numbers; the copied rows keep their exact text.
+    let compared = compare_list(columns);
+    let id = row_id(columns);
+    let sql = format!(
+        "INSERT INTO main.r SELECT {names} FROM src.r WHERE {id} IN \
+         (SELECT {id} FROM (SELECT {id} AS {id}, {compared} FROM src.r) WHERE ({predicate})) ORDER BY {id}"
+    );
     let mut statement = conn.prepare(&sql).map_err(filter_error)?;
     let values = params.iter().map(json_param).collect::<Vec<_>>();
     let inserted = statement
@@ -389,26 +513,76 @@ pub fn json_param(value: &Value) -> Cell {
     }
 }
 
+// Each column is a full scan with its own DISTINCT sort, so threads take the next column until none is left.
 pub fn summarize(path: &Path, columns: &[Column]) -> Result<Vec<Value>> {
-    let conn = open_read(path)?;
-    columns
-        .iter()
-        .map(|column| {
-            let name = quote(&column.name);
-            let sql = format!("SELECT count(*) - count({name}), count(DISTINCT {name}), min({name}), max({name}) FROM r");
-            let (nulls, distinct, min, max) = conn.query_row(&sql, [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Cell>(2)?, row.get::<_, Cell>(3)?))
-            })?;
-            Ok(json!({
-                "name": column.name,
-                "type": column.type_name,
-                "nulls": nulls,
-                "distinct": distinct,
-                "min": cell_json(&min, column, MAX_CELL_CHARS),
-                "max": cell_json(&max, column, MAX_CELL_CHARS),
-            }))
-        })
-        .collect()
+    let temp_store = if fs::metadata(path)?.len() <= MEMORY_SORT_MAX_BYTES {
+        "MEMORY"
+    } else {
+        "DEFAULT"
+    };
+    let threads = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(SUMMARIZE_MAX_THREADS)
+        .min(columns.len());
+    let next = AtomicUsize::new(0);
+    let take_columns = || -> Result<Vec<(usize, Value)>> {
+        let conn = open_read(path)?;
+        conn.pragma_update(None, "temp_store", temp_store)?;
+        let mut done = Vec::new();
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(column) = columns.get(index) else {
+                return Ok(done);
+            };
+            done.push((index, summarize_column(&conn, column)?));
+        }
+    };
+    let mut summary = thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads).map(|_| scope.spawn(take_columns)).collect();
+        let mut summary = Vec::with_capacity(columns.len());
+        for worker in workers {
+            let part = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            summary.extend(part);
+        }
+        Ok::<_, Error>(summary)
+    })?;
+    summary.sort_unstable_by_key(|(index, _)| *index);
+    Ok(summary.into_iter().map(|(_, value)| value).collect())
+}
+
+fn summarize_column(conn: &Connection, column: &Column) -> Result<Value> {
+    let name = quote(&column.name);
+    let key = compare_key(column);
+    let (min, max) = if is_decimal_text(column) {
+        let extreme = |order| {
+            format!(
+                "(SELECT {name} FROM r WHERE {name} IS NOT NULL ORDER BY {key} {order} LIMIT 1)"
+            )
+        };
+        (extreme("ASC"), extreme("DESC"))
+    } else {
+        (format!("min({name})"), format!("max({name})"))
+    };
+    let sql =
+        format!("SELECT count(*) - count({name}), count(DISTINCT {key}), {min}, {max} FROM r");
+    let (nulls, distinct, min, max) = conn.query_row(&sql, [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Cell>(2)?,
+            row.get::<_, Cell>(3)?,
+        ))
+    })?;
+    Ok(json!({
+        "name": column.name,
+        "type": column.type_name,
+        "nulls": nulls,
+        "distinct": distinct,
+        "min": cell_json(&min, column, MAX_CELL_CHARS),
+        "max": cell_json(&max, column, MAX_CELL_CHARS),
+    }))
 }
 
 pub fn export(path: &Path, columns: &[Column], output: &Path, format: ExportFormat) -> Result<u64> {
@@ -434,8 +608,9 @@ fn write_export(
 ) -> Result<u64> {
     let conn = open_read(path)?;
     let mut statement = conn.prepare(&format!(
-        "SELECT {} FROM r ORDER BY rowid",
-        select_list(columns)
+        "SELECT {} FROM r ORDER BY {}",
+        select_list(columns),
+        row_id(columns)
     ))?;
     let mut rows = statement.query([])?;
     let mut count = 0;

@@ -32,6 +32,7 @@ pub struct Response {
 }
 
 impl Response {
+    // The output contract leaves out nulls and false flags, so a missing flag means false.
     pub fn with(mut self, key: &str, value: impl Serialize) -> Self {
         let value = json!(value);
         let omitted = matches!(value, Value::Null | Value::Bool(false));

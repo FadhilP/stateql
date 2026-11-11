@@ -385,6 +385,28 @@ fn caps_overflow_deletes_the_partial_result_file() {
 }
 
 #[test]
+fn a_column_named_rowid_does_not_change_which_rows_filter_and_rows_return() {
+    let (home, target) = setup();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, false));
+    ok(
+        &mut session,
+        r#"{"command":"query","stmt":"SELECT 1 AS rowid, 1 AS x UNION ALL SELECT 1, 2 UNION ALL SELECT 2, 3","as":"ids"}"#,
+    );
+    let filtered = ok(
+        &mut session,
+        r#"{"command":"filter","handle":"ids","predicate":"x = 1"}"#,
+    );
+    assert_eq!(json!(filtered.rows), json!([[1, 1]]));
+    let page = ok(
+        &mut session,
+        r#"{"command":"rows","handle":"ids","offset":1,"limit":2}"#,
+    );
+    assert_eq!(json!(page.rows), json!([[1, 2], [2, 3]]));
+}
+
+#[test]
 fn summarize_and_export_read_the_stored_rows() {
     let (home, target) = setup();
     let engine = home.engine();
