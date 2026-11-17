@@ -54,12 +54,16 @@ pub enum Profile {
     Url {
         url: String,
         read_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Env {
         env: String,
         read_only: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 
@@ -67,6 +71,12 @@ impl Profile {
     pub fn read_only(&self) -> bool {
         match self {
             Profile::Url { read_only, .. } | Profile::Env { read_only, .. } => *read_only,
+        }
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Profile::Url { note, .. } | Profile::Env { note, .. } => note.as_deref(),
         }
     }
 }

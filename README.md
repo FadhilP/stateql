@@ -154,9 +154,28 @@ prints 20):
 Method: Windows 11, Intel i7-12700, 32 GB RAM, release build. The servers run
 on `127.0.0.1`: PostgreSQL 18 (`psql -X -q -At`), MySQL 9.7 (`mysql -N -B`),
 SQLite 3.32 (`sqlite3`), MongoDB 6.0 (`mongosh` 2.14 with `--quiet
---json=relaxed`), and Redis 7.0 in WSL 2 (`redis-cli`, timed inside WSL).
+--json=relaxed`).
 "Remote" sends PostgreSQL through a proxy that adds about 60 ms to each round
 trip. Each sequence runs 3 to 10 times after one warm-up run.
+
+## Documentation
+
+- [CLI reference](docs/cli.md): every command, option, output field, and exit code.
+- [Architecture](docs/architecture.md): the store, result files, read guards, the write flow, deadlines, and credentials.
+
+## Development
+
+```bash
+cargo build
+cargo test                                   # SQLite and CLI tests always run
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all
+```
+
+The PostgreSQL, MySQL, MongoDB, and Redis tests run only when
+`STQL_TEST_POSTGRES_URL`, `STQL_TEST_MYSQL_URL`, `STQL_TEST_MONGODB_URL`, or
+`STQL_TEST_REDIS_URL` is set. `STQL_TEST_REQUIRE` (a comma-separated list of
+these names) makes a test fail instead of skip when its variable is not set.
 
 ## License
 

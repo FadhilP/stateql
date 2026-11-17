@@ -31,7 +31,10 @@ fn main() -> ExitCode {
     };
     session.set_timeout(Duration::from_millis(cli.timeout_ms));
     stateql::spawn_watchdog();
-    let notice = engine.migration_notice().map(str::to_string);
+    let notice = join_notices(
+        engine.migration_notice().map(str::to_string),
+        git_bash_notice(&cli.command),
+    );
     let command = match &cli.profile {
         None => cli.command,
         Some(profile) => match session.with_profile(profile, cli.command) {
@@ -62,6 +65,37 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => finish(&Err(error), false),
     }
+}
+
+fn join_notices(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first} {second}")),
+        (first, second) => first.or(second),
+    }
+}
+
+// Git Bash rewrites an argument that starts with / (for example /v1/users) into a Windows path
+// before stql starts, so the query silently gets another value.
+fn git_bash_notice(command: &Command) -> Option<String> {
+    std::env::var_os("MSYSTEM")?;
+    let params = match command {
+        Command::Query { param, .. }
+        | Command::Exec { param, .. }
+        | Command::Filter { param, .. } => param,
+        _ => return None,
+    };
+    let converted = params.iter().find(|value| has_drive_path(value))?;
+    Some(format!(
+        "--param \"{converted}\" looks like a path that Git Bash converted from a value that starts with /. If you meant the value with /, pass it as --params '[\"/...\"]'."
+    ))
+}
+
+fn has_drive_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(3).enumerate().any(|(start, window)| {
+        let starts_word = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        starts_word && window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'/'
+    })
 }
 
 const REMOVED_NAMES: [(&str, &str); 6] = [

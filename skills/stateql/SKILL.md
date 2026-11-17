@@ -20,8 +20,9 @@ install it yourself.
    the `default` session.
 2. Connect read-only (the default). Use `--read-write` only when the user asked
    for a change.
-3. Do not cut the output with `head -c` or `cut -c`. That makes the JSON
-   invalid. Use `--max-bytes`, `--preview-rows`, or `--columns`.
+3. Do not cut the output with `head`, `head -c`, or `cut -c`. That makes the
+   JSON invalid. Use `--preview-rows`, `--max-bytes` (on `query`, `rows`, and
+   `filter`), or `--columns` (on `rows`). `describe` has no `--max-bytes`.
 4. Do not add `--allow-destructive`, `--allow-unbounded`, or `--replay` unless
    the user approved that operation. These flags are approvals, not fixes.
 5. Do not put a password in a command. `stql` rejects a URL that contains a
@@ -29,6 +30,11 @@ install it yourself.
    a profile.
 6. Give values as parameters (`--param`, `--params`). Do not build SQL strings.
 7. Do not run a query again to see more rows. Use its handle.
+8. Protect shared databases. Read the `note` of a profile (`stql profile list`)
+   before you use it, and obey it. On a large table, filter on an indexed
+   column (see `describe`) and a short time range, and check the plan with
+   `EXPLAIN` first. If a query passes its deadline, make it smaller. Do not
+   raise `--timeout-ms` above 120000 unless the user agrees.
 
 ## Connect
 
@@ -39,7 +45,7 @@ stql connect --env DATABASE_URL              # postgres://, mysql://, mongodb://
 stql connect --env DATABASE_URL --read-write # only for changes that the user asked for
 stql connect <profile>                       # a saved profile, in the mode that it was saved with
 stql connect <profile> --read-only           # read-only, also for a profile saved with --read-write
-stql --profile <profile> query 'SELECT 1'    # connects first, so you do not need a separate connect
+stql --profile <profile> query 'SELECT 1'    # connects first, so you do not need a separate connect (-p is short for --profile)
 ```
 
 `--profile NAME` works before any command, also before `pipe`. If the session
@@ -54,7 +60,12 @@ Profiles are in `profiles.toml` in the `stql` home directory.
 - `stql profile add <name> '<URL without password>' --ask-password`: the user
   types the password in a dialog. The password goes to the OS keyring. You do
   not see it. Use this command only when the user asks for it.
-- `stql profile list` and `stql profile remove <name>`.
+- `stql profile list` (also `stql profile` or `stql profiles`): each
+  profile with its URL without the query options, `read_only`, and `note`.
+  `stql profile remove <name>` removes one.
+- `--note TEXT` on `profile add` saves a note, for example
+  `production replica: keep queries narrow`. `connect` shows it as `note`,
+  and `--profile` shows it as `notice` when it connects.
 
 TLS for PostgreSQL (`sslmode`) and MySQL (`ssl-mode`) in the URL:
 
@@ -83,7 +94,9 @@ when they need the database.
    `collection`, `view`; Redis `key`).
 2. Read the shape: `stql describe orders` (columns, keys, indexes, and DDL).
    A column shows `nullable:false`, `default`, and `primary_key:true` only
-   when they apply. An index shows `unique:true` only when it is unique.
+   when they apply. An index shows `unique:true` only when it is unique. A
+   PostgreSQL index `definition` starts at the access method:
+   `btree (created_at)`.
 3. Query only the columns that you need:
    `stql query 'SELECT id, total FROM orders WHERE status = $1' --param paid`
 4. Read the response (see below). `total` is the full row count, so you do not
@@ -109,7 +122,8 @@ Notes for `filter`:
   above 2^63 are stored as exact strings (`"7.50"`). Use
   `CAST(column AS REAL)` to compare them as numbers.
 
-`query --preview-rows N` (0 to 200, default 20) sets the preview size.
+`query --preview-rows N` and `filter --preview-rows N` (0 to 200, default 20)
+set the preview size.
 `query --as NAME` gives the result a name. Use the name in place of the handle.
 
 `query`, `rows`, and `filter` also take these options. They change only the
@@ -148,8 +162,11 @@ output of that call, not the stored result:
   `::a.b.c.d` shows as hex words). For another type that
   `stql` cannot read, cast the column with `::text`.
 - Null fields and `false` flags are not in the output.
-- `notice` (also inside `error`) is a one-time message, for example about the
-  profiles that `stql` copied from its TypeScript version. Tell the user.
+- `notice` (also inside `error`) is a message for this call. Read it every
+  time. It can be the note of a profile that `--profile` connected (obey it),
+  a warning that Git Bash changed a `--param` (see below), or the one-time
+  report about the profiles that `stql` copied from its TypeScript version
+  (tell the user).
 - `--text` prints a table for people. Do not parse it.
 
 ## Placeholders and shell quoting
@@ -163,8 +180,16 @@ output of that call, not the stored result:
 - Put SQL in single quotes. In bash and PowerShell, `"$1"` becomes an empty
   string and breaks the query.
 - For long SQL, or SQL with quotes, write it to a file and use `--file query.sql`.
-  `--file -` reads standard input. This works for `query` and `exec`. Git Bash
-  paths (`/c/work/q.sql`) work; you do not need `cygpath`.
+  `--file -` reads standard input. This works for `query` and `exec`.
+- **Git Bash on Windows** changes each argument that starts with `/` into a
+  Windows path before `stql` starts. `--param '/v1/users'` becomes
+  `C:/Program Files/Git/v1/users`, and `'%/v1/%'` changes too. The query then
+  gets a different value and returns wrong rows, with no error. `stql` adds a
+  `notice` when a `--param` looks converted. Give such values in a JSON array,
+  which Git Bash does not change: `--params '["/v1/users"]'`. Do not set
+  `MSYS_NO_PATHCONV=1`: then file paths such as `--file /tmp/q.sql` are not
+  converted, and `stql` cannot find the file. Paths such as `/tmp/q.sql` and
+  `/c/work/q.sql` work because Git Bash converts them.
 - `--params '[1, "Ada", null]'` binds typed JSON values. `--param` binds strings.
 - PostgreSQL: `interval $1` is not valid. Write `$1::interval`.
 - PostgreSQL array parameter: `--param '{a,b}'` with `= ANY($1::text[])`.
@@ -195,17 +220,19 @@ time before the first line.
 {"ok":false,"error":{"code":"UNBOUNDED_MUTATION","message":"This update has no row filter.","retryable":false,"executed":false,"hint":"--allow-unbounded"}}
 ```
 
-Retry only when `retryable` is `true`. `executed` is `false` (nothing ran),
-`true`, or `"unknown"`. Read `hint` first. For a missing column or table, it
-gives the database suggestion, or the `describe` or `objects` command to run.
+Retry only when `retryable` is `true`, and at most one time. `executed` is
+`false` (nothing ran), `true`, or `"unknown"`. Read `hint` first. For a missing
+table, it names the closest table or view when one is near
+(`did you mean users? ...`). For a missing column, it gives the database
+suggestion, or the `describe` command to run.
 
 | Code (exit) | What to do |
 | --- | --- |
 | `INVALID_COMMAND`, `INVALID_SQL` (2) | Fix the command or the SQL. Check the placeholder style. |
-| `CONNECTION_FAILED`, `NOT_CONNECTED` (3) | Check `stql status`, the URL variable, and the network. `hint` lists the saved profiles. |
+| `CONNECTION_FAILED`, `NOT_CONNECTED` (3) | Check `stql status`, the URL variable, and the network. `hint` lists the saved profiles. If the server does not answer, tell the user. Do not retry in a loop. |
 | `CREDENTIAL_MISSING`, `CREDENTIAL_MISMATCH` (3) | The saved password is missing, or it is for a different host or user. Tell the user. |
 | `QUERY_FAILED` (4) | Read the database message (missing table, type error). |
-| `DEADLINE_EXCEEDED` (4) | The default limit is 30000 ms. Make the query smaller, or raise `--timeout-ms`. |
+| `DEADLINE_EXCEEDED` (4) | The default limit is 30000 ms. Make the query smaller first: an indexed filter, a shorter range, or `EXPLAIN` to find the slow part. Raise `--timeout-ms` only after that (see rule 8). |
 | `READ_ONLY` (5) | `query` runs only reads; use `exec`. On a read-only connection, ask the user before you connect with `--read-write`. |
 | `UNBOUNDED_MUTATION`, `DESTRUCTIVE_OPERATION` (5) | Show the statement to the user. Add the flag in `hint` only after approval. |
 | `OUTCOME_UNKNOWN` (6) | The write may have run. Query the data first. See [reference/writes.md](reference/writes.md). |

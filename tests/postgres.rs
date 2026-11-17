@@ -640,7 +640,9 @@ fn statement_timeout_cancels_slow_reads_and_writes() {
     assert_eq!(error.executed, Executed::No);
     assert_eq!(
         error.hint.as_deref(),
-        Some("--timeout-ms is 1500; raise it or narrow the query")
+        Some(
+            "--timeout-ms is 1500; narrow the query first (an indexed filter or a shorter range; check with EXPLAIN), then raise it"
+        )
     );
     let error = expect_code(
         &mut session,
@@ -706,13 +708,13 @@ fn catalog_lists_objects_and_describes_tables_and_views() {
         json!([{"name": "users_pkey", "type": "PRIMARY KEY"}]),
         "NOT NULL columns are not listed as CHECK constraints"
     );
-    let indexes: Vec<&str> = value["indexes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|index| index["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(indexes, ["users_pkey", "users_status"]);
+    assert_eq!(
+        value["indexes"],
+        json!([
+            {"name": "users_pkey", "definition": "btree (id)", "unique": true},
+            {"name": "users_status", "definition": "btree (status)"}
+        ])
+    );
 
     let view = ok(
         &mut session,

@@ -2,8 +2,7 @@ name: Check
 
 on:
   push:
-    tags-ignore:
-      - "**"
+    branches: [main]
   pull_request:
 
 permissions:
@@ -16,20 +15,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo build --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in step with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
   postgres:
     name: PostgreSQL ${{ matrix.postgres }} integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -52,13 +61,14 @@ jobs:
       STQL_TEST_POSTGRES_URL: postgresql://stql_ci:stql_ci_password@127.0.0.1:5432/stql_ci?sslmode=disable
       STQL_TEST_REQUIRE: STQL_TEST_POSTGRES_URL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --test postgres
 
   mysql:
     name: MySQL integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       mysql:
         image: mysql:8.4
@@ -78,18 +88,19 @@ jobs:
       STQL_TEST_MYSQL_URL: mysql://stql_ci:stql_ci_password@127.0.0.1:3306/stql_ci
       STQL_TEST_REQUIRE: STQL_TEST_MYSQL_URL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --test mysql
 
   mongodb:
     name: MongoDB integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       STQL_TEST_MONGODB_URL: mongodb://127.0.0.1:27017/stql_ci?replicaSet=rs0&directConnection=true
       STQL_TEST_REQUIRE: STQL_TEST_MONGODB_URL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Transactions need a replica set, which service containers cannot initiate.
       - name: Start a single-node MongoDB replica set
         run: |
@@ -105,11 +116,12 @@ jobs:
           done
           exit 1
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --test mongo
 
   redis:
     name: Redis integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       redis:
         image: redis:7
@@ -124,6 +136,7 @@ jobs:
       STQL_TEST_REDIS_URL: redis://127.0.0.1:6379
       STQL_TEST_REQUIRE: STQL_TEST_REDIS_URL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --test redis

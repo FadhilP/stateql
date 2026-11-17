@@ -25,6 +25,7 @@ pub struct Cli {
     )]
     pub text: bool,
     #[arg(
+        short,
         long,
         global = true,
         value_name = "NAME",
@@ -95,11 +96,14 @@ pub enum Command {
         #[serde(default)]
         all: bool,
     },
-    #[command(about = "Manage saved connection profiles")]
+    #[command(
+        about = "Manage saved connection profiles (no action lists them)",
+        visible_alias = "profiles"
+    )]
     #[serde(skip)]
     Profile {
         #[command(subcommand)]
-        action: ProfileCommand,
+        action: Option<ProfileCommand>,
     },
     #[command(about = "Run a read, store the full result, and return a preview and a handle")]
     Query {
@@ -224,6 +228,8 @@ pub enum Command {
         #[arg(long = "as", value_name = "NAME", help = "Name the new result")]
         #[serde(rename = "as")]
         name: Option<String>,
+        #[arg(long, value_name = "N", help = "Rows in the preview (default 20)")]
+        preview_rows: Option<u64>,
         #[arg(long, value_name = "N", help = CELL_HELP)]
         max_cell_characters: Option<usize>,
         #[arg(long, value_name = "N", help = BYTES_HELP)]
@@ -314,6 +320,12 @@ pub enum ProfileCommand {
         ask_password: bool,
         #[arg(long, help = "Connect read-write by default")]
         read_write: bool,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "A note that profile list and connect show, for example \"production: keep queries narrow\""
+        )]
+        note: Option<String>,
         #[arg(long, help = "Replace an existing profile")]
         force: bool,
     },

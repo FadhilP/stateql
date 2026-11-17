@@ -943,11 +943,23 @@ impl Driver for PostgresDriver {
                 row[3].as_deref(),
                 row[4].as_deref() == Some("true"),
             )).collect::<Vec<_>>(),
-            "indexes": indexes.iter().map(|row| json!({"name": row[0], "definition": row[1]})).collect::<Vec<_>>(),
+            "indexes": indexes.iter().map(|row| index_json(row[0].as_deref(), row[1].as_deref().unwrap_or_default())).collect::<Vec<_>>(),
             "constraints": constraints.iter().map(|row| json!({"name": row[0], "type": row[1]})).collect::<Vec<_>>(),
             "ddl": ddl,
         }))
     }
+}
+
+// pg_indexes repeats the index and table names; the part after USING is what tells indexes apart.
+fn index_json(name: Option<&str>, definition: &str) -> Value {
+    let short = definition
+        .split_once(" USING ")
+        .map_or(definition, |(_, rest)| rest);
+    let mut index = json!({"name": name, "definition": short});
+    if definition.starts_with("CREATE UNIQUE ") {
+        index["unique"] = json!(true);
+    }
+    index
 }
 
 #[cfg(test)]

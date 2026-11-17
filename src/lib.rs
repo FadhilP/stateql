@@ -66,7 +66,7 @@ fn arm_watchdog(armed: Option<(Instant, Duration)>) {
 
 fn timeout_hint(timeout: Duration) -> String {
     format!(
-        "--timeout-ms is {}; raise it or narrow the query",
+        "--timeout-ms is {}; narrow the query first (an indexed filter or a shorter range; check with EXPLAIN), then raise it",
         timeout.as_millis()
     )
 }
@@ -148,16 +148,19 @@ impl Session<'_> {
 
     // The next response or error carries the notice, so stderr stays empty.
     pub fn set_notice(&mut self, notice: Option<String>) {
-        self.notice = notice;
+        self.notice = match (self.notice.take(), notice) {
+            (Some(earlier), Some(notice)) => Some(format!("{earlier} {notice}")),
+            (earlier, notice) => earlier.or(notice),
+        };
     }
 
     // Applies the global --profile option before the command runs.
     pub fn with_profile(&mut self, profile: &str, command: Command) -> Result<Command> {
         let profiles = config::load_profiles(&self.engine.home)?;
-        if !profiles.profiles.contains_key(profile) {
+        let Some(saved) = profiles.profiles.get(profile) else {
             return Err(Error::invalid(format!("No profile named \"{profile}\"."))
                 .with_hint(connect_hint(&profiles)));
-        }
+        };
         match command {
             Command::Connect {
                 target: None,
@@ -186,6 +189,11 @@ impl Session<'_> {
                         read_write: false,
                         read_only: false,
                     })?;
+                    self.set_notice(
+                        saved
+                            .note()
+                            .map(|note| format!("Profile {profile}: {note}")),
+                    );
                 }
                 Ok(command)
             }
@@ -247,9 +255,11 @@ impl Session<'_> {
             }
             Command::Disconnect {} => self.disconnect(),
             Command::Status { all } => self.status(all),
-            Command::Profile { action } => {
-                secret::profile_command(&self.engine.home, &self.engine.keyring_service, action)
-            }
+            Command::Profile { action } => secret::profile_command(
+                &self.engine.home,
+                &self.engine.keyring_service,
+                action.unwrap_or(ProfileCommand::List),
+            ),
             Command::Query {
                 stmt,
                 param,
@@ -310,12 +320,13 @@ impl Session<'_> {
                 param,
                 params,
                 name,
+                preview_rows,
                 max_cell_characters,
                 max_bytes,
             } => {
                 let params = merge_params(param, params)?;
                 let limits = PageLimits::new(max_cell_characters, max_bytes);
-                self.filter(&handle, &predicate, &params, name, limits)
+                self.filter(&handle, &predicate, &params, name, preview_rows, limits)
             }
             Command::Summarize { handle } => self.summarize(&handle),
             Command::Export {
@@ -358,11 +369,15 @@ impl Session<'_> {
             return Err(Error::invalid("connect cannot run inside pipe --atomic."));
         }
         let profiles = config::load_profiles(&self.engine.home)?;
-        let (source, default_read_only) = match (target, env) {
-            (None, Some(var)) => (Source::Env(var), true),
+        let (source, default_read_only, note) = match (target, env) {
+            (None, Some(var)) => (Source::Env(var), true, None),
             (Some(target), None) => match profiles.profiles.get(&target) {
-                Some(profile) => (Source::Profile(target), profile.read_only()),
-                None => (Source::Target(normalize_target(&target)?), true),
+                Some(profile) => (
+                    Source::Profile(target),
+                    profile.read_only(),
+                    profile.note().map(str::to_string),
+                ),
+                None => (Source::Target(normalize_target(&target)?), true, None),
             },
             _ => {
                 return Err(Error::invalid(
@@ -379,7 +394,8 @@ impl Session<'_> {
             .with("session", &self.name)
             .with("target", &connection.identity)
             .with("backend", connection.backend.name())
-            .with("read_only", read_only);
+            .with("read_only", read_only)
+            .with("note", note);
         self.connection = Some(connection);
         Ok(response)
     }
@@ -413,7 +429,18 @@ impl Session<'_> {
             }
         };
         let backend = Backend::of(&url);
-        let driver = driver::open(&url, read_only, deadline)?;
+        let driver = driver::open(&url, read_only, deadline).map_err(|error| {
+            let unreachable_server = error.code == Code::ConnectionFailed
+                && error.hint.is_none()
+                && backend != Backend::Sqlite;
+            if unreachable_server {
+                error.with_hint(
+                    "the server may be off or unreachable; tell the user instead of retrying in a loop",
+                )
+            } else {
+                error
+            }
+        })?;
         Ok(Connection {
             driver,
             backend,
@@ -505,9 +532,7 @@ impl Session<'_> {
         deadline: Instant,
     ) -> Result<Response> {
         check_result_name(name.as_deref())?;
-        let preview = preview_rows
-            .unwrap_or(DEFAULT_PREVIEW_ROWS)
-            .min(MAX_PREVIEW_ROWS);
+        let preview = preview_limit(preview_rows);
         let id = new_id('r');
         let mut sink = RowSink::create(
             self.store.result_path(&id),
@@ -515,9 +540,64 @@ impl Session<'_> {
             preview as usize,
         )?;
         let connection = self.connection(deadline)?;
-        let next_cursor = connection.driver.read(stmt, &mut sink, deadline)?;
+        let next_cursor = match connection.driver.read(stmt, &mut sink, deadline) {
+            Ok(next_cursor) => next_cursor,
+            Err(error) => return Err(self.with_table_suggestion(error, deadline)),
+        };
         let source = connection.identity.clone();
         self.store_result(sink, id, name, source, next_cursor, limits)
+    }
+
+    // Best effort: when the catalog cannot be read, the error keeps its generic hint.
+    fn with_table_suggestion(&mut self, error: Error, deadline: Instant) -> Error {
+        let missing_table = error.hint.as_deref() == Some(driver::MISSING_TABLE_HINT);
+        if !missing_table || self.atomic.is_some() {
+            return error;
+        }
+        let Some(missing) = missing_name(&error.message) else {
+            return error;
+        };
+        let names = ["table", "view"]
+            .into_iter()
+            .filter_map(|kind| self.object_names(kind, deadline).ok())
+            .flatten();
+        match closest_name(&missing, names) {
+            Some(name) => error.with_hint(format!(
+                "did you mean {name}? ({})",
+                driver::MISSING_TABLE_HINT
+            )),
+            None => error,
+        }
+    }
+
+    fn object_names(&mut self, kind: &str, deadline: Instant) -> Result<Vec<String>> {
+        let path = self.store.result_path(&new_id('r'));
+        let mut sink = RowSink::create(path.clone(), MAX_PAGE_ROWS, MAX_PAGE_ROWS as usize)?;
+        let query = ObjectQuery {
+            kind: Some(kind.to_string()),
+            limit: MAX_PAGE_ROWS,
+            ..ObjectQuery::default()
+        };
+        let connection = self.connection(deadline)?;
+        let listed = connection.driver.objects(&query, &mut sink, deadline);
+        let finished = listed.and_then(|_| sink.finish());
+        let _ = fs::remove_file(&path);
+        let finished = finished?;
+        let Some(name_index) = finished
+            .columns
+            .iter()
+            .position(|column| column.name == "name")
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(finished
+            .preview
+            .into_iter()
+            .filter_map(|mut row| match row.swap_remove(name_index) {
+                driver::Cell::Text(name) => Some(name),
+                _ => None,
+            })
+            .collect())
     }
 
     fn store_result(
@@ -593,6 +673,7 @@ impl Session<'_> {
         predicate: &str,
         params: &[Value],
         name: Option<String>,
+        preview_rows: Option<u64>,
         limits: PageLimits,
     ) -> Result<Response> {
         check_result_name(name.as_deref())?;
@@ -621,7 +702,7 @@ impl Session<'_> {
             let _ = fs::remove_file(&path);
             return Err(error);
         }
-        let preview = results::read_page(&path, &meta.columns, 0, DEFAULT_PREVIEW_ROWS)?;
+        let preview = results::read_page(&path, &meta.columns, 0, preview_limit(preview_rows))?;
         let response = page(&meta, &meta.columns, &preview, 0, limits.cell_chars);
         Ok(fit_bytes(response, 0, limits.bytes))
     }
@@ -1132,6 +1213,49 @@ fn statement_head(command: &Command) -> Option<String> {
         end -= 1;
     }
     Some(text[..end].to_string())
+}
+
+// The table name in "relation \"x\" does not exist", "Table 'db.x' doesn't exist", or "no such table: x".
+fn missing_name(message: &str) -> Option<String> {
+    let name = match message.strip_prefix("no such table: ") {
+        Some(rest) => rest.split_whitespace().next()?,
+        None => ['"', '\''].into_iter().find_map(|quote| {
+            let (_, rest) = message.split_once(quote)?;
+            rest.split_once(quote).map(|(name, _)| name)
+        })?,
+    };
+    let name = name.rsplit_once('.').map_or(name, |(_, table)| table);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn closest_name(missing: &str, names: impl Iterator<Item = String>) -> Option<String> {
+    let missing = missing.to_lowercase();
+    let allowed = (missing.chars().count() / 4).max(2);
+    names
+        .map(|name| (edit_distance(&missing, &name.to_lowercase()), name))
+        .filter(|(distance, _)| *distance <= allowed)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, a_char) in a.chars().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, b_char) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(a_char != *b_char);
+            current.push(substitution.min(previous[j + 1] + 1).min(current[j] + 1));
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+fn preview_limit(preview_rows: Option<u64>) -> u64 {
+    preview_rows
+        .unwrap_or(DEFAULT_PREVIEW_ROWS)
+        .min(MAX_PREVIEW_ROWS)
 }
 
 fn merge_params(param: Vec<String>, params: Option<JsonArray>) -> Result<Vec<Value>> {

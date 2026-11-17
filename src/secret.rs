@@ -217,6 +217,7 @@ pub fn profile_command(home: &Path, service: &str, action: ProfileCommand) -> Re
             env_file,
             ask_password,
             read_write,
+            note,
             force,
         } => {
             let env_file = match env_file {
@@ -232,6 +233,7 @@ pub fn profile_command(home: &Path, service: &str, action: ProfileCommand) -> Re
                 env_file,
                 ask_password,
                 !read_write,
+                note,
                 force,
             )
         }
@@ -246,6 +248,12 @@ pub fn profile_command(home: &Path, service: &str, action: ProfileCommand) -> Re
                         (&mut listed, json!(profile))
                     {
                         listed.extend(fields);
+                    }
+                    // Long TLS options fill the list; connect still shows the full target.
+                    if let Profile::Url { url, .. } = profile
+                        && let Some((base, _)) = url.split_once('?')
+                    {
+                        listed["url"] = json!(base);
                     }
                     listed
                 })
@@ -281,6 +289,7 @@ fn add_profile(
     env_file: Option<String>,
     ask_password: bool,
     read_only: bool,
+    note: Option<String>,
     force: bool,
 ) -> Result<Response> {
     if !valid_profile_name(name) {
@@ -299,11 +308,13 @@ fn add_profile(
         (Some(url), None) => Profile::Url {
             url: profile_target(&url)?,
             read_only,
+            note,
         },
         (None, Some(env)) if valid_env_name(&env) => Profile::Env {
             env,
             read_only,
             env_file,
+            note,
         },
         (None, Some(_)) => {
             return Err(Error::invalid(
@@ -751,12 +762,17 @@ pub fn migrate_ts_profiles(home: &Path, service: &str) -> Result<Option<String>>
                 {
                     without_password.push(format!("{} ({reason})", row.name));
                 }
-                Profile::Url { url, read_only }
+                Profile::Url {
+                    url,
+                    read_only,
+                    note: None,
+                }
             }
             (None, Some(env), _) => Profile::Env {
                 env,
                 read_only,
                 env_file: None,
+                note: None,
             },
             _ => {
                 skipped.push(row.name);

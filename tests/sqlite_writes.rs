@@ -271,7 +271,9 @@ fn killed_writer_leaves_an_unknown_outcome_that_blocks_until_replay() {
     );
     assert_eq!(
         error.hint.as_deref(),
-        Some("--timeout-ms is 500; raise it or narrow the query")
+        Some(
+            "--timeout-ms is 500; narrow the query first (an indexed filter or a shorter range; check with EXPLAIN), then raise it"
+        )
     );
     assert_eq!(count(&db, "audit"), 1);
 }

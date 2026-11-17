@@ -221,7 +221,9 @@ fn a_commit_that_hangs_ends_at_the_watchdog_and_reads_as_unknown() {
     );
     assert_eq!(
         lines[1]["error"]["hint"],
-        serde_json::json!("--timeout-ms is 300; raise it or narrow the query")
+        serde_json::json!(
+            "--timeout-ms is 300; narrow the query first (an indexed filter or a shorter range; check with EXPLAIN), then raise it"
+        )
     );
     let handle = lines[0]["handle"].as_str().unwrap();
     let engine = home.engine();
@@ -232,4 +234,35 @@ fn a_commit_that_hangs_ends_at_the_watchdog_and_reads_as_unknown() {
     );
     assert_eq!(receipt.status.as_deref(), Some("unknown"));
     assert_eq!(count(&home.file("app.db"), "audit"), 0);
+}
+
+#[test]
+fn a_param_that_git_bash_converted_gets_a_notice() {
+    let home = connected_home();
+    let run = |value: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_stql"))
+            .args(["query", "SELECT ? AS v", "--param", value])
+            .env("STQL_HOME", home.path.join("home"))
+            .env("STQL_SESSION", "cli")
+            .env("MSYSTEM", "MINGW64")
+            .output()
+            .expect("stql runs");
+        serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap()
+    };
+    let converted = run("%C:/Program Files/Git/v1/users%");
+    assert!(
+        converted["notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("--params")),
+        "{converted}"
+    );
+    let url = run("https://example.com/v1");
+    assert_eq!(url.get("notice"), None, "{url}");
+}
+
+#[test]
+fn profiles_without_an_action_lists_them() {
+    let home = Home::new();
+    let output = stql(&home, &["profiles"], None);
+    assert_eq!(stdout(&output), "{\"ok\":true,\"profiles\":[]}\n");
 }

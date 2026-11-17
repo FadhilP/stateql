@@ -698,3 +698,36 @@ fn sessions_do_not_see_each_others_results() {
     drop(engine);
     let _ = Engine::open_with_keyring_service(&home.path.join("home"), KEYRING_SERVICE).unwrap();
 }
+
+#[test]
+fn a_missing_table_error_names_the_closest_table() {
+    let (home, target) = setup();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, false));
+    let error = fail(&mut session, &query_json("SELECT * FROM user"));
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("did you mean users? (stql objects --search TEXT)")
+    );
+    let error = fail(&mut session, &query_json("SELECT * FROM zzzz"));
+    assert_eq!(error.hint.as_deref(), Some("stql objects --search TEXT"));
+}
+
+#[test]
+fn filter_takes_the_preview_size() {
+    let (home, target) = setup();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, false));
+    ok(
+        &mut session,
+        r#"{"command":"query","stmt":"SELECT id FROM users","as":"all"}"#,
+    );
+    let filtered = ok(
+        &mut session,
+        r#"{"command":"filter","handle":"all","predicate":"id > 1","preview_rows":2}"#,
+    );
+    assert_eq!(filtered.rows.map(|rows| rows.len()), Some(2));
+    assert_eq!(filtered.next_offset, Some(2));
+}

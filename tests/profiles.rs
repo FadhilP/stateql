@@ -281,15 +281,16 @@ fn profiles_refuse_passwords_and_keep_them_bound_to_one_destination() {
     );
     let name = account("bound");
     let with_password = stateql::Command::Profile {
-        action: stateql::ProfileCommand::Add {
+        action: Some(stateql::ProfileCommand::Add {
             name: name.clone(),
             url: Some("postgres://app:secret@db.example.com/sales".into()),
             env: None,
             env_file: None,
             ask_password: false,
             read_write: false,
+            note: None,
             force: false,
-        },
+        }),
     };
     assert_eq!(
         session.run(with_password).unwrap_err().code,
@@ -302,15 +303,16 @@ fn profiles_refuse_passwords_and_keep_them_bound_to_one_destination() {
     keyring.track(&name);
     let run = |session: &mut stateql::Session<'_>, url: &str, force: bool| {
         session.run(stateql::Command::Profile {
-            action: stateql::ProfileCommand::Add {
+            action: Some(stateql::ProfileCommand::Add {
                 name: name.clone(),
                 url: Some(url.into()),
                 env: None,
                 env_file: None,
                 ask_password: false,
                 read_write: false,
+                note: None,
                 force,
-            },
+            }),
         })
     };
     run(&mut session, "postgres://app@db.invalid/sales", false).unwrap();
@@ -357,13 +359,13 @@ fn profiles_refuse_passwords_and_keep_them_bound_to_one_destination() {
 
     let removed = session
         .run(stateql::Command::Profile {
-            action: stateql::ProfileCommand::Remove { name: name.clone() },
+            action: Some(stateql::ProfileCommand::Remove { name: name.clone() }),
         })
         .unwrap();
     assert_eq!(removed.data["removed"], json!(true));
     let listed = session
         .run(stateql::Command::Profile {
-            action: stateql::ProfileCommand::List,
+            action: Some(stateql::ProfileCommand::List),
         })
         .unwrap();
     assert_eq!(listed.data["profiles"], json!([]));
@@ -377,15 +379,16 @@ fn env_and_sqlite_profiles_connect_without_the_keyring() {
     let engine = home.engine();
     let mut session = engine.session("t").unwrap();
     let add = |name: &str, url: Option<String>, env: Option<&str>| stateql::Command::Profile {
-        action: stateql::ProfileCommand::Add {
+        action: Some(stateql::ProfileCommand::Add {
             name: name.into(),
             url,
             env: env.map(str::to_string),
             env_file: None,
             ask_password: false,
             read_write: true,
+            note: None,
             force: false,
-        },
+        }),
     };
     session
         .run(add("local", Some(db.display().to_string()), None))
@@ -425,7 +428,7 @@ fn env_and_sqlite_profiles_connect_without_the_keyring() {
     );
     let listed = session
         .run(stateql::Command::Profile {
-            action: stateql::ProfileCommand::List,
+            action: Some(stateql::ProfileCommand::List),
         })
         .unwrap();
     assert_eq!(
@@ -447,7 +450,7 @@ fn read_only_wins_over_a_read_write_profile_and_with_profile_keeps_the_mode() {
     std::fs::write(
         home.path.join("home").join("profiles.toml"),
         format!(
-            "[profiles.local]\nurl = '{}'\nread_only = false\n",
+            "[profiles.local]\nurl = '{}'\nread_only = false\nnote = 'test data only'\n",
             db.display()
         ),
     )
@@ -458,6 +461,7 @@ fn read_only_wins_over_a_read_write_profile_and_with_profile_keeps_the_mode() {
         r#"{"command":"connect","target":"local","read_only":true}"#,
     );
     assert_eq!(connected.data["read_only"], json!(true));
+    assert_eq!(connected.data["note"], json!("test data only"));
     expect_code(&mut session, &insert, Code::ReadOnly);
 
     let command = session.with_profile("local", cmd(&insert)).unwrap();
@@ -468,8 +472,13 @@ fn read_only_wins_over_a_read_write_profile_and_with_profile_keeps_the_mode() {
     );
     let mut fresh = engine.session("fresh").unwrap();
     let command = fresh.with_profile("local", cmd(&insert)).unwrap();
-    fresh.run(command).unwrap();
+    let inserted = fresh.run(command).unwrap();
     assert_eq!(count(&db, "audit"), 1);
+    assert_eq!(
+        inserted.data["notice"],
+        json!("Profile local: test data only"),
+        "--profile shows the note when it connects"
+    );
 
     let error = fresh.with_profile("typo", cmd(&insert)).unwrap_err();
     assert_eq!(
@@ -506,15 +515,16 @@ fn env_profiles_read_a_missing_variable_from_their_env_file() {
     let engine = home.engine();
     let mut session = engine.session("t").unwrap();
     let add = |name: &str, env_file| stateql::Command::Profile {
-        action: stateql::ProfileCommand::Add {
+        action: Some(stateql::ProfileCommand::Add {
             name: name.into(),
             url: None,
             env: Some(var.clone()),
             env_file,
             ask_password: false,
             read_write: false,
+            note: None,
             force: false,
-        },
+        }),
     };
     session.run(add("filed", Some(env_file.clone()))).unwrap();
     session
@@ -539,11 +549,30 @@ fn env_profiles_read_a_missing_variable_from_their_env_file() {
     );
     let listed = session
         .run(stateql::Command::Profile {
-            action: stateql::ProfileCommand::List,
+            action: Some(stateql::ProfileCommand::List),
         })
         .unwrap();
     assert_eq!(
         listed.data["profiles"][1]["env_file"],
         json!(env_file.display().to_string())
+    );
+}
+
+#[test]
+fn profile_list_shows_notes_and_leaves_out_url_options() {
+    let home = Home::new();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    std::fs::write(
+        home.path.join("home").join("profiles.toml"),
+        "[profiles.prod]\nurl = 'postgres://app@db.invalid/sales?sslmode=verify-full&sslrootcert=C%3A%5Cca.pem'\nread_only = true\nnote = 'production: keep queries narrow'\n",
+    )
+    .unwrap();
+    let listed = session
+        .run(stateql::Command::Profile { action: None })
+        .unwrap();
+    assert_eq!(
+        listed.data["profiles"],
+        json!([{"name": "prod", "url": "postgres://app@db.invalid/sales", "read_only": true, "note": "production: keep queries narrow"}])
     );
 }
