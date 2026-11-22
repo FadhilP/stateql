@@ -168,6 +168,28 @@ fn query_prints_the_documented_shape() {
 }
 
 #[test]
+fn text_output_shows_a_cut_cell_as_its_preview_and_length() {
+    let home = connected_home();
+    let output = stql(
+        &home,
+        &[
+            "query",
+            "SELECT name FROM users WHERE id = 1",
+            "--max-cell-characters",
+            "2",
+            "--text",
+        ],
+        None,
+    );
+    let text = stdout(&output);
+    assert!(text.starts_with("name\nAd… (3 characters)\n"), "{text}");
+    assert!(
+        text.contains("hint: text cells over 2 characters are cut"),
+        "{text}"
+    );
+}
+
+#[test]
 fn query_reads_the_statement_from_stdin_with_file_dash() {
     let home = connected_home();
     let output = stql(

@@ -128,8 +128,11 @@ fn cell_limits_change_only_the_output_of_one_call() {
         r#"{"command":"query","stmt":"SELECT printf('%.300c', 'x') AS long_text","max_cell_characters":1000,"as":"long"}"#,
     );
     assert_eq!(full.rows.unwrap()[0][0], json!("x".repeat(300)));
+    assert_eq!(full.data.get("hint"), None);
     let stored = ok(&mut session, r#"{"command":"rows","handle":"long"}"#);
     assert_eq!(stored.rows.unwrap()[0][0]["length"], json!(300));
+    let hint = stored.data["hint"].as_str().unwrap();
+    assert!(hint.contains("--max-cell-characters"), "{hint}");
     let short = ok(
         &mut session,
         r#"{"command":"rows","handle":"long","max_cell_characters":3}"#,
@@ -380,7 +383,7 @@ fn caps_overflow_deletes_the_partial_result_file() {
         &query_json("SELECT missing_column FROM users"),
         Code::QueryFailed,
     );
-    assert_eq!(error.hint.as_deref(), Some("stql describe TABLE"));
+    assert_eq!(error.hint.as_deref(), Some("stql describe users"));
     assert_eq!(result_files(&home), 0);
 }
 
@@ -712,6 +715,53 @@ fn a_missing_table_error_names_the_closest_table() {
     );
     let error = fail(&mut session, &query_json("SELECT * FROM zzzz"));
     assert_eq!(error.hint.as_deref(), Some("stql objects --search TEXT"));
+}
+
+#[test]
+fn a_missing_column_error_names_the_tables_but_not_the_ctes() {
+    let (home, target) = setup();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, false));
+    let error = fail(
+        &mut session,
+        &query_json(
+            "WITH recent AS (SELECT id FROM users) SELECT missing FROM recent JOIN audit ON audit.id = recent.id",
+        ),
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("stql describe TABLE, where TABLE is one of: users, audit")
+    );
+}
+
+#[test]
+fn page_sizes_over_the_maximum_are_refused_before_a_result_is_stored() {
+    let (home, target) = setup();
+    let engine = home.engine();
+    let mut session = engine.session("t").unwrap();
+    ok(&mut session, &connect_json(&target, false));
+    ok(
+        &mut session,
+        r#"{"command":"query","stmt":"SELECT id FROM users","as":"all"}"#,
+    );
+    let stored = result_files(&home);
+    for line in [
+        r#"{"command":"rows","handle":"all","limit":1001}"#,
+        r#"{"command":"query","stmt":"SELECT id FROM users","preview_rows":201}"#,
+        r#"{"command":"filter","handle":"all","predicate":"id > 1","preview_rows":201}"#,
+        r#"{"command":"objects","limit":1001}"#,
+        r#"{"command":"history","limit":1001}"#,
+    ] {
+        let error = expect_code(&mut session, line, Code::InvalidCommand);
+        assert!(error.hint.is_some(), "{line}");
+    }
+    assert_eq!(result_files(&home), stored);
+    let full_page = ok(
+        &mut session,
+        r#"{"command":"rows","handle":"all","limit":1000}"#,
+    );
+    assert_eq!(full_page.next_offset, None);
 }
 
 #[test]

@@ -88,7 +88,7 @@ Cell values:
 - JSON columns, PostgreSQL arrays, and MongoDB nested values are JSON values.
 - PostgreSQL `numeric`, MySQL `DECIMAL`, and MySQL `BIGINT UNSIGNED` above 2^63 are exact strings.
 - Booleans are `1` and `0`.
-- A text cell over `--max-cell-characters` (default 200) is `{"type":"text","length":N,"preview":"..."}`. Binary is `{"type":"bytes","length":N,"base64":"..."}`.
+- A text cell over `--max-cell-characters` (default 200) is `{"type":"text","length":N,"preview":"..."}`, and the response has a `hint`. `--text` shows such a cell as its preview, then `… (N characters)`. Binary is `{"type":"bytes","length":N,"base64":"..."}`.
 
 `--max-bytes N` drops rows from the end of the page until the line fits in `N` bytes. `next_offset` is then the first dropped row.
 
@@ -126,7 +126,7 @@ Runs one read, stores the full result, and returns a preview. The statement is S
 | `--param V` | — | Bind a string. Repeat for more. |
 | `--params JSON` | — | Bind typed values from a JSON array. Cannot be used with `--param`. |
 | `--as NAME` | — | Name the result. A later result with the same name replaces it. The name must not look like a handle. |
-| `--preview-rows N` | `20` | Rows in the preview. Max 200. |
+| `--preview-rows N` | `20` | Rows in the preview. Max 200; a larger value is `INVALID_COMMAND`. |
 | `--max-rows N` | `100000` | Row cap of the stored result. A result is also limited to 64 MiB. Over a cap: `RESULT_TOO_LARGE`. |
 
 Placeholders are native: `$1` for PostgreSQL, `?` for SQLite and MySQL. `query` refuses a statement that is not a read with `READ_ONLY` (hint: `use exec`).
@@ -151,7 +151,7 @@ The record of a write: `stmt`, `statement_type`, `status` (`pending`, `committed
 
 ### `rows <handle>`
 
-Pages a stored result. `--offset` (default 0), `--limit` (default 20, max 1000), `--columns A,B`. `--limit 0` returns only the metadata. The handle can be the result name.
+Pages a stored result. `--offset` (default 0), `--limit` (default 20, max 1000; a larger value is `INVALID_COMMAND`), `--columns A,B`. `--limit 0` returns only the metadata. The handle can be the result name.
 
 ### `filter <handle> <predicate>`
 
@@ -167,7 +167,7 @@ Writes all rows to a new file. It never overwrites a file. Without `--format`, t
 
 ### `objects [KIND]`
 
-Lists database objects. Kinds: `table`, `view`, `index`, `trigger`, `function`, `enum`; MongoDB `collection`, `view`; Redis `key`. `--search S` filters by name. `--limit` (default 100, max 1000). `--cursor` continues from `next_cursor`.
+Lists database objects. Kinds: `table`, `view`, `index`, `trigger`, `function`, `enum`; MongoDB `collection`, `view`; Redis `key`. `--search S` filters by name. `--limit` (default 100, max 1000; a larger value is `INVALID_COMMAND`). `--cursor` continues from `next_cursor`.
 
 ### `describe <name>`
 
@@ -175,7 +175,7 @@ Columns, keys, indexes, and DDL of one object. A PostgreSQL index shows its defi
 
 ### `history [--limit N]`
 
-Recent commands of this session, newest first (default 20, max 1000): command, target, result, error code, duration, and the first 4 KiB of the statement. Parameter values are never stored.
+Recent commands of this session, newest first (`--limit`: default 20, max 1000; a larger value is `INVALID_COMMAND`): command, target, result, error code, duration, and the first 4 KiB of the statement. Parameter values are never stored.
 
 ### `purge`
 
@@ -216,7 +216,7 @@ These backends take JSON commands in `query` and `exec`, not SQL. Values go in t
 - `retryable` is `true` only for `CONNECTION_FAILED` and `DEADLINE_EXCEEDED`.
 - `executed` is `false` (nothing ran), `true`, or `"unknown"`.
 - Optional fields: `hint`, `previous_operation` (the write handle of an earlier identical write), `actual_rows`, `notice`.
-- When `query` names a table that does not exist, `hint` names the closest table or view when one is near: `did you mean users? (stql objects --search TEXT)`. Column names get no suggestion.
+- When `query` names a table that does not exist, `hint` names the closest table or view when one is near: `did you mean users? (stql objects --search TEXT)`. When `query` names a column that does not exist and the database gives no suggestion, `hint` gives the `stql describe` command for the tables of the statement (CTE names left out).
 
 | Exit | Codes |
 |---|---|

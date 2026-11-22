@@ -343,9 +343,8 @@ impl Session<'_> {
             } => self.objects(kind, search, limit, cursor, deadline),
             Command::Describe { name } => self.describe(&name, deadline),
             Command::History { limit } => {
-                let entries = self
-                    .store
-                    .history(&self.name, limit.unwrap_or(20).min(MAX_PAGE_ROWS))?;
+                let limit = page_size(limit, 20, MAX_PAGE_ROWS, "--limit", "--limit 1000")?;
+                let entries = self.store.history(&self.name, limit)?;
                 Ok(Response::default().with("history", entries))
             }
             Command::Purge {
@@ -532,7 +531,7 @@ impl Session<'_> {
         deadline: Instant,
     ) -> Result<Response> {
         check_result_name(name.as_deref())?;
-        let preview = preview_limit(preview_rows);
+        let preview = preview_limit(preview_rows)?;
         let id = new_id('r');
         let mut sink = RowSink::create(
             self.store.result_path(&id),
@@ -540,9 +539,13 @@ impl Session<'_> {
             preview as usize,
         )?;
         let connection = self.connection(deadline)?;
+        let backend = connection.backend;
         let next_cursor = match connection.driver.read(stmt, &mut sink, deadline) {
             Ok(next_cursor) => next_cursor,
-            Err(error) => return Err(self.with_table_suggestion(error, deadline)),
+            Err(error) => {
+                let error = with_column_tables(error, backend, &stmt.text);
+                return Err(self.with_table_suggestion(error, deadline));
+            }
         };
         let source = connection.identity.clone();
         self.store_result(sink, id, name, source, next_cursor, limits)
@@ -657,7 +660,13 @@ impl Session<'_> {
         let meta = self.result(handle)?;
         let columns = results::select_columns(&meta.columns, columns)?;
         let offset = offset.unwrap_or(0);
-        let limit = limit.unwrap_or(DEFAULT_PREVIEW_ROWS).min(MAX_PAGE_ROWS);
+        let limit = page_size(
+            limit,
+            DEFAULT_PREVIEW_ROWS,
+            MAX_PAGE_ROWS,
+            "--limit",
+            "page with --offset, or write all rows with stql export",
+        )?;
         let rows = results::read_page(&self.store.result_path(&meta.id), &columns, offset, limit)?;
         let mut response = page(&meta, &columns, &rows, offset, limits.cell_chars);
         if limit == 0 {
@@ -677,6 +686,7 @@ impl Session<'_> {
         limits: PageLimits,
     ) -> Result<Response> {
         check_result_name(name.as_deref())?;
+        let preview = preview_limit(preview_rows)?;
         let source = self.result(handle)?;
         let id = new_id('r');
         let path = self.store.result_path(&id);
@@ -702,8 +712,8 @@ impl Session<'_> {
             let _ = fs::remove_file(&path);
             return Err(error);
         }
-        let preview = results::read_page(&path, &meta.columns, 0, preview_limit(preview_rows))?;
-        let response = page(&meta, &meta.columns, &preview, 0, limits.cell_chars);
+        let rows = results::read_page(&path, &meta.columns, 0, preview)?;
+        let response = page(&meta, &meta.columns, &rows, 0, limits.cell_chars);
         Ok(fit_bytes(response, 0, limits.bytes))
     }
 
@@ -747,7 +757,14 @@ impl Session<'_> {
         cursor: Option<String>,
         deadline: Instant,
     ) -> Result<Response> {
-        let limit = limit.unwrap_or(100).clamp(1, MAX_PAGE_ROWS);
+        let limit = page_size(
+            limit,
+            100,
+            MAX_PAGE_ROWS,
+            "--limit",
+            "continue with --cursor",
+        )?
+        .max(1);
         let query = ObjectQuery {
             kind,
             search,
@@ -1252,10 +1269,51 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b.len()]
 }
 
-fn preview_limit(preview_rows: Option<u64>) -> u64 {
-    preview_rows
-        .unwrap_or(DEFAULT_PREVIEW_ROWS)
-        .min(MAX_PREVIEW_ROWS)
+fn preview_limit(preview_rows: Option<u64>) -> Result<u64> {
+    page_size(
+        preview_rows,
+        DEFAULT_PREVIEW_ROWS,
+        MAX_PREVIEW_ROWS,
+        "--preview-rows",
+        "page the rest with stql rows HANDLE --offset N",
+    )
+}
+
+// Refused, not cut: a page that is silently shorter than asked reads as the full result.
+fn page_size(value: Option<u64>, default: u64, max: u64, flag: &str, hint: &str) -> Result<u64> {
+    let size = value.unwrap_or(default);
+    if size > max {
+        return Err(Error::invalid(format!("{flag} is at most {max}.")).with_hint(hint));
+    }
+    Ok(size)
+}
+
+fn sql_dialect(backend: Backend) -> Option<guard::Dialect> {
+    match backend {
+        Backend::Sqlite => Some(guard::Dialect::Sqlite),
+        Backend::Postgres => Some(guard::Dialect::Postgres),
+        Backend::Mysql => Some(guard::Dialect::Mysql),
+        Backend::Mongo | Backend::Redis => None,
+    }
+}
+
+// The database does not name the table of a missing column, so the hint names the tables of the statement.
+fn with_column_tables(error: Error, backend: Backend, sql: &str) -> Error {
+    if error.hint.as_deref() != Some(driver::MISSING_COLUMN_HINT) {
+        return error;
+    }
+    let Some(dialect) = sql_dialect(backend) else {
+        return error;
+    };
+    let tables = guard::table_names(dialect, sql);
+    match tables.as_slice() {
+        [] => error,
+        [table] => error.with_hint(format!("stql describe {table}")),
+        _ => error.with_hint(format!(
+            "stql describe TABLE, where TABLE is one of: {}",
+            tables.join(", ")
+        )),
+    }
 }
 
 fn merge_params(param: Vec<String>, params: Option<JsonArray>) -> Result<Vec<Value>> {
@@ -1311,6 +1369,15 @@ fn page(
     cell_chars: usize,
 ) -> Response {
     let end = offset + rows.len() as u64;
+    let cut = rows
+        .iter()
+        .flatten()
+        .any(|cell| matches!(cell, driver::Cell::Text(text) if text.chars().count() > cell_chars));
+    let hint = cut.then(|| {
+        format!(
+            "text cells over {cell_chars} characters are cut; use --max-cell-characters N, or stql export for full values"
+        )
+    });
     Response {
         handle: Some(meta.id.clone()),
         name: meta.name.clone(),
@@ -1326,6 +1393,7 @@ fn page(
         rows: Some(results::rows_json(rows, columns, cell_chars)),
         ..Response::default()
     }
+    .with("hint", hint)
 }
 
 // Drops rows from the end until the JSON line fits; next_offset then points at the first dropped row.

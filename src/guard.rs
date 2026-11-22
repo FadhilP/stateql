@@ -1,6 +1,9 @@
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{OnConflictAction, OnInsert, SqliteOnConflict, Statement, visit_statements};
+use sqlparser::ast::{
+    OnConflictAction, OnInsert, Query, SqliteOnConflict, Statement, TableFactor, Visit, Visitor,
+    visit_statements,
+};
 use sqlparser::dialect::{Dialect as SqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
@@ -108,6 +111,56 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Vec<Statement>> {
         Dialect::Mysql => Box::new(MySqlDialect {}),
     };
     Parser::parse_sql(parser_dialect.as_ref(), sql).ok()
+}
+
+// The tables and views that a statement reads, without its CTE names and table functions.
+pub fn table_names(dialect: Dialect, sql: &str) -> Vec<String> {
+    let Some(statements) = parse(dialect, sql) else {
+        return Vec::new();
+    };
+    let mut tables = Tables::default();
+    let _ = statements.visit(&mut tables);
+    let Tables { names, ctes } = tables;
+    names
+        .into_iter()
+        .filter(|name| !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(name)))
+        .collect()
+}
+
+#[derive(Default)]
+struct Tables {
+    names: Vec<String>,
+    ctes: Vec<String>,
+}
+
+impl Visitor for Tables {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        let ctes = query.with.iter().flat_map(|with| &with.cte_tables);
+        self.ctes
+            .extend(ctes.map(|cte| cte.alias.name.value.clone()));
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table {
+            name, args: None, ..
+        } = factor
+        {
+            let parts: Vec<&str> = name
+                .0
+                .iter()
+                .filter_map(|part| part.as_ident())
+                .map(|ident| ident.value.as_str())
+                .collect();
+            let name = parts.join(".");
+            if !self.names.contains(&name) {
+                self.names.push(name);
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 pub fn may_write(dialect: Dialect, sql: &str) -> bool {

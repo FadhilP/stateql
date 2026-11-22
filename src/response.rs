@@ -107,6 +107,14 @@ fn table(columns: &[String], rows: &[Vec<Value>]) -> String {
                 .map(|value| match value {
                     Value::String(text) => text.replace(['\n', '\t'], " "),
                     Value::Null => "NULL".to_string(),
+                    Value::Object(cut) if cut.contains_key("preview") => format!(
+                        "{}… ({} characters)",
+                        cut["preview"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .replace(['\n', '\t'], " "),
+                        cut.get("length").unwrap_or(&Value::Null)
+                    ),
                     other => other.to_string(),
                 })
                 .collect()

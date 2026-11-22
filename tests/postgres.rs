@@ -354,7 +354,7 @@ fn missing_columns_and_tables_carry_a_hint() {
         &query_json("SELECT zzzz FROM users"),
         Code::InvalidSql,
     );
-    assert_eq!(far.hint.as_deref(), Some("stql describe TABLE"));
+    assert_eq!(far.hint.as_deref(), Some("stql describe users"));
     let table = expect_code(
         &mut session,
         &query_json("SELECT * FROM no_such_table"),

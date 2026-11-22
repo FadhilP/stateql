@@ -102,7 +102,7 @@ when they need the database.
 4. Read the response (see below). `total` is the full row count, so you do not
    need a separate `COUNT(*)`.
 5. More rows: `stql rows <handle> --offset <next_offset> --limit 50`
-   (maximum 1000). `--columns id,email` returns only some columns.
+   (maximum 1000; a larger value is an error). `--columns id,email` returns only some columns.
    `--limit 0` returns only the metadata.
 6. Learn about the data: `stql summarize <handle>` gives the type, null count,
    distinct count, min, and max of each column.
@@ -153,7 +153,8 @@ output of that call, not the stored result:
 - Dates and times are ISO 8601 text. `timestamptz` and MySQL `TIMESTAMP` are UTC with `Z`.
 - JSON columns and MongoDB nested values come back as JSON values.
 - A text cell longer than the limit is an object, not a string:
-  `{"type":"text","length":20000,"preview":"..."}`. Binary is
+  `{"type":"text","length":20000,"preview":"..."}`, and the response has a
+  `hint`. Binary is
   `{"type":"bytes","length":N,"base64":"..."}`. Use `--max-cell-characters`
   or `export` to get the full value.
 - Booleans are `1` and `0`.
@@ -224,7 +225,7 @@ Retry only when `retryable` is `true`, and at most one time. `executed` is
 `false` (nothing ran), `true`, or `"unknown"`. Read `hint` first. For a missing
 table, it names the closest table or view when one is near
 (`did you mean users? ...`). For a missing column, it gives the database
-suggestion, or the `describe` command to run.
+suggestion, or the `describe` command for the tables of the statement.
 
 | Code (exit) | What to do |
 | --- | --- |
